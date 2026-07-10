@@ -1,0 +1,8 @@
+FoamFile { version 2.0; format ascii; class dictionary; object fvOptions; }
+momSource
+{
+    type     topOSource;
+    names    (U Ua);
+    function linear;
+    interpolationField beta;
+}

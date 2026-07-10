@@ -1,0 +1,7 @@
+solvers/thermalSimple/thermalSimple.C
+objectives/objectiveMeanTemperature.C
+objectives/objectivePatchTemperaturePNorm.C
+solvers/thermalAdjointSimple/thermalAdjointSimple.C
+functionObjects/boilingOnsetBerglesRohsenow.C
+
+LIB = $(FOAM_USER_LIBBIN)/libthermalTopO

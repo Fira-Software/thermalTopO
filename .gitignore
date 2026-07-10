@@ -1,0 +1,15 @@
+# case run outputs — rebuildable
+cases/*/[0-9]*/
+cases/*/processor*/
+cases/*/optimisation/
+cases/*/postProcessing/
+cases/*/log.*
+cases/*/fd_*.log
+cases/*/*.png
+cases/*/constant/polyMesh/
+cases/*/mesh_info.txt
+# build artefacts
+src/Make/linux*/
+src/lnInclude/
+*.o
+*.so
