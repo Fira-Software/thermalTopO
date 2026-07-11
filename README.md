@@ -47,10 +47,13 @@ residuals with automated guards:
 ![FD verification](docs/figures/fd_verification.png)
 
 - **Single-cell central FD, solid interior, consistent 2nd-order schemes:
-  median |error| 0.5 %, max 2.1 %** (meets the < 1 % laminar acceptance
-  criterion of the derivation note). Verified for the volumetric
-  (zone-mean) objective; the patch p-norm objective path is implemented
-  and queued for the same protocol.
+  zone-mean objective median |error| 0.5 % (max 2.1 %); patch p-norm
+  objective median |error| 0.2 % (max 0.9 %)** - both objective classes
+  meet the < 1 % laminar acceptance criterion of the derivation note. The
+  p-norm campaign exercises the boundary-driven adjoint flux path used by
+  peak-temperature objectives. Cells at unregularised design-field steps
+  show 5-10 % errors (consistent sign); a regularisation-on pass is
+  queued.
 - Directional derivatives across 720 design cells: 1–3 % on
   gradient-dominant directions.
 - With 1st-order upwind advection the solid-interior error grows to a

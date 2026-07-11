@@ -169,6 +169,14 @@ automated guards (no unconverged samples admitted).
    **median 0.5%, max 2.1%** - meeting the < 1% laminar acceptance
    criterion. The first-order bias is therefore advection-scheme
    consistency, not a formulation error.
+4. **Patch p-norm objective (12 Jul 2026)**: the same single-cell protocol
+   applied to `objectivePatchTemperaturePNorm` (P = 8, adiabatic wall
+   patch), which exercises the boundary-driven adjoint flux path
+   (update_boundarydJdT -> fixedGradient drive): solid interior
+   **median 0.2%, max 0.9%**; high-signal sponge cells 2-3%; blob-edge
+   cells 6-10% with consistent sign (unregularised design steps, same
+   class as item 3's localisation note). Both objective classes are
+   FD-verified.
 4. Confirmed conventions: couplingSign = +1, thermalSensScale = +1
    (as derived); design-variable-to-indicator map verified as identity
    with regularisation off; sensitivity scale constant uniform across
