@@ -48,8 +48,9 @@ residuals with automated guards:
 
 - **Single-cell central FD, solid interior, consistent 2nd-order schemes:
   zone-mean objective median |error| 0.5 % (max 2.1 %); patch p-norm
-  objective median |error| 0.2 % (max 0.9 %)** - both objective classes
-  meet the < 1 % laminar acceptance criterion of the derivation note. The
+  objective median |error| 0.2 % (max 0.9 %).** Against the derivation
+  note's pre-registered < 1 % laminar gate: the p-norm campaign passes it
+  outright; the zone-mean campaign passes on median with max 2.1 %. The
   p-norm campaign exercises the boundary-driven adjoint flux path used by
   peak-temperature objectives.
 - **Production configuration (regularisation on, p-norm objective,

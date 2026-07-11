@@ -42,6 +42,7 @@ adjointManagers
                 {
                     DFluid          1.0e-5;
                     DSolid          1.0e-3;
+                    DSolidTable     table ((300 1.2e-3) (340 0.8e-3));
                     Prt             0.85;
                     couplingSign    1;
                     thermalSensScale 1;
