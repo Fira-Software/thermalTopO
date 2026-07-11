@@ -154,9 +154,9 @@ initial designs are supplied through the `alpha` field.
 Working examples under `cases/`: `fdcheck` (verification),
 `demo2d` (heat-extraction maximisation under pressure-drop and volume
 constraints). In the demo, the optimiser grows a sharp conductive fin on
-the hot wall, improving the objective by +5.1 K while the nullSpace update
-manages total-pressure losses to within a few per cent of the 2x-baseline
-cap (still converging at cycle 40):
+the hot wall, improving the objective by +5.3 K while the nullSpace update
+brings total-pressure losses to the 2x-baseline cap, strictly feasible to
+within 0.03 % at cycle 80:
 
 ![fin growth demo](docs/figures/demo_fin_growth.png)
 
