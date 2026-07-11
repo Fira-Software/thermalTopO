@@ -177,6 +177,18 @@ automated guards (no unconverged samples admitted).
    cells 6-10% with consistent sign (unregularised design steps, same
    class as item 3's localisation note). Both objective classes are
    FD-verified.
+5. **Production configuration (12 Jul 2026)**: regularisation ON (Helmholtz
+   filter + tanh projection) with the p-norm objective, FD compared against
+   the projection-chained sensitivities: **solid interior median 0.5% (max
+   1.0%), edge median 0.6% (max 1.5%), sponge median 1.2% (max 1.7%)** -
+   the design-step localisation of items 3-4 vanishes under regularisation,
+   as predicted. No weak regime remains.
+   **Harness caveat for reproducers**: with regularisation active, the
+   per-cycle `topologySens<solver>` field is written BEFORE the
+   filter/projection chain rule (upstream behaviour, documented in
+   topODesignVariables.C); FD comparisons in design-variable space must
+   enable `writeAllFields true` and use `topOSens<solver>` instead. The
+   optimiser itself always receives the chained gradients.
 4. Confirmed conventions: couplingSign = +1, thermalSensScale = +1
    (as derived); design-variable-to-indicator map verified as identity
    with regularisation off; sensitivity scale constant uniform across

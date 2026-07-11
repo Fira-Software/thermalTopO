@@ -1,0 +1,98 @@
+FoamFile { version 2.0; format ascii; class dictionary; object optimisationDict; }
+
+optimisationManager steadyOptimisation;
+
+primalSolvers
+{
+    op1
+    {
+        active                 true;
+        type                   incompressible;
+        solver                 thermalSimple;
+        thermal
+        {
+            DFluid          1.0e-5;
+            DSolid          1.0e-3;
+            Prt             0.85;
+            kInterpolation { function BorrvallPetersson; b 20; }
+        }
+        solutionControls
+        {
+            nIters 6000;
+            residualControl { "p.*" 1e-8; "U.*" 1e-8; "T.*" 1e-9; }
+        }
+    }
+}
+
+adjointManagers
+{
+    adjManager1
+    {
+        primalSolver             op1;
+        adjointSolvers
+        {
+            as1
+            {
+                active                 false;
+                type                   incompressible;
+                solver                 thermalAdjointSimple;
+                computeSensitivities   true;
+                thermal
+                {
+                    DFluid          1.0e-5;
+                    DSolid          1.0e-3;
+                    Prt             0.85;
+                    couplingSign    1;
+                    thermalSensScale 1;
+                    kInterpolation { function BorrvallPetersson; b 20; }
+                }
+                objectives
+                {
+                    type  incompressible;
+                    objectiveNames
+                    {
+                        pnormT
+                        {
+                            weight  1e-6;
+                            type    patchTemperaturePNorm;
+                            patches (topWall);
+                            P       8;
+                        }
+                    }
+                }
+                ATCModel { ATCModel standard; }
+                solutionControls
+                {
+                    nIters 3000;
+                    residualControl { "pa.*" 1e-8; "Ua.*" 1e-8; }
+                }
+            }
+        }
+    }
+}
+
+optimisation
+{
+    designVariables
+    {
+        type            topO;
+        sensitivityType topO;
+        writeAllFields  true;
+        writeFieldSens  true;
+        fixedZeroPorousZones (objZone);
+        regularisation
+        {
+            regularise     true;
+            growFromWalls  false;
+            meanRadiusMult 8;
+            function       tanh;
+            b              20;
+        }
+        betaMax    2500;
+        maxInitChange 0.2;
+    }
+    updateMethod
+    {
+        method steepestDescent;
+    }
+}

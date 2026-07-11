@@ -51,9 +51,14 @@ residuals with automated guards:
   objective median |error| 0.2 % (max 0.9 %)** - both objective classes
   meet the < 1 % laminar acceptance criterion of the derivation note. The
   p-norm campaign exercises the boundary-driven adjoint flux path used by
-  peak-temperature objectives. Cells at unregularised design-field steps
-  show 5-10 % errors (consistent sign); a regularisation-on pass is
-  queued.
+  peak-temperature objectives.
+- **Production configuration (regularisation on, p-norm objective,
+  chained sensitivities): all regimes verify to max 1.7 % per cell**
+  (solid 0.5 % median, edge 0.6 %, sponge 1.2 %) - the design-step error
+  localisation observed without regularisation vanishes, as predicted.
+  Note for reproducers: with regularisation active compare FD against
+  `topOSens<solver>` (enable `writeAllFields`), not `topologySens<solver>`,
+  which upstream writes before the filter/projection chain rule.
 - Directional derivatives across 720 design cells: 1–3 % on
   gradient-dominant directions.
 - With 1st-order upwind advection the solid-interior error grows to a
