@@ -26,7 +26,7 @@ of coolant channels in fusion plasma-facing components.
 
 | Component | Class | Status |
 |---|---|---|
-| Primal SIMPLE + energy equation over the design field | `thermalSimple` | working, verified |
+| Primal SIMPLE + energy equation over the design field, optional D_s(T) table | `thermalSimple` | working, verified |
 | Adjoint SIMPLE + adjoint energy equation and Ta∇T momentum coupling | `thermalAdjointSimple` | working, verified |
 | Zone-mean temperature objective | `objectiveMeanTemperature` | working, FD-verified |
 | Patch p-norm (peak-surrogate) temperature objective | `objectivePatchTemperaturePNorm` | working |

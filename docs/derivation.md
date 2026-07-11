@@ -119,9 +119,16 @@ untouched — they are inherited from `adjointOptimisationFoam`.
    ("frozen α_t"). The momentum-side SST adjoint remains fully differentiated
    (upstream capability). Consequence: gradients are inexact in strongly
    turbulence-dominated heat transfer; the FD check quantifies this (§5).
-2. **Temperature-dependent k_s(T)**: primal supports a tungsten k(T) table;
-   its adjoint linearisation ∂k/∂T ∇T·∇T_a is implemented but can be toggled
-   for A/B testing.
+2. **Temperature-dependent k_s(T)** (implemented 12 Jul 2026): both solvers
+   accept an optional `DSolidTable` (Function1); the primal evaluates
+   D_s(T) per cell each iteration, the adjoint and the conductivity
+   sensitivity term use the same field at the frozen primal T. The
+   ∂D_s/∂T linearisation is NOT differentiated (frozen). Quantified: with
+   an exaggerated -33% D_s variation across the verification case's
+   temperature range, per-cell FD errors are identical to the constant-D
+   production campaign (solid 0.5% median / 1.0% max; edge 0.6%/1.5%;
+   sponge 1.2%/1.7%) - the frozen term contributes no measurable
+   gradient error at these conditions.
 
 ## 4. Sensitivities
 

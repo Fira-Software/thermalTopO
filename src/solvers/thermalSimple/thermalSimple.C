@@ -107,6 +107,32 @@ Foam::tmp<Foam::volScalarField> Foam::thermalSimple::DEff() const
     const autoPtr<incompressible::turbulenceModel>& turbulence =
         incoVars_.turbulence();
 
+    // solid diffusivity: constant, or D_s(T) from the optional table
+    auto tDs =
+        tmp<volScalarField>::New
+        (
+            IOobject
+            (
+                "DSolidField",
+                mesh_.time().timeName(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE
+            ),
+            mesh_,
+            dimensionedScalar("DSolid", dimViscosity, DSolid_)
+        );
+    if (DSolidTablePtr_)
+    {
+        const volScalarField& T = TPtr_();
+        scalarField& Ds = tDs.ref().primitiveFieldRef();
+        forAll(Ds, celli)
+        {
+            Ds[celli] = DSolidTablePtr_->value(T[celli]);
+        }
+        tDs.ref().correctBoundaryConditions();
+    }
+
     auto tDEff =
         tmp<volScalarField>::New
         (
@@ -119,7 +145,7 @@ Foam::tmp<Foam::volScalarField> Foam::thermalSimple::DEff() const
                 IOobject::NO_WRITE
             ),
             dimensionedScalar("DFluid", dimViscosity, DFluid_)
-          + dimensionedScalar("dD", dimViscosity, DSolid_ - DFluid_)*Ik
+          + (tDs() - dimensionedScalar(dimViscosity, DFluid_))*Ik
           + (scalar(1) - Ik)*turbulence->nut()/Prt_
         );
 
@@ -167,6 +193,7 @@ Foam::thermalSimple::thermalSimple
     TPtr_(nullptr),
     DFluid_(Zero),
     DSolid_(Zero),
+    DSolidTablePtr_(nullptr),
     Prt_(0.85),
     kInterpolation_(nullptr)
 {
@@ -175,6 +202,11 @@ Foam::thermalSimple::thermalSimple
     DFluid_ = thermalDict.get<scalar>("DFluid");
     DSolid_ = thermalDict.get<scalar>("DSolid");
     Prt_ = thermalDict.getOrDefault<scalar>("Prt", 0.85);
+    if (thermalDict.found("DSolidTable"))
+    {
+        DSolidTablePtr_ =
+            Function1<scalar>::New("DSolidTable", thermalDict, &mesh_);
+    }
     kInterpolation_ =
         topOInterpolationFunction::New
         (

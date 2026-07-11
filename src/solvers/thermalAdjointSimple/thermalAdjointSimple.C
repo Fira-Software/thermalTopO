@@ -98,6 +98,31 @@ Foam::tmp<Foam::volScalarField> Foam::thermalAdjointSimple::DEff() const
     const autoPtr<incompressible::turbulenceModel>& turbulence =
         primalVars_.turbulence();
 
+    auto tDs =
+        tmp<volScalarField>::New
+        (
+            IOobject
+            (
+                "DSolidFieldAdj",
+                mesh_.time().timeName(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE
+            ),
+            mesh_,
+            dimensionedScalar("DSolid", dimViscosity, DSolid_)
+        );
+    if (DSolidTablePtr_)
+    {
+        const volScalarField& T = TRef();
+        scalarField& Ds = tDs.ref().primitiveFieldRef();
+        forAll(Ds, celli)
+        {
+            Ds[celli] = DSolidTablePtr_->value(T[celli]);
+        }
+        tDs.ref().correctBoundaryConditions();
+    }
+
     return tmp<volScalarField>::New
     (
         IOobject
@@ -109,7 +134,7 @@ Foam::tmp<Foam::volScalarField> Foam::thermalAdjointSimple::DEff() const
             IOobject::NO_WRITE
         ),
         dimensionedScalar("DFluid", dimViscosity, DFluid_)
-      + dimensionedScalar("dD", dimViscosity, DSolid_ - DFluid_)*Ik
+      + (tDs() - dimensionedScalar(dimViscosity, DFluid_))*Ik
       + (scalar(1) - Ik)*turbulence->nut()/Prt_
     );
 }
@@ -232,6 +257,7 @@ Foam::thermalAdjointSimple::thermalAdjointSimple
     TaPtr_(nullptr),
     DFluid_(Zero),
     DSolid_(Zero),
+    DSolidTablePtr_(nullptr),
     Prt_(0.85),
     couplingSign_(1),
     thermalSensScale_(1),
@@ -242,6 +268,11 @@ Foam::thermalAdjointSimple::thermalAdjointSimple
     DFluid_ = thermalDict.get<scalar>("DFluid");
     DSolid_ = thermalDict.get<scalar>("DSolid");
     Prt_ = thermalDict.getOrDefault<scalar>("Prt", 0.85);
+    if (thermalDict.found("DSolidTable"))
+    {
+        DSolidTablePtr_ =
+            Function1<scalar>::New("DSolidTable", thermalDict, &mesh_);
+    }
     couplingSign_ = thermalDict.getOrDefault<scalar>("couplingSign", 1);
     thermalSensScale_ =
         thermalDict.getOrDefault<scalar>("thermalSensScale", 1);
@@ -322,12 +353,20 @@ void Foam::thermalAdjointSimple::topOSensMultiplier
         const volVectorField gradT(fvc::grad(T));
         const volVectorField gradTa(fvc::grad(Ta));
 
+        scalarField DsField(mesh_.nCells(), DSolid_);
+        if (DSolidTablePtr_)
+        {
+            forAll(DsField, celli)
+            {
+                DsField[celli] = DSolidTablePtr_->value(T[celli]);
+            }
+        }
         scalarField thermSens
         (
             thermalSensScale_
            *(gradT.primitiveField() & gradTa.primitiveField())
            *(
-                DSolid_ - DFluid_
+                DsField - DFluid_
               - turbulence->nut()().primitiveField()/Prt_
             )
            *dt

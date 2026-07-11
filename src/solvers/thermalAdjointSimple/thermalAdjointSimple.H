@@ -26,18 +26,21 @@ Description
     Boundary conditions on Ta: the solver drives every fixedGradient Ta
     patch with
 
-        gradient = ( - sum_k w_k bdJdT_k - max(u.n, 0) Ta ) / DEff
+        gradient = ( - sum_k w_k bdJdT_k ) / DEff
 
-    which realises simultaneously (a) the objective flux BC on objective
-    patches, (b) the adiabatic adjoint wall (gradient 0), and (c) a
-    Picard-lagged Robin outlet. Inlets take fixedValue 0 (set in 0/Ta).
+    realising the objective flux BC on objective patches and the adiabatic
+    adjoint wall (zero gradient) elsewhere. Inlets and outlets take
+    fixedValue 0 in 0/Ta (the outlet value is the high-Peclet limit of the
+    exact Robin condition).
 
     Contributes the conductivity-interpolation sensitivity term through the
     topOSensMultiplier hook using its own kInterpolation RAMP.
 
-    v1 approximations (documented, quantified by the FD gate): frozen
-    turbulent thermal diffusivity in the adjoint; k_s(T) linearisation
-    omitted.
+    Supports an optional temperature-dependent solid diffusivity table
+    (entry "DSolidTable", evaluated at the frozen primal T). v1
+    approximations (documented, quantified by the FD gate): frozen
+    turbulent thermal diffusivity in the adjoint; dD_s/dT linearisation
+    omitted (D_s evaluated at frozen T).
 
     Dictionary: same "thermal" sub-dictionary as thermalSimple, plus
     optional "couplingSign" (default 1) and "thermalSensScale" (default 1).
@@ -52,6 +55,7 @@ SourceFiles
 
 #include "adjointSimple.H"
 #include "topOInterpolationFunction.H"
+#include "Function1.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -87,6 +91,9 @@ protected:
         //- Molecular diffusivities, fluid and solid [m2/s]
         scalar DFluid_;
         scalar DSolid_;
+
+        //- Optional D_s(T) table, evaluated at the frozen primal T
+        autoPtr<Function1<scalar>> DSolidTablePtr_;
 
         //- Turbulent Prandtl number
         scalar Prt_;

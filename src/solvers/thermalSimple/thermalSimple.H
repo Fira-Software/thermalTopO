@@ -47,6 +47,8 @@ Description
     {
         DFluid          1.72e-7;   // k_f/(rho_f cp_f)
         DSolid          3.55e-5;   // k_s/(rho_f cp_f)
+        // optional temperature dependence, overrides DSolid:
+        // DSolidTable  table ((373 3.9e-5) (673 3.3e-5));
         Prt             0.85;
         kInterpolation             // RAMP for conductivity interpolation
         {
@@ -66,6 +68,7 @@ SourceFiles
 
 #include "simple.H"
 #include "topOInterpolationFunction.H"
+#include "Function1.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -101,6 +104,10 @@ protected:
         //- Molecular diffusivities, fluid and solid [m2/s]
         scalar DFluid_;
         scalar DSolid_;
+
+        //- Optional temperature-dependent solid diffusivity D_s(T) [m2/s];
+        //- overrides DSolid when present (entry "DSolidTable")
+        autoPtr<Function1<scalar>> DSolidTablePtr_;
 
         //- Turbulent Prandtl number
         scalar Prt_;
