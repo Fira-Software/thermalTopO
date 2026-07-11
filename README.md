@@ -48,7 +48,9 @@ residuals with automated guards:
 
 - **Single-cell central FD, solid interior, consistent 2nd-order schemes:
   median |error| 0.5 %, max 2.1 %** (meets the < 1 % laminar acceptance
-  criterion of the derivation note).
+  criterion of the derivation note). Verified for the volumetric
+  (zone-mean) objective; the patch p-norm objective path is implemented
+  and queued for the same protocol.
 - Directional derivatives across 720 design cells: 1–3 % on
   gradient-dominant directions.
 - With 1st-order upwind advection the solid-interior error grows to a
@@ -145,7 +147,8 @@ Working examples under `cases/`: `fdcheck` (verification),
 `demo2d` (heat-extraction maximisation under pressure-drop and volume
 constraints). In the demo, the optimiser grows a sharp conductive fin on
 the hot wall, improving the objective by +5.1 K while the nullSpace update
-holds total-pressure losses at the 2x-baseline cap:
+manages total-pressure losses to within a few per cent of the 2x-baseline
+cap (still converging at cycle 40):
 
 ![fin growth demo](docs/figures/demo_fin_growth.png)
 
