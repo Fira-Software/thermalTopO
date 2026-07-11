@@ -180,9 +180,10 @@ automated guards (no unconverged samples admitted).
    uniform +11% bias in solid-interior cells.
 3. **Scheme attribution**: with second-order (limitedLinear) advection on
    T and T_a, the solid-interior per-cell errors collapse to
-   **median 0.5%, max 2.1%** - meeting the < 1% laminar acceptance
-   criterion. The first-order bias is therefore advection-scheme
-   consistency, not a formulation error.
+   **median 0.5%, max 2.1%** - the 1% laminar target met in median terms
+   (see the compliance statement under the protocol above; the p-norm
+   campaign of item 4 meets it outright, max 0.9%). The first-order bias
+   is therefore advection-scheme consistency, not a formulation error.
 4. **Patch p-norm objective (11 Jul 2026)**: the same single-cell protocol
    applied to `objectivePatchTemperaturePNorm` (P = 8, adiabatic wall
    patch), which exercises the boundary-driven adjoint flux path
