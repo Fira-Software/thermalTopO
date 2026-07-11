@@ -1,5 +1,7 @@
-# case run outputs — rebuildable
+# case run outputs — rebuildable (keep 0/ input directories!)
 cases/*/[0-9]*/
+!cases/*/0/
+!cases/*/0/**
 cases/*/processor*/
 cases/*/optimisation/
 cases/*/postProcessing/
