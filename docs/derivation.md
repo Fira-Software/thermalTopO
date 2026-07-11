@@ -169,7 +169,7 @@ automated guards (no unconverged samples admitted).
    **median 0.5%, max 2.1%** - meeting the < 1% laminar acceptance
    criterion. The first-order bias is therefore advection-scheme
    consistency, not a formulation error.
-4. **Patch p-norm objective (12 Jul 2026)**: the same single-cell protocol
+4. **Patch p-norm objective (11 Jul 2026)**: the same single-cell protocol
    applied to `objectivePatchTemperaturePNorm` (P = 8, adiabatic wall
    patch), which exercises the boundary-driven adjoint flux path
    (update_boundarydJdT -> fixedGradient drive): solid interior
@@ -177,7 +177,7 @@ automated guards (no unconverged samples admitted).
    cells 6-10% with consistent sign (unregularised design steps, same
    class as item 3's localisation note). Both objective classes are
    FD-verified.
-5. **Production configuration (12 Jul 2026)**: regularisation ON (Helmholtz
+5. **Production configuration (11 Jul 2026)**: regularisation ON (Helmholtz
    filter + tanh projection) with the p-norm objective, FD compared against
    the projection-chained sensitivities: **solid interior median 0.5% (max
    1.0%), edge median 0.6% (max 1.5%), sponge median 1.2% (max 1.7%)** -
