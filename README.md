@@ -26,8 +26,10 @@ of coolant channels in fusion plasma-facing components.
 
 | Component | Class | Status |
 |---|---|---|
-| Primal SIMPLE + energy equation over the design field, optional D_s(T) table | `thermalSimple` | working, verified |
+| Primal SIMPLE + energy equation over the design field | `thermalSimple` | working, verified |
 | Adjoint SIMPLE + adjoint energy equation and Ta∇T momentum coupling | `thermalAdjointSimple` | working, verified |
+| Temperature-dependent properties ρ(T), c_p(T), k_f(T), k_s(T) in primal, adjoint and sensitivities | `thermalPropertyTables` | working, FD-verified |
+| Temperature-dependent viscosity μ(T) in the momentum equation | `viscosityModels::temperatureTable` | working, verified |
 | Zone-mean temperature objective | `objectiveMeanTemperature` | working, FD-verified |
 | Patch p-norm (peak-surrogate) temperature objective | `objectivePatchTemperaturePNorm` | working |
 | Conductivity term in topology sensitivities | via `topOSensMultiplier` hook | working, FD-verified |
@@ -73,6 +75,103 @@ residuals with automated guards:
   the roadmap.
 
 Full derivation and verification protocol: [docs/derivation.md](docs/derivation.md).
+
+## Temperature-dependent fluid and solid properties
+
+Properties can be tabulated in temperature **in both the fluid and the solid**,
+and they stay active **throughout** the optimisation — primal, adjoint and
+sensitivity assembly — not just in a final verification run.
+
+| Property | Entry | Where it acts |
+|---|---|---|
+| ρ(T) [kg/m³] | `rhoTable` | volumetric heat capacity, and ν = μ/ρ |
+| c_p(T) [J/kg/K] | `cpTable` | volumetric heat capacity |
+| k_f(T) [W/m/K] | `kFluidTable` | fluid diffusivity D_f = k_f/(ρc_p)_ref |
+| μ(T) [Pa s] | `muTable` | momentum, via ν(T) = μ(T)/ρ(T) |
+| k_s(T), as D_s [m²/s] | `DSolidTable` | solid diffusivity |
+| Pr_t | `Prt` | constant (default 0.85), documented, frozen in the adjoint |
+
+The energy equation is solved as
+
+    C(T) u·∇T = ∇·[D_eff(β, T) ∇T],    C(T) = ρ(T)c_p(T)/(ρc_p)_ref,
+                                        D_f(T) = k_f(T)/(ρc_p)_ref
+
+i.e. the ρc_p variation is carried on the **convective** term, scaled by a
+*constant* reference (ρc_p)_ref. That is not cosmetic: dividing by the *local*
+ρc_p instead — putting α(T) = k/(ρc_p) straight into the Laplacian — breaks
+continuity of the physical heat flux k∇T at the fluid/solid interface, which
+is the one thing a conjugate formulation may not get wrong. The local thermal
+diffusivity α(T) = k/(ρc_p) = D_f/C is computed by the property class
+(`thermalPropertyTables::alphaField`) for diagnostics, and is deliberately
+never used to assemble the equation. All properties are re-evaluated from the
+current T every primal iteration, on cells *and* boundary faces. Derivation:
+[§6](docs/derivation.md).
+
+μ(T) reaches the momentum equation through a new incompressible transport
+model, `temperatureTable`, selected in `constant/transportProperties`:
+
+```
+transportModel  temperatureTable;
+temperatureTableCoeffs
+{
+    TRef        300;    // nu used before T exists
+    muTable     table ((300 1.0e-3) (340 5.0e-4));   // [Pa s]
+    rhoTable    table ((300 1000)   (340 850));      // [kg/m3]
+    // nuTable  table ((300 1e-6) (340 5.88e-7));    // [m2/s], alternative
+}
+```
+
+and the thermal tables go in the `thermal` subdict of **both** solvers:
+
+```
+thermal
+{
+    TRef            300;    // (rho cp)_ref = rho(TRef)*cp(TRef)
+    rhoTable        table ((300 1000) (340 850));
+    cpTable         table ((300 4000) (340 3600));
+    kFluidTable     table ((300 40)   (340 44));
+    DSolidTable     table ((300 1.2e-3) (340 0.8e-3));
+    Prt             0.85;
+    kInterpolation  { function BorrvallPetersson; b 20; }
+}
+```
+
+A table overrides its constant (`DFluid`, `DSolid`), so constant-property
+cases are unaffected and reproduce their earlier results bitwise. `rhoTable`
+appears in both dictionaries because OpenFOAM builds the transport model and
+the primal solver from different files; **keep them consistent — they are not
+cross-checked.** A variable-property case must also declare the adjoint's
+C-weighted convective flux in `fvSchemes`, which must *not* be `bounded`:
+
+```
+div(-phiC,Ta)   Gauss limitedLinear 1;
+```
+
+**Adjoint treatment: frozen-property linearisation.** ∂C/∂T, ∂D/∂T and ∂ν/∂T
+are not differentiated; C, D_eff and ν are frozen coefficient fields at the
+primal solution. The cost of that is measured, not assumed.
+
+**Verification** (`cases/varprops`, laminar, production configuration, all
+five tables active at once: ρ, c_p, k_f, μ *and* D_s; ρc_p varies −23.5 %,
+ν −41 %, k_f +10 %, D_s −33 % across the case's 300–339 K range):
+
+| Regime | median \|err\| | max \|err\| | same case, constant properties |
+|---|---|---|---|
+| solid interior | 0.4 % | 0.8 % | 0.5 % / 1.0 % |
+| interface edge | 0.7 % | 0.9 % | 0.6 % / 1.5 % |
+| sponge | 1.4 % | 1.5 % | 1.2 % / 1.7 % |
+
+Sign agreement 18/18 cells. Per-cell gradient accuracy with every property
+tabulated is indistinguishable from the constant-property campaign. Across
+the five directional derivatives the sign is likewise always correct, with
+magnitude errors of 2.0–5.8 % against 1–3 % constant-property — a modest,
+honestly-reported cost of the frozen-property terms. That μ(T) genuinely
+reaches momentum was confirmed against an otherwise identical constant-ν run
+(22 % change in peak pressure, 11.5 % in peak velocity).
+
+The tables are the mechanism; the verification values are chosen for FD
+conditioning. Production runs load real coolant/structural data through the
+same entries (for a fusion monoblock: IAPWS water at 95 bar, tungsten k(T)).
 
 ## Build
 

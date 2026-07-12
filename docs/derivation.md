@@ -45,7 +45,7 @@ Notes:
    (`betaMax`, interpolation function objects). I_k(β) for conductivity is a
    separate RAMP with its own convexity parameter, because the optimal
    penalisation of conduction and of momentum differ (large k-contrast is the
-   known hard case: continuation on the RAMP parameter is required; see §6).
+   known hard case: continuation on the RAMP parameter is required; see §7).
 3. **Turbulence masking.** ν_t/Pr_t is multiplied by (1 − I_k(β)) so
    solidified cells carry no turbulent diffusivity even where the turbulence
    model leaves residual ν_t.
@@ -130,6 +130,10 @@ untouched — they are inherited from `adjointOptimisationFoam`.
    equal the constant-property production campaign (solid 0.5% median /
    1.0% max; edge 0.6%/1.5%; sponge 1.2%/1.7%) - the frozen term
    contributes no measurable gradient error at these conditions.
+   **Extended 12 Jul 2026 to the fluid side** — ρ(T), c_p(T), k_f(T), μ(T)
+   as well as k_s(T), under the same frozen-property linearisation. The
+   formulation, its interface-continuity constraint and the verification
+   are in §6, which supersedes this note.
 
 ## 4. Sensitivities
 
@@ -216,7 +220,159 @@ upwind or limitedLinear over cellLimited-gradient linearUpwind near sharp
 Brinkman interfaces (limiter flip-flop stalls SIMPLE); primal outlet
 T_a = 0 (high-Peclet limit of the Robin condition).
 
-## 6. Constraints and optimiser
+## 6. Temperature-dependent material properties
+
+Implemented 12 July 2026, in **both** the fluid and the solid, active
+throughout the optimisation (primal, adjoint and sensitivity assembly).
+Supersedes the solid-only treatment of §3.3.2, which it subsumes.
+
+### 6.1 Primal formulation
+
+With variable properties the steady energy equation is
+
+    ρ(T) c_p(T) u·∇T = ∇·[k(T) ∇T]
+
+Divide through by a **constant** reference volumetric heat capacity
+(ρ c_p)_ref = ρ(T_ref) c_p(T_ref):
+
+    R_T ≡ C(T) u·∇T − ∇·[D_eff(β, T) ∇T] = 0
+
+    C(T)        = ρ(T) c_p(T) / (ρ c_p)_ref                       [−]
+    D_f(T)      = k_f(T) / (ρ c_p)_ref                            [m²/s]
+    D_s(T)      = k_s(T) / (ρ c_p)_ref     (tabulated directly)   [m²/s]
+    D_eff(β,T)  = D_f + (D_s − D_f) I_k(β) + (1 − I_k(β)) ν_t/Pr_t
+
+With constant properties C ≡ 1 and this collapses **exactly** to §1; the
+constant-property code path is unchanged and reproduces its earlier results
+bitwise.
+
+**Why the reference must be a constant, not the local ρc_p.** §1 note 1
+guarantees interface flux continuity because the *same constant* 1/(ρ_f c_p,f)
+multiplies the conductivity on both sides of every interior face: continuity
+of D∇T is then equivalent to continuity of the physical flux k∇T. That
+argument survives variable properties **only if the divisor stays constant**.
+Dividing instead by the local field ρ(T)c_p(T) would put the local thermal
+diffusivity α(T) = k/(ρ c_p) in the Laplacian, and
+
+    ∇·(α ∇T) ≠ (1/ρc_p) ∇·(k ∇T)    whenever ρc_p varies in space,
+
+the difference being a spurious flux α ∇ln(ρc_p)·∇T. It would also be
+meaningless across the fluid/solid interface, where the *fluid's* ρc_p has no
+definition on the solid side. So the ρc_p variation is carried on the
+convective term, where it belongs, and never inside the divergence. α(T) =
+D_f/C is exposed as a diagnostic output only; it is never used to assemble
+the equation.
+
+**Momentum.** ν(T) = μ(T)/ρ(T) enters through a new incompressible transport
+model, `viscosityModels::temperatureTable`, which looks T up from the object
+registry and rebuilds ν from the μ and ρ tables. `adjointOptimisationFoam`'s
+SIMPLE loop already calls `laminarTransport().correct()` once per iteration,
+so ν is refreshed every primal iteration with no change to the upstream loop.
+ν_eff = ν(T) + ν_t as before. (This is the registry-lookup pattern of the
+upstream `viscosityModels::Arrhenius` model, but ν is rebuilt from the tables
+each call rather than accumulated onto its previous value.)
+
+**Discretisation.** C multiplies the convection matrix row-wise (diagonal,
+off-diagonals, source and boundary coefficients), which is exactly
+C_P (u·∇T)_P V_P because the discrete face fluxes sum to zero. All properties
+are re-evaluated from the current T at every primal iteration, on cells *and*
+on boundary faces — the latter matters wherever solid meets a domain boundary
+(the CS9 plasma-facing surface), since a face diffusivity left at a constant
+would corrupt the wall heat flux.
+
+### 6.2 Adjoint: frozen-property linearisation
+
+C, D_eff and ν are treated as **frozen coefficient fields** evaluated at the
+converged primal T: the property derivatives ∂C/∂T, ∂D/∂T and ∂ν/∂T are not
+differentiated. Under that linearisation, δ_T of ∫ T_a R_T gives
+
+    −∇·(C u T_a) − ∇·(D_eff ∇T_a) = − Σ_k w_k dJ/dT_k
+
+and δ_u gives the modified thermal coupling into adjoint momentum
+
+    + C(T) T_a ∇T                                              (ATC-T)
+
+Both reduce to §3.1 and §3.2 when C ≡ 1.
+
+Note the C-weighted adjoint flux is **not** solenoidal: ∇·(C u) ≠ 0 where C
+varies. The adjoint convection must therefore use a *conservative*
+(unbounded) scheme. A "bounded" scheme subtracts Sp(∇·(C u), T_a), which
+would silently replace the conservative operator by the non-conservative
+form C u·∇T_a — not the transpose of the primal term, and a wrong gradient.
+The solver gives this flux its own scheme key, `div(-phiC,Ta)`, so a
+variable-property case must declare it explicitly rather than inherit a
+`bounded` entry by accident.
+
+Sensitivities (§4) are unchanged in form, with the properties evaluated at
+the frozen T:
+
+    dJ/dβ_c ⊃ − I_k'(β) [D_s(T) − D_f(T) − ν_t/Pr_t] (∇T·∇T_a) V_c
+
+C carries no β dependence: it multiplies convection, which the Brinkman term
+drives to zero in solidified cells.
+
+Omitted, and declared: ∂ν/∂T (the route by which adjoint momentum would feed
+back into T_a through viscosity), ∂C/∂T, ∂D/∂T, and — as in §3.3.1 — ν_t
+itself. The cost of these omissions is measured, not assumed (§6.3).
+
+### 6.3 Verification (12 July 2026)
+
+`cases/varprops`: the fdcheck geometry, laminar, production configuration
+(regularisation on, patch p-norm objective), with **all five tables active
+simultaneously** — ρ(T), c_p(T), k_f(T), μ(T) in the fluid and D_s(T) in the
+solid. A manufactured verification fluid, anchored so that at 300 K it
+reduces exactly to the constant-property case (ν = 1e-6, D_f = 1e-5) and the
+Péclet/Reynolds regime is unchanged. Variation over the case's 300–339 K
+range: ρ −15 %, c_p −10 %, ρc_p −23.5 % (so C: 1.000 → 0.765), k_f +10 %,
+μ −50 % (so ν: 1.0e-6 → 5.9e-7, Re 400 → 680), D_s −33 %.
+
+That μ(T) genuinely reaches the momentum equation was checked directly
+against an otherwise identical constant-ν run: 22 % change in peak pressure,
+11.5 % in peak velocity.
+
+Single-cell central differences, ε = 0.008, compared against `topOSensas1`:
+
+| Regime | median \|err\| | max \|err\| | constant-property campaign |
+|---|---|---|---|
+| solid interior | 0.4 % | 0.8 % | 0.5 % / 1.0 % |
+| interface edge | 0.7 % | 0.9 % | 0.6 % / 1.5 % |
+| sponge | 1.4 % | 1.5 % | 1.2 % / 1.7 % |
+
+Sign agreement: **18/18** cells. Per-cell accuracy with every property
+tabulated is statistically indistinguishable from the constant-property
+production campaign — the frozen-property terms contribute no measurable
+per-cell gradient error at these conditions.
+
+Directional derivatives over the 720 design cells (blob, band, three random)
+agree in sign in all five directions, with magnitude errors of 2.0–5.8 %
+against 1–3 % for the same directions with constant properties. This modest
+growth is the honest cost of the frozen-property linearisation and is
+reported as such; it is well inside what a descent direction needs, and the
+per-cell gradients that drive the filtered update are unaffected.
+
+Reproduce: `cases/varprops/Allrun` then `./fd_varprops.py`.
+
+### 6.4 Turbulent thermal diffusivity
+
+Pr_t is a documented constant (default 0.85), with ν_t/Pr_t masked by
+(1 − I_k(β)) as in §1 note 3, and frozen in the adjoint as in §3.3.1. The
+verification case is laminar (ν_t = 0), so this campaign does not exercise
+it. A tabulated or locally-varying Pr_t is a drop-in extension of the same
+Function1 machinery; quantification on turbulent cases remains roadmap, as
+for the frozen-ν_t term itself.
+
+### 6.5 Production data
+
+The tables are the mechanism; the values above are chosen for verification
+conditioning. Production runs load real coolant and structural data through
+the same entries — for CS9, IAPWS water at 95 bar and the Annex 1 Table 2
+tungsten conductivity. Note ρ and μ appear in *two* dictionaries
+(`constant/transportProperties` for the viscosity model,
+`optimisationDict`'s `thermal` subdict for the energy equation) because
+OpenFOAM constructs the transport model and the primal solver from different
+files; they are not cross-checked, and must be kept consistent by hand.
+
+## 7. Constraints and optimiser
 
 - **Pressure drop ≤ 340 Pa**: existing `objectivePtLosses` as an inequality
   constraint under the framework's ISQP/MMA update methods (upstream since
@@ -235,7 +391,7 @@ T_a = 0 (high-Peclet limit of the Robin condition).
   optimisation cycles (the 206:1 conductivity contrast makes early
   intermediate densities essential for a usable design space).
 
-## 7. CS9 mapping
+## 8. CS9 mapping
 
 | CS9 element | Formulation element |
 |---|---|
@@ -243,11 +399,11 @@ T_a = 0 (high-Peclet limit of the Robin condition).
 | Case 2 design domain (+ block minus 2 mm crust) | design cells extended to `Monoblock_main_body`; crust cells fixed solid |
 | Objective: peak plasma-facing T | `objectivePatchTemperaturePNorm` on Γ_pf |
 | ΔP ≤ 340 Pa | `objectivePtLosses` ISQP constraint |
-| No nucleate boiling | proxy constraint + ONB post-check (§6) |
+| No nucleate boiling | proxy constraint + ONB post-check (§7) |
 | Iterative geometry history (CS9R-4) | framework's per-cycle β/iso-surface writes (upstream) |
-| k_s(T) (CS9R-5, Desirable) | tungsten k(T) table in primal (§3.3) |
+| k_s(T) AND fluid rho,cp,k,mu (T) (CS9R-5, Desirable) | tabulated in primal, adjoint and sensitivities (§6) |
 
-## 8. Open questions for reviewers
+## 9. Open questions for reviewers
 
 1. Sign/normalisation of (ATC-T) against the NTUA residual convention —
    checked in code against FD, but an independent eye is wanted.

@@ -1,0 +1,132 @@
+FoamFile { version 2.0; format ascii; class dictionary; object optimisationDict; }
+
+// Variable-property verification case: rho(T), cp(T), k_f(T), mu(T) in the
+// fluid AND D_s(T) in the solid, all active through the optimisation.
+//
+// Manufactured verification fluid. At T = 300 K it reduces exactly to the
+// constant-property fdcheck case (nu = 1e-6, D_f = 1e-5), which keeps the
+// Peclet and Reynolds numbers in the regime all other FD campaigns were
+// conditioned on. Over 300 -> 340 K:
+//
+//     rho      1000  -> 850      (-15%)
+//     cp       4000  -> 3600     (-10%)
+//     rho*cp   4.0e6 -> 3.06e6   -> C(T) = 1.000 -> 0.765
+//     k_f      40    -> 44       -> D_f  = 1.0e-5 -> 1.1e-5
+//     mu       1e-3  -> 5e-4     -> nu   = 1.0e-6 -> 5.88e-7  (Re 400 -> 680)
+//     D_s      1.2e-3 -> 0.8e-3
+//
+// The absolute values are those of a Pr ~ 0.1 liquid-metal-like fluid, not
+// water: they are chosen so that every property path is exercised well above
+// FD noise while the 2-D case stays well conditioned. Production runs load
+// the same tables with real coolant data (IAPWS water for CS9).
+
+optimisationManager steadyOptimisation;
+
+primalSolvers
+{
+    op1
+    {
+        active                 true;
+        type                   incompressible;
+        solver                 thermalSimple;
+        thermal
+        {
+            DFluid          1.0e-5;     // ignored: kFluidTable present
+            DSolid          1.0e-3;     // ignored: DSolidTable present
+
+            TRef            300;        // (rho cp)_ref = rho(300)*cp(300)
+            rhoTable        table ((280 1075) (300 1000) (320 925) (340 850) (360 775));
+            cpTable         table ((280 4200) (300 4000) (320 3800) (340 3600) (360 3400));
+            kFluidTable     table ((280 38) (300 40) (320 42) (340 44) (360 46));
+            DSolidTable     table ((280 1.4e-3) (300 1.2e-3) (320 1.0e-3) (340 0.8e-3) (360 0.6e-3));
+
+            Prt             0.85;
+            kInterpolation { function BorrvallPetersson; b 20; }
+        }
+        solutionControls
+        {
+            nIters 6000;
+            residualControl { "p.*" 1e-8; "U.*" 1e-8; "T.*" 1e-9; }
+        }
+    }
+}
+
+adjointManagers
+{
+    adjManager1
+    {
+        primalSolver             op1;
+        adjointSolvers
+        {
+            as1
+            {
+                active                 false;
+                type                   incompressible;
+                solver                 thermalAdjointSimple;
+                computeSensitivities   true;
+                thermal
+                {
+                    DFluid          1.0e-5;
+                    DSolid          1.0e-3;
+
+                    TRef            300;
+                    rhoTable        table ((280 1075) (300 1000) (320 925) (340 850) (360 775));
+                    cpTable         table ((280 4200) (300 4000) (320 3800) (340 3600) (360 3400));
+                    kFluidTable     table ((280 38) (300 40) (320 42) (340 44) (360 46));
+                    DSolidTable     table ((280 1.4e-3) (300 1.2e-3) (320 1.0e-3) (340 0.8e-3) (360 0.6e-3));
+
+                    Prt             0.85;
+                    couplingSign    1;
+                    thermalSensScale 1;
+                    kInterpolation { function BorrvallPetersson; b 20; }
+                }
+                objectives
+                {
+                    type  incompressible;
+                    objectiveNames
+                    {
+                        pnormT
+                        {
+                            weight  1e-6;
+                            type    patchTemperaturePNorm;
+                            patches (topWall);
+                            P       8;
+                        }
+                    }
+                }
+                ATCModel { ATCModel standard; }
+                solutionControls
+                {
+                    nIters 3000;
+                    residualControl { "pa.*" 1e-8; "Ua.*" 1e-8; }
+                }
+            }
+        }
+    }
+}
+
+optimisation
+{
+    designVariables
+    {
+        type            topO;
+        sensitivityType topO;
+        writeAllFields  true;
+        writeFieldSens  true;
+        fixedZeroPorousZones (objZone);
+        regularisation
+        {
+            regularise     true;
+            growFromWalls  false;
+            meanRadiusMult 8;
+            function       tanh;
+            b              20;
+        }
+        betaMax    2500;
+        maxInitChange 0.2;
+    }
+    updateMethod
+    {
+        method steepestDescent;
+    }
+}

@@ -20,6 +20,25 @@ With regularisation active, compare FD against `topOSens<solver>`
 ## fdcheck-fine (120x48)
 4x refinement of fdcheck for the scheme-consistency study.
 
+## varprops (60x24, laminar 2D CHT, temperature-dependent properties)
+Gradient verification with rho(T), cp(T), k_f(T), mu(T) in the fluid AND
+D_s(T) in the solid, all active in primal, adjoint and sensitivities.
+Same geometry, design field and production configuration (regularisation +
+patch p-norm) as `fdcheck`, so the numbers are directly comparable.
+
+- `constant/transportProperties` selects the `temperatureTable` viscosity
+  model (mu(T)/rho(T)); switch it back to `Newtonian` for a constant-nu
+  comparison run.
+- `system/fvSchemes` declares `div(-phiC,Ta)` for the C(T)-weighted adjoint
+  flux. It must NOT be `bounded` — see derivation note section 6.2.
+- Dictionaries: `optimisationDict.varprops` / `.varprops_primalonly`
+- Driver: `./fd_varprops.py` (after `./Allrun`)
+
+Manufactured verification fluid: at 300 K it reduces exactly to the
+constant-property fdcheck case, and over 300-339 K rho*cp varies -23.5%,
+nu -41%, k_f +10%, D_s -33%. Results in the top-level README and
+derivation note section 6.3.
+
 ## demo2d
 Constrained heat-transfer enhancement demonstration: maximise downstream
 zone temperature subject to total-pressure losses <= 2x baseline (active

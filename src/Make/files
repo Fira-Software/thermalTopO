@@ -1,3 +1,5 @@
+thermalProperties/thermalPropertyTables.C
+viscosityModels/temperatureTable/temperatureTable.C
 solvers/thermalSimple/thermalSimple.C
 objectives/objectiveMeanTemperature.C
 objectives/objectivePatchTemperaturePNorm.C

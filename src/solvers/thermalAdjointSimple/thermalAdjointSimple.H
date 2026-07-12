@@ -18,10 +18,14 @@ Description
 
     Solves, before each adjoint momentum iteration,
 
-        div(-phi, Ta) - laplacian(DEff(beta), Ta) = - sum_k w_k dJdT_k
+        div(-C(T) phi, Ta) - laplacian(DEff(beta, T), Ta) = - sum_k w_k dJdT_k
 
-    and injects the thermal coupling source couplingSign*(Ta grad(T)) into
-    the adjoint momentum equation through the addMomentumSource hook.
+    and injects the thermal coupling source couplingSign*(C(T) Ta grad(T))
+    into the adjoint momentum equation through the addMomentumSource hook.
+
+    C(T) = rho(T) cp(T)/(rho cp)_ref is the normalised volumetric heat
+    capacity of the primal equation; it is unity for constant properties, and
+    both expressions then reduce to the constant-property adjoint.
 
     Boundary conditions on Ta: the solver drives every fixedGradient Ta
     patch with
@@ -36,11 +40,16 @@ Description
     Contributes the conductivity-interpolation sensitivity term through the
     topOSensMultiplier hook using its own kInterpolation RAMP.
 
-    Supports an optional temperature-dependent solid diffusivity table
-    (entry "DSolidTable", evaluated at the frozen primal T). v1
-    approximations (documented, quantified by the FD gate): frozen
-    turbulent thermal diffusivity in the adjoint; dD_s/dT linearisation
-    omitted (D_s evaluated at frozen T).
+    Supports temperature-dependent fluid and solid properties (tables rhoTable,
+    cpTable, kFluidTable, DSolidTable), evaluated at the converged primal T.
+
+    Frozen-property linearisation (v1, documented and FD-gated): the property
+    derivatives dC/dT, dD/dT and dnu/dT are omitted from the adjoint operator,
+    i.e. C, DEff and nu are treated as frozen coefficient fields at the primal
+    solution rather than as functions of the state. Also frozen: the turbulent
+    thermal diffusivity (constant Prt) and the turbulence model itself. The
+    resulting gradient error is measured, not assumed: see docs/derivation.md
+    section 6 and cases/varprops.
 
     Dictionary: same "thermal" sub-dictionary as thermalSimple, plus
     optional "couplingSign" (default 1) and "thermalSensScale" (default 1).
@@ -55,7 +64,7 @@ SourceFiles
 
 #include "adjointSimple.H"
 #include "topOInterpolationFunction.H"
-#include "Function1.H"
+#include "thermalPropertyTables.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -88,14 +97,10 @@ protected:
         //- Adjoint temperature field
         autoPtr<volScalarField> TaPtr_;
 
-        //- Molecular diffusivities, fluid and solid [m2/s]
-        scalar DFluid_;
-        scalar DSolid_;
+        //- Fluid and solid properties, evaluated at the frozen primal T
+        thermalPropertyTables props_;
 
-        //- Optional D_s(T) table, evaluated at the frozen primal T
-        autoPtr<Function1<scalar>> DSolidTablePtr_;
-
-        //- Turbulent Prandtl number
+        //- Turbulent Prandtl number (constant)
         scalar Prt_;
 
         //- Sign of the Ta grad(T) coupling into adjoint momentum

@@ -27,29 +27,46 @@ Description
     Extends the adjointOptimisationFoam 'simple' primal solver with a
     temperature equation
 
-        div(phi, T) - laplacian(DEff(beta), T) = 0
+        C(T) div(phi, T) - laplacian(DEff(beta, T), T) = 0
 
     where the effective diffusivity interpolates between fluid and solid
     conductivity over the topology-optimisation design field beta, looked up
     from the mesh registry ("topOVars", as populated by topODesignVariables),
     plus a turbulent contribution nut/Prt masked out of solidified cells:
 
-        DEff(beta) = DFluid + (DSolid - DFluid)*Ik(beta)
-                   + (1 - Ik(beta))*nut/Prt
+        DEff(beta, T) = DFluid(T) + (DSolid(T) - DFluid(T))*Ik(beta)
+                      + (1 - Ik(beta))*nut/Prt
 
-    All quantities are kinematic: DFluid = k_f/(rho_f cp_f),
-    DSolid = k_s/(rho_f cp_f). See docs/derivation.md section 1 for why the
-    single (rho cp)_f scaling is exact at steady state.
+    All quantities are kinematic, scaled by a *constant* reference volumetric
+    heat capacity (rho cp)_ref: DFluid = k_f/(rho cp)_ref,
+    DSolid = k_s/(rho cp)_ref, and
+
+        C(T) = rho(T) cp(T)/(rho cp)_ref
+
+    is the normalised volumetric heat capacity multiplying convection. With
+    constant properties C == 1 and the equation collapses to the form of
+    docs/derivation.md section 1; with tabulated rho, cp, k it is the variable
+    -property form of section 6. The reference must be constant for continuity
+    of DEff grad(T) to remain equivalent to continuity of the physical flux
+    k grad(T) at the fluid/solid interface.
+
+    Temperature-dependent properties are handled by thermalPropertyTables;
+    mu(T) enters the momentum equation separately, through the
+    viscosityModels::temperatureTable transport model.
 
     Dictionary entries (in the primal solver dict, subDict "thermal"):
     \verbatim
     thermal
     {
-        DFluid          1.72e-7;   // k_f/(rho_f cp_f)
-        DSolid          3.55e-5;   // k_s/(rho_f cp_f)
-        // optional temperature dependence, overrides DSolid:
-        // DSolidTable  table ((373 3.9e-5) (673 3.3e-5));
-        Prt             0.85;
+        DFluid          1.72e-7;   // k_f/(rho cp)_ref
+        DSolid          3.55e-5;   // k_s/(rho cp)_ref
+        // optional temperature dependence; a table overrides its constant:
+        // TRef         300;
+        // rhoTable     table ((300 1000)    (340 850));      // [kg/m3]
+        // cpTable      table ((300 4000)    (340 3600));     // [J/kg/K]
+        // kFluidTable  table ((300 40)      (340 44));       // [W/m/K]
+        // DSolidTable  table ((373 3.9e-5)  (673 3.3e-5));   // [m2/s]
+        Prt             0.85;      // constant turbulent Prandtl number
         kInterpolation             // RAMP for conductivity interpolation
         {
             function    BorrvallPetersson;
@@ -68,7 +85,7 @@ SourceFiles
 
 #include "simple.H"
 #include "topOInterpolationFunction.H"
-#include "Function1.H"
+#include "thermalPropertyTables.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -101,15 +118,10 @@ protected:
         //- Temperature field
         autoPtr<volScalarField> TPtr_;
 
-        //- Molecular diffusivities, fluid and solid [m2/s]
-        scalar DFluid_;
-        scalar DSolid_;
+        //- Fluid and solid properties, constant or tabulated in T
+        thermalPropertyTables props_;
 
-        //- Optional temperature-dependent solid diffusivity D_s(T) [m2/s];
-        //- overrides DSolid when present (entry "DSolidTable")
-        autoPtr<Function1<scalar>> DSolidTablePtr_;
-
-        //- Turbulent Prandtl number
+        //- Turbulent Prandtl number (constant; see docs/derivation.md 6.4)
         scalar Prt_;
 
         //- Interpolation function for the conductivity RAMP

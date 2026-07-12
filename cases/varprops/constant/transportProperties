@@ -1,0 +1,28 @@
+FoamFile { version 2.0; format ascii; class dictionary; object transportProperties; }
+
+// Temperature-dependent kinematic viscosity nu(T) = mu(T)/rho(T).
+// rho must match the rhoTable in system/optimisationDict.* (thermal subdict).
+transportModel  temperatureTable;
+
+temperatureTableCoeffs
+{
+    field       T;
+    TRef        300;    // nu used before T exists (first momentum assembly)
+
+    // mu [Pa s]: halves over 300 -> 340 K (water-like)
+    muTable     table
+    (
+        (280 1.4142e-3) (300 1.0000e-3) (320 7.0711e-4)
+        (340 5.0000e-4) (360 3.5355e-4)
+    );
+
+    // rho [kg/m3]
+    rhoTable    table
+    (
+        (280 1075) (300 1000) (320 925) (340 850) (360 775)
+    );
+}
+
+// Retained so that a constant-property comparison run can simply switch
+// transportModel back to Newtonian:
+nu              1e-06;

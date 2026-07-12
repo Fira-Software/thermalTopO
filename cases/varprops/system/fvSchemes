@@ -1,0 +1,25 @@
+FoamFile { version 2.0; format ascii; class dictionary; object fvSchemes; }
+ddtSchemes { default steadyState; }
+gradSchemes { default Gauss linear; gradConv cellLimited Gauss linear 1; }
+divSchemes
+{
+    default         none;
+    div(phi,U)      bounded Gauss upwind;
+    div(-phi,Ua)    bounded Gauss upwind;
+    div(phi,T)      bounded Gauss limitedLinear 1;
+    div(-phi,Ta)    bounded Gauss limitedLinear 1;
+    // C(T)-weighted adjoint flux: div(C u) != 0, so this must NOT be
+    // 'bounded' (that would subtract Sp(div(C u),Ta) and silently turn
+    // the conservative adjoint operator into a non-conservative one)
+    div(-phiC,Ta)   Gauss limitedLinear 1;
+    div((nuEff*dev2(T(grad(U))))) Gauss linear;
+    div((nuaEff*dev2(T(grad(Ua))))) Gauss linear;
+    div((nuEff*dev(T(grad(Ua)))))   Gauss linear;
+    div((nuEff*dev2(T(grad(Ua)))))  Gauss linear;
+    div((nu*dev(T(grad(Ua)))))      Gauss linear;
+    div((nuEff*dev(T(grad(U)))))    Gauss linear;
+}
+laplacianSchemes { default Gauss linear corrected; }
+interpolationSchemes { default linear; }
+snGradSchemes { default corrected; }
+wallDist { method meshWave; }

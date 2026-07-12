@@ -94,34 +94,16 @@ Foam::tmp<Foam::volScalarField> Foam::thermalAdjointSimple::kIndicator() const
 Foam::tmp<Foam::volScalarField> Foam::thermalAdjointSimple::DEff() const
 {
     const volScalarField Ik(kIndicator());
+    const volScalarField& T = TRef();
 
     const autoPtr<incompressible::turbulenceModel>& turbulence =
         primalVars_.turbulence();
 
-    auto tDs =
-        tmp<volScalarField>::New
-        (
-            IOobject
-            (
-                "DSolidFieldAdj",
-                mesh_.time().timeName(),
-                mesh_,
-                IOobject::NO_READ,
-                IOobject::NO_WRITE
-            ),
-            mesh_,
-            dimensionedScalar("DSolid", dimViscosity, DSolid_)
-        );
-    if (DSolidTablePtr_)
-    {
-        const volScalarField& T = TRef();
-        scalarField& Ds = tDs.ref().primitiveFieldRef();
-        forAll(Ds, celli)
-        {
-            Ds[celli] = DSolidTablePtr_->value(T[celli]);
-        }
-        tDs.ref().correctBoundaryConditions();
-    }
+    // Same property state as the primal, by construction: both solvers build
+    // their diffusivities from a thermalPropertyTables read from the same
+    // "thermal" sub-dictionary.
+    const volScalarField Df(props_.DFluidField(T, "DFluidFieldAdj"));
+    const volScalarField Ds(props_.DSolidField(T, "DSolidFieldAdj"));
 
     return tmp<volScalarField>::New
     (
@@ -133,8 +115,8 @@ Foam::tmp<Foam::volScalarField> Foam::thermalAdjointSimple::DEff() const
             IOobject::NO_READ,
             IOobject::NO_WRITE
         ),
-        dimensionedScalar("DFluid", dimViscosity, DFluid_)
-      + (tDs() - dimensionedScalar(dimViscosity, DFluid_))*Ik
+        Df
+      + (Ds - Df)*Ik
       + (scalar(1) - Ik)*turbulence->nut()/Prt_
     );
 }
@@ -184,6 +166,7 @@ void Foam::thermalAdjointSimple::solveTaEqn()
 {
     const surfaceScalarField& phi = primalVars_.phi();
     volScalarField& Ta = TaPtr_.ref();
+    const volScalarField& T = TRef();
 
     const volScalarField DEff(this->DEff());
 
@@ -218,9 +201,36 @@ void Foam::thermalAdjointSimple::solveTaEqn()
         }
     }
 
+    // Adjoint convection. The transpose of the primal term C(T) u.grad(T) is
+    // the conservative divergence -div(C u Ta), so the adjoint carries the
+    // C-weighted flux -C_f phi_f.
+    //
+    // This flux is NOT solenoidal (div(C u) != 0 where C varies), so it must
+    // use an unbounded convection scheme: a "bounded" scheme subtracts
+    // Sp(div(C u), Ta), which would quietly replace the conservative operator
+    // by the non-conservative C u.grad(Ta) and break adjoint consistency.
+    // Hence its own scheme key, div(-phiC,Ta), which a variable-property case
+    // must declare; the constant-property path keeps div(-phi,Ta) unchanged,
+    // where div(u) = 0 makes bounded and conservative forms identical.
+    tmp<surfaceScalarField> tNegPhiC;
+    word divScheme;
+
+    if (props_.variableRhoCp())
+    {
+        const volScalarField C(props_.CField(T, "rhoCpNorm"));
+
+        tNegPhiC = -fvc::interpolate(C)*phi;
+        divScheme = "div(-phiC,Ta)";
+    }
+    else
+    {
+        tNegPhiC = -phi;
+        divScheme = "div(-phi,Ta)";
+    }
+
     fvScalarMatrix TaEqn
     (
-        fvm::div(-phi, Ta)
+        fvm::div(tNegPhiC(), Ta, divScheme)
       - fvm::laplacian(DEff, Ta)
     );
 
@@ -238,7 +248,17 @@ void Foam::thermalAdjointSimple::addMomentumSource(fvVectorMatrix& matrix)
     const volScalarField& T = TRef();
     const volScalarField& Ta = TaPtr_();
 
-    matrix += couplingSign_*(Ta*fvc::grad(T))();
+    // d/du of the primal convective term C(T) u.grad(T), contracted with Ta
+    if (props_.variableRhoCp())
+    {
+        const volScalarField C(props_.CField(T, "rhoCpNorm"));
+
+        matrix += couplingSign_*(C*Ta*fvc::grad(T))();
+    }
+    else
+    {
+        matrix += couplingSign_*(Ta*fvc::grad(T))();
+    }
 }
 
 
@@ -255,9 +275,7 @@ Foam::thermalAdjointSimple::thermalAdjointSimple
 :
     adjointSimple(mesh, managerType, dict, primalSolverName, solverName),
     TaPtr_(nullptr),
-    DFluid_(Zero),
-    DSolid_(Zero),
-    DSolidTablePtr_(nullptr),
+    props_(),
     Prt_(0.85),
     couplingSign_(1),
     thermalSensScale_(1),
@@ -265,14 +283,8 @@ Foam::thermalAdjointSimple::thermalAdjointSimple
 {
     const dictionary& thermalDict = dict.subDict("thermal");
 
-    DFluid_ = thermalDict.get<scalar>("DFluid");
-    DSolid_ = thermalDict.get<scalar>("DSolid");
+    props_.read(thermalDict, mesh_);
     Prt_ = thermalDict.getOrDefault<scalar>("Prt", 0.85);
-    if (thermalDict.found("DSolidTable"))
-    {
-        DSolidTablePtr_ =
-            Function1<scalar>::New("DSolidTable", thermalDict, &mesh_);
-    }
     couplingSign_ = thermalDict.getOrDefault<scalar>("couplingSign", 1);
     thermalSensScale_ =
         thermalDict.getOrDefault<scalar>("thermalSensScale", 1);
@@ -308,8 +320,7 @@ bool Foam::thermalAdjointSimple::readDict(const dictionary& dict)
     if (adjointSimple::readDict(dict))
     {
         const dictionary& thermalDict = dict.subDict("thermal");
-        DFluid_ = thermalDict.get<scalar>("DFluid");
-        DSolid_ = thermalDict.get<scalar>("DSolid");
+        props_.read(thermalDict, mesh_);
         Prt_ = thermalDict.getOrDefault<scalar>("Prt", 0.85);
         couplingSign_ =
             thermalDict.getOrDefault<scalar>("couplingSign", 1);
@@ -341,8 +352,13 @@ void Foam::thermalAdjointSimple::topOSensMultiplier
     adjointSimple::topOSensMultiplier(betaMult, designVariablesName, dt);
 
     // Conductivity-interpolation contribution:
-    //   thermalSensScale * Ik'(beta) (DSolid - DFluid - nut/Prt)
+    //   thermalSensScale * Ik'(beta) (DSolid(T) - DFluid(T) - nut/Prt)
     //   (grad(T) . grad(Ta)) dt
+    //
+    // beta enters DEff only through Ik, so dDEff/dIk = Ds - Df - nut/Prt with
+    // the properties evaluated at the frozen primal T. C(T) carries no beta
+    // dependence: it multiplies convection, which the Brinkman term drives to
+    // zero in solidified cells.
     if (mesh_.foundObject<topOVariablesBase>("topOVars"))
     {
         const volScalarField& T = TRef();
@@ -353,20 +369,15 @@ void Foam::thermalAdjointSimple::topOSensMultiplier
         const volVectorField gradT(fvc::grad(T));
         const volVectorField gradTa(fvc::grad(Ta));
 
-        scalarField DsField(mesh_.nCells(), DSolid_);
-        if (DSolidTablePtr_)
-        {
-            forAll(DsField, celli)
-            {
-                DsField[celli] = DSolidTablePtr_->value(T[celli]);
-            }
-        }
+        const volScalarField Df(props_.DFluidField(T, "DFluidFieldSens"));
+        const volScalarField Ds(props_.DSolidField(T, "DSolidFieldSens"));
+
         scalarField thermSens
         (
             thermalSensScale_
            *(gradT.primitiveField() & gradTa.primitiveField())
            *(
-                DsField - DFluid_
+                Ds.primitiveField() - Df.primitiveField()
               - turbulence->nut()().primitiveField()/Prt_
             )
            *dt

@@ -103,53 +103,29 @@ Foam::tmp<Foam::volScalarField> Foam::thermalSimple::kIndicator() const
 Foam::tmp<Foam::volScalarField> Foam::thermalSimple::DEff() const
 {
     const volScalarField Ik(kIndicator());
+    const volScalarField& T = TPtr_();
 
     const autoPtr<incompressible::turbulenceModel>& turbulence =
         incoVars_.turbulence();
 
-    // solid diffusivity: constant, or D_s(T) from the optional table
-    auto tDs =
-        tmp<volScalarField>::New
+    // Fluid and solid diffusivities: constant, or D(T) from the tables
+    const volScalarField Df(props_.DFluidField(T, "DFluidField"));
+    const volScalarField Ds(props_.DSolidField(T, "DSolidField"));
+
+    return tmp<volScalarField>::New
+    (
+        IOobject
         (
-            IOobject
-            (
-                "DSolidField",
-                mesh_.time().timeName(),
-                mesh_,
-                IOobject::NO_READ,
-                IOobject::NO_WRITE
-            ),
+            "DEff",
+            mesh_.time().timeName(),
             mesh_,
-            dimensionedScalar("DSolid", dimViscosity, DSolid_)
-        );
-    if (DSolidTablePtr_)
-    {
-        const volScalarField& T = TPtr_();
-        scalarField& Ds = tDs.ref().primitiveFieldRef();
-        forAll(Ds, celli)
-        {
-            Ds[celli] = DSolidTablePtr_->value(T[celli]);
-        }
-        tDs.ref().correctBoundaryConditions();
-    }
-
-    auto tDEff =
-        tmp<volScalarField>::New
-        (
-            IOobject
-            (
-                "DEff",
-                mesh_.time().timeName(),
-                mesh_,
-                IOobject::NO_READ,
-                IOobject::NO_WRITE
-            ),
-            dimensionedScalar("DFluid", dimViscosity, DFluid_)
-          + (tDs() - dimensionedScalar(dimViscosity, DFluid_))*Ik
-          + (scalar(1) - Ik)*turbulence->nut()/Prt_
-        );
-
-    return tDEff;
+            IOobject::NO_READ,
+            IOobject::NO_WRITE
+        ),
+        Df
+      + (Ds - Df)*Ik
+      + (scalar(1) - Ik)*turbulence->nut()/Prt_
+    );
 }
 
 
@@ -161,13 +137,36 @@ void Foam::thermalSimple::solveTEqn()
 
     const volScalarField DEff(this->DEff());
 
-    fvScalarMatrix TEqn
-    (
-        fvm::div(phi, T)
-      - fvm::laplacian(DEff, T)
-     ==
-        fvOptions(T)
-    );
+    // Convection is scaled by C(T) = rho cp/(rho cp)_ref. Multiplying the
+    // convection matrix by a cell field scales each row (diag, off-diagonals
+    // and source) by C_P, which is exactly C_P (u.grad(T))_P V_P since the
+    // discrete face fluxes sum to zero.
+    tmp<fvScalarMatrix> tTEqn;
+
+    if (props_.variableRhoCp())
+    {
+        const volScalarField C(props_.CField(T, "rhoCpNorm"));
+
+        tTEqn =
+        (
+            C.internalField()*fvm::div(phi, T)
+          - fvm::laplacian(DEff, T)
+         ==
+            fvOptions(T)
+        );
+    }
+    else
+    {
+        tTEqn =
+        (
+            fvm::div(phi, T)
+          - fvm::laplacian(DEff, T)
+         ==
+            fvOptions(T)
+        );
+    }
+
+    fvScalarMatrix& TEqn = tTEqn.ref();
 
     TEqn.relax();
     fvOptions.constrain(TEqn);
@@ -191,22 +190,14 @@ Foam::thermalSimple::thermalSimple
 :
     simple(mesh, managerType, dict, solverName),
     TPtr_(nullptr),
-    DFluid_(Zero),
-    DSolid_(Zero),
-    DSolidTablePtr_(nullptr),
+    props_(),
     Prt_(0.85),
     kInterpolation_(nullptr)
 {
     const dictionary& thermalDict = dict.subDict("thermal");
 
-    DFluid_ = thermalDict.get<scalar>("DFluid");
-    DSolid_ = thermalDict.get<scalar>("DSolid");
+    props_.read(thermalDict, mesh_);
     Prt_ = thermalDict.getOrDefault<scalar>("Prt", 0.85);
-    if (thermalDict.found("DSolidTable"))
-    {
-        DSolidTablePtr_ =
-            Function1<scalar>::New("DSolidTable", thermalDict, &mesh_);
-    }
     kInterpolation_ =
         topOInterpolationFunction::New
         (
@@ -225,8 +216,7 @@ bool Foam::thermalSimple::readDict(const dictionary& dict)
     if (simple::readDict(dict))
     {
         const dictionary& thermalDict = dict.subDict("thermal");
-        DFluid_ = thermalDict.get<scalar>("DFluid");
-        DSolid_ = thermalDict.get<scalar>("DSolid");
+        props_.read(thermalDict, mesh_);
         Prt_ = thermalDict.getOrDefault<scalar>("Prt", 0.85);
 
         return true;
