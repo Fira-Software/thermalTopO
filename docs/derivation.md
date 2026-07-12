@@ -322,9 +322,10 @@ itself. The cost of these omissions is measured, not assumed (§6.3).
 simultaneously** — ρ(T), c_p(T), k_f(T), μ(T) in the fluid and D_s(T) in the
 solid. A manufactured verification fluid, anchored so that at 300 K it
 reduces exactly to the constant-property case (ν = 1e-6, D_f = 1e-5) and the
-Péclet/Reynolds regime is unchanged. Variation over the case's 300–339 K
-range: ρ −15 %, c_p −10 %, ρc_p −23.5 % (so C: 1.000 → 0.765), k_f +10 %,
-μ −50 % (so ν: 1.0e-6 → 5.9e-7, Re 400 → 680), D_s −33 %.
+Péclet/Reynolds regime is unchanged. Variation across the tabulated 300–340 K
+span (the case's temperature field reaches 338.8 K, so it realises very
+nearly all of it): ρ −15 %, c_p −10 %, ρc_p −23.5 % (so C: 1.000 → 0.765),
+k_f +10 %, μ −50 % (so ν: 1.0e-6 → 5.9e-7, Re 400 → 680), D_s −33 %.
 
 That μ(T) genuinely reaches the momentum equation was checked directly
 against an otherwise identical constant-ν run: 22 % change in peak pressure,

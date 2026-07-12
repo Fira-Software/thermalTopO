@@ -152,8 +152,9 @@ are not differentiated; C, D_eff and ν are frozen coefficient fields at the
 primal solution. The cost of that is measured, not assumed.
 
 **Verification** (`cases/varprops`, laminar, production configuration, all
-five tables active at once: ρ, c_p, k_f, μ *and* D_s; ρc_p varies −23.5 %,
-ν −41 %, k_f +10 %, D_s −33 % across the case's 300–339 K range):
+five tables active at once: ρ, c_p, k_f, μ *and* D_s. Across the tabulated
+300–340 K span, which the case's temperature field realises to 338.8 K:
+ρc_p −23.5 %, ν −41 %, k_f +10 %, D_s −33 %):
 
 | Regime | median \|err\| | max \|err\| | same case, constant properties |
 |---|---|---|---|
