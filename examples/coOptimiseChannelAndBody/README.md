@@ -185,27 +185,71 @@ ON the projection threshold, where P' is at its maximum of ~10:
 
 | cell | alphaTilda | beta | P'(alphaTilda) | K'(beta) | ratio/weight |
 |---|---|---|---|---|---|
-| 628 | 0.5019 | 0.5193 | **9.99** | 0.162 | **10.7** |
-| 626 | 0.5158 | 0.6528 | **9.07** | 0.106 | **36.1** |
+| 628 | 0.5019 | 0.5193 | 9.99 | 0.162 | 10.7 |
+| 626 | 0.5158 | 0.6528 | 9.07 | 0.106 | 36.1 |
 
-Cell 628: ratio/weight = 10.7 ~= P' = 9.99 -- the classic "projection applied
-one extra time" signature. Cell 626: 36.1 against P' = 9.07, which is 4x too
-big and **cannot** be any filter-weighted average of P', since P' is capped at
-10. So it is not a clean double-P' either. That is the paradox to resolve.
+Cell 628's ratio/weight matches its own P' almost exactly. Cell 626's does not.
+
+CORRECTION (an earlier version of this file argued that 36.1 > max(P') = 10 was
+impossible and therefore paradoxical -- that was WRONG). topOSens is a
+filter-weighted sum over NEIGHBOURS,
+
+    topOSens_k = V * sum_i  H_ik * P'_i * K'_i * g_i
+
+so the amplification relative to the probe cell's own P' can exceed max(P')
+freely. There is no paradox.
+
+### Localisation: it is the near-zero-beta cells
+
+`fd_localise.py` ranks the actual contributions, using the numerically measured
+Jacobian dbeta_i/dalpha_k. For probe cell 626:
+
+     cell    zone     beta   P'(aT)  dbeta/da       gbeta     contrib     %
+      786  design   0.0002    0.007    0.0001  -1.618e+05  -2.17e+01  31.8
+      785  design   0.0002    0.008    0.0001  -1.348e+05  -1.42e+01  20.7
+      787  design   0.0001    0.005    0.0001  -1.901e+05  -1.35e+01  19.8
+      626  design   0.6535    9.074    0.6596   1.704e+01   1.12e+01 -16.4  <- probe cell
+      708  design   0.0036    0.141    0.0014  -8.197e+03  -1.12e+01  16.4
+
+The probe cell contributes only -16 %, with the OPPOSITE sign to the total. The
+sum is dominated by **near-zero-beta fluid cells** (beta ~ 1e-4) whose pre-chain
+sensitivity gbeta is about **10^4 times larger** than the probe cell's
+(-1.6e5 vs +17).
+
+Those are exactly the cells where the BorrvallPetersson derivative
+`K'(beta) = q(1+q)/(beta+q)^2` and the Brinkman `a'(beta) = betaMax * I'(beta)`
+are maximal (q = 1/b = 0.05, betaMax = 2500).
+
+**And no ablation has ever tested gbeta there.** A and B only probe the
+*perturbed* cell's own gbeta (the chain is local, so neighbours never enter),
+and in C the projection is off, so beta never gets driven to ~1e-4 -- the
+filtered field alphaTilda stays moderate in the channel. Case D is the only one
+that both creates near-zero beta (projection sharpens alphaTilda ~ 0.1 down to
+~1e-4) AND pulls those cells into the probe's stencil (filter). That is why only
+D fails.
+
+**Fixed-zone ordering is NOT the cause.** beta does move in 48-52 fixed-zone
+cells under a raw-alpha perturbation, but their combined contribution is
++0.01 to +0.02 % of the total. Ruled out.
 
 ### Next diagnostic
 
-Stop altering the thermal operator. Instrument the chain instead: write the
-sensitivity **both before and after** `sourceTermSensitivities`, i.e.
+Verify the pre-chain sensitivity `gbeta` **in a near-zero-beta cell**. That
+region is untested by every ablation so far, and it dominates the failing sum.
+It cannot be FD'd directly by perturbing its own raw alpha (those channel cells
+sit at alpha = 0, so the minus side clips), so use one of:
 
-    scalarField thermSensPreChain(thermSens);
-    vars.sourceTermSensitivities(thermSens, ...);
-    scalarField thermSensPostChain(thermSens);
+- a design whose channel cells start at alpha = 0.05 rather than 0, so a
+  central difference is admissible there;
+- or split the written sensitivity into its two parts --
 
-and compare, cell by cell in the six probe cells, against `beta`, `alphaTilda`,
-the projection derivative `P'(alphaTilda)`, and the filter row/column sums.
-The failure is confined to cells with intermediate beta, so tabulating
-`ratio/weight` against `P'(alphaTilda)` is the direct test.
+      momPostChain   (from adjointSimple::topOSensMultiplier, the Brinkman term)
+      thermPostChain (ours, after sourceTermSensitivities)
+
+  and check which of the two carries the 1e5 magnitude at beta ~ 1e-4. The
+  Brinkman term is upstream code and scales as betaMax * I'(beta) = 2500 * 21 at
+  beta -> 0, so it is the more likely carrier -- in which case this is NOT a
+  thermalTopO bug at all.
 
 Until that is closed, **nothing from this case is evidence of anything.**
 
