@@ -34,9 +34,23 @@ of coolant channels in fusion plasma-facing components.
 | Patch p-norm (peak-surrogate) temperature objective | `objectivePatchTemperaturePNorm` | working |
 | Conductivity term in topology sensitivities | via `topOSensMultiplier` hook | working, FD-verified |
 | Bergles–Rohsenow onset-of-nucleate-boiling monitor | `boilingOnsetBerglesRohsenow` functionObject | working |
+| Discrete adjoint-transpose gate (no-solve operator test) | `utilities/testAdjointTranspose` | working |
 
 Everything plugs into unmodified OpenFOAM v2512 through its runtime-selection
 and sensitivity extension points; no core sources are patched.
+
+## How the repository is organised
+
+| Directory | Status |
+|---|---|
+| `src/` | the module |
+| **`cases/`** | **verified.** Every gradient claim in this README is reproduced here: `fdcheck` (FD gate), `varprops` (temperature-dependent properties), `demo2d` (constrained optimisation). Independently reproducible from a clean checkout. |
+| `utilities/` | verification tooling, incl. a no-solve operator-transpose gate |
+| `examples/` | **experimental.** Work in progress, published for transparency and reuse. Not evidence: see each example's own status section. |
+
+Verification is treated as a gate, not a report: an operator is checked
+algebraically before it is trusted, and a case is not cited until its gradients
+pass finite differences. `examples/` is where that work happens in the open.
 
 ## Verification (gradient correctness)
 
