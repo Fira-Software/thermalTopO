@@ -161,6 +161,10 @@ residuals with automated guards:
 
 ![FD verification](docs/figures/fd_verification.png)
 
+One global scale factor is applied consistently to account for the objective
+weight/sign convention; agreement is assessed cell-by-cell after that single
+factor.
+
 - **Single-cell central FD, solid interior, consistent 2nd-order schemes:
   zone-mean objective median |error| 0.5 % (max 2.1 %); patch p-norm
   objective median |error| 0.2 % (max 0.9 %).** Against the derivation
