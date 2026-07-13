@@ -40,7 +40,7 @@ shutil.copy("system/optimisationDict.baseline","system/optimisationDict")
 CELLS=[628,626]
 print(f"{'cell':>5} {'eps':>7} {'FD dJ/dalpha':>14} {'adj/FD':>12}")
 for i in CELLS:
-    for eps in (0.0005,0.001,0.002):
+    for eps in (3e-5,1e-4,3e-4,1e-3,3e-3):
         Js={}
         for tag,sg in (("+",1.),("-",-1.)):
             v=list(alpha0); v[i]+=sg*eps

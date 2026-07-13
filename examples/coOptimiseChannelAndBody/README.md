@@ -151,6 +151,48 @@ The ordering is correct (forward H then P; transpose P' then H^T), and
 transpose to 5 s.f. So the composition is right, which is what makes the D
 failure interesting rather than trivial.
 
+### Two more hypotheses killed (13 Jul, later)
+
+**FD secant vs tangent through the steep tanh — DEAD.** If the FD step were
+crossing the sharp projection, the adjoint (a local tangent) would exceed the
+FD (a secant), and the ratio would fall toward the weight as eps -> 0. It does
+not. Deep sweep in case D, eps from 3e-5 to 3e-3:
+
+    cell 628:  9.87e-6, 1.071e-5, 1.073e-5, 1.077e-5, 1.101e-5
+    cell 626:  3.58e-5, 3.60e-5,  3.61e-5,  3.61e-5,  3.85e-5
+
+Flat across two decades, no trend toward 1e-6. It is a real chain error, not
+FD resolution.
+
+**Chain order / double application — NOT VISIBLE IN THE CODE.** The chain is
+fully determined and is correct:
+
+- `topOVariablesBase::sourceTerm` interpolates with `this->beta()`, the
+  PROJECTED field, so `Ik = K(P(H alpha))` -- filter, then projection, then
+  conductivity interpolation. That is the physically right order (not
+  `H(K(...))`).
+- `sourceTermSensitivities` is literally `sens *= betaMax * K'(beta)`
+  (betaMax = 1 for us). Nothing else.
+- `postProcessSens` then applies `P'(alphaTilda)`, then `H^T`, then `* V`.
+
+so `topOSens = V * H^T * diag(P'(alphaTilda)) * diag(K'(beta)) * dJ/dIk`,
+which IS `dIk/dalpha = K'(beta) * P'(alphaTilda) * H` transposed. No double
+application, correct order. (The mesh is uniform, so `*V` commuting past `H^T`
+is harmless.)
+
+**The smoking-gun table, which half-fires.** Both probe cells sit essentially
+ON the projection threshold, where P' is at its maximum of ~10:
+
+| cell | alphaTilda | beta | P'(alphaTilda) | K'(beta) | ratio/weight |
+|---|---|---|---|---|---|
+| 628 | 0.5019 | 0.5193 | **9.99** | 0.162 | **10.7** |
+| 626 | 0.5158 | 0.6528 | **9.07** | 0.106 | **36.1** |
+
+Cell 628: ratio/weight = 10.7 ~= P' = 9.99 -- the classic "projection applied
+one extra time" signature. Cell 626: 36.1 against P' = 9.07, which is 4x too
+big and **cannot** be any filter-weighted average of P', since P' is capped at
+10. So it is not a clean double-P' either. That is the paradox to resolve.
+
 ### Next diagnostic
 
 Stop altering the thermal operator. Instrument the chain instead: write the
