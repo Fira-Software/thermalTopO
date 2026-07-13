@@ -63,31 +63,83 @@ Inside the plateau:
   Here the ratio is **1e-5 to 4e-5**: both ~10–40x too large *and* varying by
   3.3x between neighbouring cells.
 
-**What has been ruled out:**
+### What has been ruled out (each by measurement, not argument)
 
-- *Not* FD noise or step size — the plateau is flat and reproducible.
-- *Not* an unconverged primal — `residualControl` is met and the FD harness
-  refuses any sample whose objective is still moving.
-- *Not* cell-volume/geometry bookkeeping — the mesh is uniform (every cell
-  1.5 x 1.0 x 1.0 mm), so a `V`/`magSf` convention error cannot produce a
-  cell-to-cell spread.
-- *Not* the cell-centred vs face-based conductivity sensitivity. The
-  sensitivity is now computed **face-based** (differentiating the discrete
-  `fvm::laplacian(DEff, T)` operator itself, see the code comment in
-  `topOSensMultiplier`), which is the correct discrete derivative and is
-  kept. It moved the ratios from 1.244e-5 / 4.132e-5 to 1.074e-5 / 3.678e-5:
-  the 3.3x spread is **unchanged**. So the material-interface interpolation is
-  not the cause.
+Reproduce with `fd_sweep.py`, `fd_sweep_noreg.py`, `fd_chain.py`.
 
-**Leading remaining suspect: the regularisation/projection chain.** A pure
-interface error would not inflate the overall scale by an order of magnitude.
-With `tanh` projection at b = 20, dbeta/dalpha_filtered peaks near 10 and
-swings hard wherever the filtered field crosses the 0.5 threshold — which is
-exactly the body/channel interface in this case, and never happens in
-`cases/fdcheck`, whose design field sits at alpha = 0.05–0.35, far from the
-threshold. The next step is to instrument the chain: write `alphaTilda`,
-`beta`, and `dbeta/dalphaTilda`, and FD the chain itself
-(`dbeta_j/dalpha_i`) rather than the whole objective.
+1. **FD noise / step size.** `fd_sweep.py` shows a flat plateau at
+   eps <= 0.002 (stable to 3 s.f.). The eps >= 0.01 artefacts — including a
+   *sign flip* — were the step size, not the code.
+2. **Unconverged primal.** `residualControl` is met and the harness rejects
+   any sample whose objective is still moving.
+3. **Volume / geometry bookkeeping.** The mesh is uniform (every cell
+   1.5 x 1.0 x 1.0 mm), so a `V`/`magSf` convention error cannot produce a
+   *cell-to-cell* spread.
+4. **Cell-centred vs face-based conductivity sensitivity.** The sensitivity is
+   now computed **face-based**, differentiating the discrete
+   `fvm::laplacian(DEff, T)` operator itself (see the derivation in the code
+   comment in `topOSensMultiplier`). It is the correct discrete derivative and
+   is kept — but it moved the ratios only from 1.244e-5 / 4.132e-5 to
+   1.074e-5 / 3.678e-5. **The 3.3x spread is unchanged**, so the material-
+   interface interpolation is NOT the cause.
+5. **The thermal sensitivity itself (pre-chain dJ/dbeta) is CORRECT.**
+   `fd_sweep_noreg.py` reruns the gate with the Helmholtz filter off. Then:
+
+       cell 628: ratio = 1.1286e-6      (FD 1.82170e-2 / 1.82165e-2 / 1.82173e-2)
+       cell 626: ratio = 1.1700e-6
+
+   Both equal the objective **weight (1e-6)** and agree with each other to
+   3.7 % — the same quality as `cases/fdcheck`. Whatever is broken, it is not
+   the thermal adjoint, not the objective, and not the conductivity term.
+6. **The tanh projection derivative.** In the filter-off ablation the
+   projection is still active, and `dbeta/dalphaTilda` cancels exactly between
+   `topOSens` and the FD (it appears once in the forward map and once in the
+   transpose). That ablation passes, so the projection derivative is fine.
+7. **`postProcessSens` IS the exact transpose of the true beta(alpha) map.**
+   `fd_chain.py` is a chain-only test with no PDE physics: freeze the
+   pre-chain field `gbeta = topologySens`, measure the true Jacobian
+   `dbeta_i/dalpha_k` by perturbing raw alpha and reading the solver's own
+   `beta`, and compare `sum_i gbeta_i * dbeta_i/dalpha_k` against `topOSens_k`.
+   Result: the two agree to 5 significant figures for both probe cells, up to
+   a single global factor of 6.6667e8 = **1/V** (the volume weight
+   `postProcessSens` applies at the end). A single raw-alpha perturbation
+   correctly spreads to ~420 beta cells, so the filter really is active.
+
+### The remaining suspect: the filter path
+
+Turning the Helmholtz filter on is what breaks it:
+
+| cell | ratio, filter OFF | ratio, filter ON | inflation |
+|---|---|---|---|
+| 628 | 1.13e-6 | 1.07e-5 | **9.5x** |
+| 626 | 1.17e-6 | 3.68e-5 | **31.5x** |
+
+The relevant upstream code is `fieldRegularisation::postProcessSens`
+(`.../topODesignVariables/regularisation/fieldRegularisation.C:154`):
+
+    if (project_)    sens *= sharpenFunction_->derivative(betaArg_);  // dbeta/dalphaTilda
+    if (regularise_) regularise(sens, sens, false);                   // filter transpose
+    sens *= mesh_.V();                                                // volume
+
+against the forward map in `updateBeta()`:
+
+    if (regularise_) regularise(alpha_, alphaTilda_(), true);         // filter
+    if (project_)    sharpenFunction_->interpolate(betaArg_, beta_);  // projection
+
+Note `project_` and `regularise_` are **separate flags**: the filter-off
+ablation above still projects.
+
+**Open logical tension, for whoever picks this up.** Test 7 says the transpose
+is exact; test 5 says the pre-chain sensitivity is correct; yet composing them
+fails. One of the two must be state-dependent — they were measured on
+*different* beta fields (near-binary with the filter off, smooth with it on).
+That is the thread to pull.
+
+**Next experiment (ablation C):** filter ON, projection OFF
+(`regularise true`, `project false`). That isolates the filter transpose with
+nothing else in the path. If the ratio stays at 1e-6 the bug is in the
+interaction; if it inflates, it is the Helmholtz transpose or its volume
+weighting.
 
 Until that is closed, **nothing from this case is evidence of anything.**
 

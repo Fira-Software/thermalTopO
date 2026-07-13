@@ -32,10 +32,10 @@ def getJ(log):
 def clean():
     for d in ("1","2","optimisation"): shutil.rmtree(d,ignore_errors=True)
 
-shutil.copy("system/optimisationDict.sens","system/optimisationDict")
+shutil.copy("system/optimisationDict.sens.noreg","system/optimisationDict")
 clean(); run("log.sw_sens")
 sens=readf("1/topOSensas1"); alpha0=readf("0/alpha")
-shutil.copy("system/optimisationDict.baseline","system/optimisationDict")
+shutil.copy("system/optimisationDict.baseline.noreg","system/optimisationDict")
 
 CELLS=[628,626]
 print(f"{'cell':>5} {'eps':>7} {'FD dJ/dalpha':>14} {'adj/FD':>12}")

@@ -1,0 +1,90 @@
+FoamFile { version 2.0; format ascii; class dictionary; object optimisationDict; }
+// One primal solve on the baseline geometry: reports the peak-surface p-norm
+// and the raw total-pressure loss used to set the constraint target.
+optimisationManager steadyOptimisation;
+
+primalSolvers
+{
+    op1
+    {
+        active true; type incompressible; solver thermalSimple;
+        thermal
+        {
+            DFluid  1.0e-5;
+            DSolid  1.0e-3;
+            Prt     0.85;
+            kInterpolation { function BorrvallPetersson; b 20; }
+        }
+        solutionControls
+        {
+            nIters 20000;
+            consistent true;
+            residualControl { "p.*" 1e-8; "U.*" 1e-8; "T.*" 1e-11; }
+        }
+    }
+}
+
+adjointManagers
+{
+    am1
+    {
+        primalSolver op1;
+        adjointSolvers
+        {
+            as1
+            {
+                active false; type incompressible; solver thermalAdjointSimple;
+                computeSensitivities false;
+                thermal
+                {
+                    DFluid 1.0e-5; DSolid 1.0e-3; Prt 0.85;
+                    couplingSign 1; thermalSensScale 1;
+                    kInterpolation { function BorrvallPetersson; b 20; }
+                }
+                objectives
+                {
+                    type incompressible;
+                    objectiveNames
+                    {
+                        peakT { weight 1e-6; type patchTemperaturePNorm; patches (heatedSurface); P 8; }
+                    }
+                }
+                ATCModel { ATCModel standard; }
+                solutionControls { nIters 1; }
+            }
+            dp
+            {
+                active false; type incompressible; solver adjointSimple;
+                isConstraint true;
+                objectives
+                {
+                    type incompressible;
+                    objectiveNames
+                    {
+                        losses { weight 1.; type PtLosses; patches (inlet outlet); normalise false; }
+                    }
+                }
+                ATCModel { ATCModel standard; }
+                solutionControls { nIters 1; }
+            }
+        }
+    }
+}
+
+optimisation
+{
+    designVariables
+    {
+        type            topO;
+        sensitivityType topO;
+        writeAllFields  true;
+        adjointPorousZones   (designSpace);
+        fixedPorousZones     (crustZone baseZone);
+        fixedPorousValues    (1 1);
+        fixedZeroPorousZones (inletPlug outletPlug);
+        regularisation { regularise false; growFromWalls false; meanRadiusMult 8; function tanh; b 20; }
+        betaMax    2500;
+        maxInitChange 0.05;
+    }
+    updateMethod { method nullSpace; }
+}
