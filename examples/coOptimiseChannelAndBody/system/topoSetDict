@@ -1,0 +1,27 @@
+FoamFile { version 2.0; format ascii; class dictionary; object topoSetDict; }
+
+// designSpace  -> adjointPorousZones  : the ONLY cells the optimiser may move.
+//                 Spans the coolant channel AND the surrounding body, so both
+//                 are decided by the same design field.
+// crustZone,
+// baseZone     -> fixedPorousZones     : pinned SOLID (alpha = 1)
+// inletPlug,
+// outletPlug   -> fixedZeroPorousZones : pinned FLUID (alpha = 0)
+
+actions
+(
+    { name designSet;  type cellSet; action new; source boxToCell; box (0.012 0.004 -1) (0.108 0.020 1); }
+    { name designSpace; type cellZoneSet; action new; source setToCellZone; set designSet; }
+
+    { name crustSet;   type cellSet; action new; source boxToCell; box (-1 0.0199 -1) (1 1 1); }
+    { name crustZone;  type cellZoneSet; action new; source setToCellZone; set crustSet; }
+
+    { name baseSet;    type cellSet; action new; source boxToCell; box (-1 -1 -1) (1 0.0041 1); }
+    { name baseZone;   type cellZoneSet; action new; source setToCellZone; set baseSet; }
+
+    { name inPlugSet;  type cellSet; action new; source boxToCell; box (-1 0.008 -1) (0.012 0.016 1); }
+    { name inletPlug;  type cellZoneSet; action new; source setToCellZone; set inPlugSet; }
+
+    { name outPlugSet; type cellSet; action new; source boxToCell; box (0.108 0.008 -1) (1 0.016 1); }
+    { name outletPlug; type cellZoneSet; action new; source setToCellZone; set outPlugSet; }
+);

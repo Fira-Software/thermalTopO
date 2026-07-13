@@ -12,6 +12,7 @@
 #include "thermalSimple.H"
 #include "topOVariablesBase.H"
 #include "fvOptions.H"
+#include "extrapolatedCalculatedFvPatchFields.H"
 #include "fvm.H"
 #include "fvc.H"
 #include "addToRunTimeSelectionTable.H"
@@ -54,6 +55,14 @@ void Foam::thermalSimple::allocateThermalFields()
 
 Foam::tmp<Foam::volScalarField> Foam::thermalSimple::kIndicator() const
 {
+    // extrapolatedCalculated, NOT calculated: beta is a cell field with no
+    // boundary values of its own, so the indicator on a boundary face must be
+    // extrapolated from the adjacent cell. With plain calculated patches
+    // correctBoundaryConditions() is a no-op and every boundary face would
+    // keep Ik = 0 — i.e. DEff on any wall would be the FLUID diffusivity even
+    // where the design is solid, understating the wall heat flux by the full
+    // solid/fluid ratio. That is exactly the plasma-facing surface of a
+    // fixed-solid crust.
     auto tindicator =
         tmp<volScalarField>::New
         (
@@ -66,7 +75,8 @@ Foam::tmp<Foam::volScalarField> Foam::thermalSimple::kIndicator() const
                 IOobject::NO_WRITE
             ),
             mesh_,
-            dimensionedScalar(dimless, Zero)
+            dimensionedScalar(dimless, Zero),
+            extrapolatedCalculatedFvPatchScalarField::typeName
         );
     volScalarField& indicator = tindicator.ref();
 

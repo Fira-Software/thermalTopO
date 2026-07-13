@@ -1,0 +1,165 @@
+FoamFile { version 2.0; format ascii; class dictionary; object optimisationDict; }
+
+// Case-2-style co-optimisation: the coolant path AND the surrounding
+// conductive body are decided by ONE design field, while a solid crust under
+// the heated surface is pinned and the inlet/outlet plugs are pinned fluid.
+//
+// minimise   peak temperature on the heated surface  (p-norm surrogate, P=8)
+// subject to total-pressure loss <= 1.3 x baseline
+//
+// Baseline (system/optimisationDict.baseline, 1920 cells):
+//     peak-surface p-norm  426.303364802 K
+//     total-pressure loss  1.42793637581e-10   -> target 1.85632e-10
+
+optimisationManager steadyOptimisation;
+
+primalSolvers
+{
+    op1
+    {
+        active true; type incompressible; solver thermalSimple;
+        thermal
+        {
+            DFluid  1.0e-5;      // coolant
+            DSolid  1.0e-3;      // conductive body (contrast 100)
+            Prt     0.85;
+            kInterpolation { function BorrvallPetersson; b 20; }
+        }
+        solutionControls
+        {
+            nIters 6000;
+            consistent true;
+            residualControl { "p.*" 1e-8; "U.*" 1e-8; "T.*" 1e-9; }
+        }
+    }
+}
+
+adjointManagers
+{
+    am1
+    {
+        primalSolver op1;
+        adjointSolvers
+        {
+            // objective: minimise the peak temperature of the heated surface
+            as1
+            {
+                active true; type incompressible; solver thermalAdjointSimple;
+                computeSensitivities true;
+                thermal
+                {
+                    DFluid 1.0e-5; DSolid 1.0e-3; Prt 0.85;
+                    couplingSign 1; thermalSensScale 1;
+                    kInterpolation { function BorrvallPetersson; b 20; }
+                }
+                objectives
+                {
+                    type incompressible;
+                    objectiveNames
+                    {
+                        peakT
+                        {
+                            weight     1e-6;    // positive = minimise
+                            type       patchTemperaturePNorm;
+                            patches    (heatedSurface);
+                            P          8;
+                        }
+                    }
+                }
+                ATCModel { ATCModel standard; }
+                solutionControls
+                {
+                    nIters 3000;
+                    consistent true;
+                    residualControl { "pa.*" 1e-8; "Ua.*" 1e-8; }
+                }
+            }
+
+            // constraint: total-pressure loss <= 1.3 x baseline
+            dp
+            {
+                active true; type incompressible; solver adjointSimple;
+                isConstraint true;
+                objectives
+                {
+                    type incompressible;
+                    objectiveNames
+                    {
+                        losses
+                        {
+                            weight     1.;
+                            type       PtLosses;
+                            patches    (inlet outlet);
+                            normalise  true;
+                            normFactor 1.42793637581e-10;   // baseline
+                            target     1.85632e-10;     // 1.3 x baseline
+                        }
+                    }
+                }
+                ATCModel { ATCModel standard; }
+                solutionControls
+                {
+                    nIters 3000;
+                    consistent true;
+                    residualControl { "pa.*" 1e-8; "Ua.*" 1e-8; }
+                }
+            }
+            // constraint: solid volume <= baseline (material is REDISTRIBUTED,
+            // not created). Geometric objective on a null solver: no adjoint,
+            // so it cannot diverge, and it conditions the dual problem.
+            vol
+            {
+                active true; type null;
+                isConstraint true;
+                objectives
+                {
+                    type geometric;
+                    objectiveNames
+                    {
+                        vol
+                        {
+                            weight     1.;
+                            type       topOVolume;
+                            percentage 0.666;   // baseline solid fraction of
+                                                // the design space (1024 of
+                                                // 1536 cells are body-ish)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+optimisation
+{
+    designVariables
+    {
+        type            topO;
+        sensitivityType topO;
+        writeAllFields  true;
+        writeFieldSens  true;
+
+        // THE POINT OF THIS EXAMPLE ------------------------------------
+        // one design field spanning coolant path + conductive body:
+        adjointPorousZones   (designSpace);
+        // protected crust under the heated surface, and the conductive base:
+        fixedPorousZones     (crustZone baseZone);
+        fixedPorousValues    (1 1);           // pinned SOLID
+        // coolant must always be able to get in and out:
+        fixedZeroPorousZones (inletPlug outletPlug);   // pinned FLUID
+        // --------------------------------------------------------------
+
+        regularisation
+        {
+            regularise     true;      // no checkerboard / small-scale porosity
+            growFromWalls  false;
+            meanRadiusMult 8;
+            function       tanh;
+            b              20;
+        }
+        betaMax    2500;
+        maxInitChange 0.02;
+    }
+    updateMethod { method nullSpace; }
+}

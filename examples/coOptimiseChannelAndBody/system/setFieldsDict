@@ -1,0 +1,17 @@
+FoamFile { version 2.0; format ascii; class dictionary; object setFieldsDict; }
+
+// Baseline geometry: a straight coolant channel through a conductive body.
+// The body starts at 0.7 rather than a hard 1.0 so the projection is
+// differentiable at cycle 0 (standard continuation practice); the crust and
+// base are true solids, pinned at 1.0 by fixedPorousValues.
+
+defaultFieldValues ( volScalarFieldValue alpha 0.7 );
+
+regions
+(
+    // the initial channel: fluid
+    boxToCell { box (-1 0.008 -1) (1 0.016 1); fieldValues ( volScalarFieldValue alpha 0 ); }
+    // crust and base: solid
+    boxToCell { box (-1 0.0199 -1) (1 1 1);    fieldValues ( volScalarFieldValue alpha 1 ); }
+    boxToCell { box (-1 -1 -1) (1 0.0041 1);   fieldValues ( volScalarFieldValue alpha 1 ); }
+);

@@ -1,0 +1,17 @@
+FoamFile { version 2.0; format ascii; class dictionary; object controlDict; }
+libs ("libthermalTopO.so");
+application     adjointOptimisationFoam;
+startFrom       startTime;
+startTime       0;
+stopAt          endTime;
+endTime         20;         // optimisation cycles
+deltaT          1;
+writeControl    timeStep;
+writeInterval   5;          // design history every 5 cycles
+                             // (the beta iso-surface STL/VTK is written EVERY
+                             //  cycle by the framework, to optimisation/topOIsoSurfaces)
+purgeWrite      0;
+writeFormat     ascii;
+writePrecision  12;
+timeFormat      general;
+runTimeModifiable true;

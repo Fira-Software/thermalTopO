@@ -137,7 +137,7 @@ thermal
 ```
 
 A table overrides its constant (`DFluid`, `DSolid`), so constant-property
-cases are unaffected and reproduce their earlier results bitwise. `rhoTable`
+cases take an unchanged code path. `rhoTable`
 appears in both dictionaries because OpenFOAM builds the transport model and
 the primal solver from different files; **keep them consistent — they are not
 cross-checked.** A variable-property case must also declare the adjoint's
@@ -160,7 +160,7 @@ five tables active at once: ρ, c_p, k_f, μ *and* D_s. Across the tabulated
 |---|---|---|---|
 | solid interior | 0.4 % | 0.8 % | 0.5 % / 1.0 % |
 | interface edge | 0.7 % | 0.9 % | 0.6 % / 1.5 % |
-| sponge | 1.4 % | 1.5 % | 1.2 % / 1.7 % |
+| sponge | 1.4 % | 1.6 % | 1.2 % / 1.7 % |
 
 Sign agreement 18/18 cells. Per-cell gradient accuracy with every property
 tabulated is indistinguishable from the constant-property campaign. Across

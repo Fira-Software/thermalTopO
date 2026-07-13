@@ -1,0 +1,16 @@
+#!/bin/sh
+cd "${0%/*}" || exit
+. ${WM_PROJECT_DIR:?}/bin/tools/RunFunctions
+
+runApplication blockMesh
+runApplication topoSet
+runApplication setFields
+
+# baseline: one primal solve on the channel-in-body starting geometry
+cp system/optimisationDict.baseline system/optimisationDict
+runApplication -s baseline $(getApplication)
+
+# co-optimisation of the coolant path and the conductive body
+rm -rf 1 2 optimisation
+cp system/optimisationDict.coopt system/optimisationDict
+runApplication -s coopt $(getApplication)

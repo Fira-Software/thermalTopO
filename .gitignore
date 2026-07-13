@@ -10,6 +10,19 @@ cases/*/fd_*.log
 cases/*/*.png
 cases/*/constant/polyMesh/
 cases/*/mesh_info.txt
+examples/*/[0-9]*/
+!examples/*/0/
+!examples/*/0/**
+examples/*/processor*/
+examples/*/optimisation/
+examples/*/postProcessing/
+examples/*/log.*
+examples/*/fd_*.log
+examples/*/constant/polyMesh/
+examples/*/system/optimisationDict
+examples/*/system/optimisationDict.tmpl
+examples/*/system/optimisationDict.sens
+examples/*/system/optimisationDict.dponly
 # build artefacts
 src/Make/linux*/
 src/lnInclude/

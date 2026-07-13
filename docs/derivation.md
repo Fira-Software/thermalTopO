@@ -337,7 +337,7 @@ Single-cell central differences, ε = 0.008, compared against `topOSensas1`:
 |---|---|---|---|
 | solid interior | 0.4 % | 0.8 % | 0.5 % / 1.0 % |
 | interface edge | 0.7 % | 0.9 % | 0.6 % / 1.5 % |
-| sponge | 1.4 % | 1.5 % | 1.2 % / 1.7 % |
+| sponge | 1.4 % | 1.6 % | 1.2 % / 1.7 % |
 
 Sign agreement: **18/18** cells. Per-cell accuracy with every property
 tabulated is statistically indistinguishable from the constant-property

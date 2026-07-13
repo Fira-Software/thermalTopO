@@ -9,7 +9,10 @@
 #include "topOVariablesBase.H"
 #include "objectiveIncompressible.H"
 #include "fixedGradientFvPatchFields.H"
+#include "extrapolatedCalculatedFvPatchFields.H"
 #include "sensitivityTopO.H"
+#include "topOZones.H"
+#include "bitSet.H"
 #include "fvm.H"
 #include "fvc.H"
 #include "addToRunTimeSelectionTable.H"
@@ -46,6 +49,8 @@ const Foam::volScalarField& Foam::thermalAdjointSimple::TRef() const
 
 Foam::tmp<Foam::volScalarField> Foam::thermalAdjointSimple::kIndicator() const
 {
+    // extrapolatedCalculated: see the note in thermalSimple::kIndicator().
+    // The adjoint must see the same DEff as the primal, boundaries included.
     auto tindicator =
         tmp<volScalarField>::New
         (
@@ -58,7 +63,8 @@ Foam::tmp<Foam::volScalarField> Foam::thermalAdjointSimple::kIndicator() const
                 IOobject::NO_WRITE
             ),
             mesh_,
-            dimensionedScalar(dimless, Zero)
+            dimensionedScalar(dimless, Zero),
+            extrapolatedCalculatedFvPatchScalarField::typeName
         );
     volScalarField& indicator = tindicator.ref();
 
@@ -150,13 +156,15 @@ void Foam::thermalAdjointSimple::updateTaBCs(const volScalarField& DEffField)
                 }
             }
 
-            const scalarField DEffp
-            (
-                DEffField.boundaryField()[pI].patchInternalField()
-            );
+            // Face diffusivity, not the adjacent cell value: the adjoint BC
+            // D_face*snGrad(Ta) = -dJ/dT must use the SAME face coefficient
+            // the primal Laplacian uses. patchInternalField() would be
+            // inconsistent with it, and the discrepancy is real now that the
+            // conductivity indicator is extrapolated to boundary faces.
+            const scalarField DEffp(DEffField.boundaryField()[pI]);
 
             refCast<fixedGradientFvPatchScalarField>(Tap).gradient() =
-                flux/DEffp;
+                flux/max(DEffp, scalarField(DEffp.size(), SMALL));
         }
     }
 }
@@ -385,6 +393,60 @@ void Foam::thermalAdjointSimple::topOSensMultiplier
 
         const topOVariablesBase& vars =
             mesh_.lookupObject<topOVariablesBase>("topOVars");
+
+        // Mask cells the optimiser may not move (pinned solid/fluid zones,
+        // anything outside the design space, and the cells next to inlets and
+        // outlets). Upstream restricts the *update* to the active design
+        // variables anyway, but this term is ours: zero it explicitly rather
+        // than rely on that, so a stray sensitivity can never leak into a
+        // fixed zone and so the written topOSens field is honest about where
+        // the design can actually change.
+        const topOZones& zones = vars.getTopOZones();
+
+        auto zeroZone = [&](const label zoneID)
+        {
+            if (zoneID != -1)
+            {
+                for (const label celli : mesh_.cellZones()[zoneID])
+                {
+                    thermSens[celli] = Zero;
+                }
+            }
+        };
+
+        for (const label zoneID : zones.fixedPorousZoneIDs())
+        {
+            zeroZone(zoneID);
+        }
+        for (const label zoneID : zones.fixedZeroPorousZoneIDs())
+        {
+            zeroZone(zoneID);
+        }
+        for (const label celli : zones.IOCells())
+        {
+            thermSens[celli] = Zero;
+        }
+
+        // If an explicit design space is given, keep only those cells
+        if (!zones.adjointPorousZoneIDs().empty())
+        {
+            bitSet isDesign(mesh_.nCells(), false);
+            for (const label zoneID : zones.adjointPorousZoneIDs())
+            {
+                for (const label celli : mesh_.cellZones()[zoneID])
+                {
+                    isDesign.set(celli);
+                }
+            }
+            forAll(thermSens, celli)
+            {
+                if (!isDesign.test(celli))
+                {
+                    thermSens[celli] = Zero;
+                }
+            }
+        }
+
         vars.sourceTermSensitivities
         (
             thermSens,
