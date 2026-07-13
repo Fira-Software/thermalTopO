@@ -281,7 +281,78 @@ Decomposing the sensitivity by coupling sign (the Brinkman term is linear in
 Neither part equals the weight, so both the coupled and uncoupled halves are off
 at these cells.
 
+### ATC-T: sign AND continuous form both tested. Neither is the fix.
+
+**Label correction.** Setting `thermalSensScale 0` removes only our **direct
+conductivity sensitivity**. It does NOT remove thermalTopO from the picture: the
+thermal objective still drives the adjoint momentum through
+`addMomentumSource()`, and the upstream Brinkman formula then consumes that
+`u_a`. So the split above is
+
+    direct conductivity sensitivity        (thermalTopO, the term we add)
+    thermal-INDUCED Brinkman sensitivity   (upstream formula, OUR u_a)
+
+and NOT "ours vs upstream". The upstream formula is proven correct by the
+flow-only test; the suspect was always the `u_a` our coupling produces.
+
+**Both continuous forms fail.** The two candidate ATC-T sources differ by a pure
+gradient (`Ta grad(T) = grad(Ta T) - T grad(Ta)`), which an incompressible
+adjoint can absorb into adjoint pressure in the continuum but not necessarily
+discretely. Both are now implemented behind `couplingForm` and both were run in
+case D (eps = 1e-3; target ratio = 1e-6):
+
+| couplingForm | cell 628 | cell 626 |
+|---|---|---|
+| `TaGradT` (default) | 1.04e-5 | 3.55e-5 |
+| `negTGradTa` | 1.24e-5 | 4.52e-5 |
+
+`negTGradTa` is slightly WORSE. Combined with the earlier `couplingSign = -1`
+test (which gave negative ratios), the discrepancy is largely **insensitive to
+the ATC-T form**: sign flip, form swap, and default all land in the same 10-45x
+band. So "the continuous coupling source is simply the wrong expression" does
+not explain it either.
+
+The `couplingForm` switch is retained -- it is cheap, documented, and the right
+place to plug in a discrete face-based transpose when one is written.
+
 ### Next diagnostic
+
+The remaining rigorous test is an **operator-only FD of ATC-T**, with no
+optimisation and no primal/adjoint solve. Freeze T, Ta, U, phi, C and the mesh.
+Define the functional corresponding to the primal thermal convection residual,
+
+    M(U) = sum_cells Ta_P * R_conv,P(U, T)      // R_conv from fvm::div(phi(U), T)
+
+and finite-difference M with respect to a velocity component in the suspect
+open-fluid cells. Compare against the vector source that `addMomentumSource()`
+actually inserts. That settles unambiguously whether the continuous source is
+the discrete transpose of `fvm::div(phi,T)`, and it fixes the sign convention
+without guesswork. It is the exact analogue of `fd_chain.py`, but for
+
+    U -> phi(U) -> fvm::div(phi,T) -> thermal residual -> adjoint momentum source
+
+rather than the design-variable chain.
+
+Companion test case: an **open-channel variant of `cases/fdcheck`** (initial
+alpha 0 through the design box, so u.u_a is large and the Brinkman term carries
+real weight). Every existing case puts the design in a low-velocity Brinkman
+sponge, which is why none of them exercises this path.
+
+### Technical debt found on the way (variable rho cp)
+
+Not the current bug -- this case is constant-property -- but it must be on the
+Q7 list before variable fluid properties are trusted in OPEN-flow optimisation.
+The primal row-scales the convection matrix, `C.internalField()*fvm::div(phi,T)`,
+while the adjoint uses a face-interpolated flux `C_f phi_f`. The exact transpose
+of a cell-row-scaled convection matrix is not generally the face-interpolated
+form: it should involve owner/neighbour cell factors, closer to
+
+    C_P Ta_P - C_N Ta_N     rather than     C_f (Ta_P - Ta_N)
+
+In `cases/varprops` the design sits in a sponge, so this is not exercised there
+either.
+
+### Status
 
 Audit the **ATC-T coupling term** `couplingSign * C(T) * Ta * grad(T)` in
 `thermalAdjointSimple::addMomentumSource()` against the derivation

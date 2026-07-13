@@ -256,16 +256,38 @@ void Foam::thermalAdjointSimple::addMomentumSource(fvVectorMatrix& matrix)
     const volScalarField& T = TRef();
     const volScalarField& Ta = TaPtr_();
 
-    // d/du of the primal convective term C(T) u.grad(T), contracted with Ta
+    // (ATC-T) the thermal coupling into adjoint momentum: d/du of the primal
+    // convective term C(T) u.grad(T), contracted with Ta.
+    //
+    // Two continuous forms are available, related by
+    //     Ta grad(T) = grad(Ta T) - T grad(Ta)
+    // so they differ by a pure gradient, which an incompressible adjoint can in
+    // principle absorb into the adjoint pressure. That cancellation is exact in
+    // the continuum but NOT guaranteed discretely, especially across sharp
+    // Brinkman/conductivity interfaces. They are offered as a switch because
+    // this is exactly the term under investigation (see
+    // examples/coOptimiseChannelAndBody): the two forms are the cheap proxy for
+    // "is our continuous source the discrete transpose of fvm::div(phi,T)?".
+    tmp<volVectorField> tSource;
+
+    if (couplingForm_ == "negTGradTa")
+    {
+        tSource = -T*fvc::grad(Ta);
+    }
+    else    // "TaGradT", the default
+    {
+        tSource = Ta*fvc::grad(T);
+    }
+
     if (props_.variableRhoCp())
     {
         const volScalarField C(props_.CField(T, "rhoCpNorm"));
 
-        matrix += couplingSign_*(C*Ta*fvc::grad(T))();
+        matrix += couplingSign_*(C*tSource())();
     }
     else
     {
-        matrix += couplingSign_*(Ta*fvc::grad(T))();
+        matrix += couplingSign_*tSource();
     }
 }
 
@@ -287,6 +309,7 @@ Foam::thermalAdjointSimple::thermalAdjointSimple
     Prt_(0.85),
     couplingSign_(1),
     thermalSensScale_(1),
+    couplingForm_("TaGradT"),
     kInterpolation_(nullptr)
 {
     const dictionary& thermalDict = dict.subDict("thermal");
@@ -296,6 +319,8 @@ Foam::thermalAdjointSimple::thermalAdjointSimple
     couplingSign_ = thermalDict.getOrDefault<scalar>("couplingSign", 1);
     thermalSensScale_ =
         thermalDict.getOrDefault<scalar>("thermalSensScale", 1);
+    couplingForm_ =
+        thermalDict.getOrDefault<word>("couplingForm", "TaGradT");
     kInterpolation_ =
         topOInterpolationFunction::New
         (
@@ -334,6 +359,8 @@ bool Foam::thermalAdjointSimple::readDict(const dictionary& dict)
             thermalDict.getOrDefault<scalar>("couplingSign", 1);
         thermalSensScale_ =
             thermalDict.getOrDefault<scalar>("thermalSensScale", 1);
+        couplingForm_ =
+            thermalDict.getOrDefault<word>("couplingForm", "TaGradT");
         // rebuild: otherwise RAMP continuation through a dictionary re-read
         // would be silently ignored
         kInterpolation_ =

@@ -109,6 +109,10 @@ protected:
         //- Scale (incl. sign) of the conductivity sensitivity term
         scalar thermalSensScale_;
 
+        //- Continuous form of the (ATC-T) coupling into adjoint momentum:
+        //- "TaGradT" (default) or "negTGradTa". See addMomentumSource().
+        word couplingForm_;
+
         //- Interpolation function for the conductivity RAMP
         autoPtr<topOInterpolationFunction> kInterpolation_;
 
