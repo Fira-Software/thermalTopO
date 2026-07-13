@@ -4,7 +4,7 @@ Perturb single design cells, re-solve the primal, compare central FD against
 topOSensas1. Body cells (alpha=0.7) only, so alpha+-eps stays inside [0,1]."""
 import os,re,shutil,subprocess
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
-EPS=0.005
+EPS=0.05      # signal must clear primal-convergence bias
 def run(log):
     with open(log,"w") as f:
         subprocess.run(["adjointOptimisationFoam"],stdout=f,stderr=subprocess.STDOUT)
@@ -31,6 +31,10 @@ boundaryField
 """)
 def getJ(log):
     v=[float(x) for x in re.findall(r'peakT : ([0-9eE+.-]+)',open(log).read()) if float(x)>1]
+    if len(v) < 2:
+        raise RuntimeError(f"{log}: no objective history")
+    if abs(v[-1]-v[-2]) > 1e-7:
+        raise RuntimeError(f"{log}: J STILL MOVING ({v[-1]-v[-2]:+.3e}) - primal not converged")
     return v[-1]
 def clean():
     for d in ("1","2","optimisation"): shutil.rmtree(d,ignore_errors=True)

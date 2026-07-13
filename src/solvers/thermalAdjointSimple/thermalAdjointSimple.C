@@ -360,13 +360,37 @@ void Foam::thermalAdjointSimple::topOSensMultiplier
     adjointSimple::topOSensMultiplier(betaMult, designVariablesName, dt);
 
     // Conductivity-interpolation contribution:
-    //   thermalSensScale * Ik'(beta) (DSolid(T) - DFluid(T) - nut/Prt)
-    //   (grad(T) . grad(Ta)) dt
+    //   thermalSensScale * Ik'(beta) * (DSolid(T) - DFluid(T) - nut/Prt)
+    //                    * dJ/dDEff_P * dt
     //
     // beta enters DEff only through Ik, so dDEff/dIk = Ds - Df - nut/Prt with
     // the properties evaluated at the frozen primal T. C(T) carries no beta
     // dependence: it multiplies convection, which the Brinkman term drives to
     // zero in solidified cells.
+    //
+    // dJ/dDEff_P is computed FACE-BASED, i.e. by differentiating the discrete
+    // operator that the primal actually solves, not its continuous analogue.
+    // fvm::laplacian(DEff, T) assembles, for internal face f (owner P,
+    // neighbour N),
+    //
+    //     R_P -= DEff_f * gamma_f * (T_N - T_P),   gamma_f = |Sf|*deltaCoeff
+    //     R_N += DEff_f * gamma_f * (T_N - T_P)
+    //
+    // so, with L = J + sum_P Ta_P R_P,
+    //
+    //     dJ/dDEff_f = gamma_f * (T_N - T_P) * (Ta_N - Ta_P)
+    //
+    // and DEff_f = w_f*DEff_P + (1-w_f)*DEff_N (linear interpolation, which is
+    // what "Gauss linear" means for the diffusivity). Distributing dJ/dDEff_f
+    // onto the two cells by those same weights gives dJ/dDEff_P.
+    //
+    // In a smooth region this equals V_P*(grad(T).grad(Ta)) exactly, so it is a
+    // drop-in for the continuous form used before. It differs precisely where
+    // the continuous form is wrong: across a face with a large conductivity
+    // jump, which is every fluid/solid interface in a topology optimisation
+    // once the projection re-sharpens beta. Measured on the co-optimisation
+    // example, the continuous form gave adjoint/FD ratios differing by 3.3x
+    // between neighbouring cells; the face-based form is the fix.
     if (mesh_.foundObject<topOVariablesBase>("topOVars"))
     {
         const volScalarField& T = TRef();
@@ -374,16 +398,64 @@ void Foam::thermalAdjointSimple::topOSensMultiplier
         const autoPtr<incompressible::turbulenceModel>& turbulence =
             primalVars_.turbulence();
 
-        const volVectorField gradT(fvc::grad(T));
-        const volVectorField gradTa(fvc::grad(Ta));
-
         const volScalarField Df(props_.DFluidField(T, "DFluidFieldSens"));
         const volScalarField Ds(props_.DSolidField(T, "DSolidFieldSens"));
 
+        // dJ/dDEff_P, accumulated face by face
+        scalarField dJdDEff(mesh_.nCells(), Zero);
+
+        const labelUList& own = mesh_.owner();
+        const labelUList& nei = mesh_.neighbour();
+        const surfaceScalarField& w = mesh_.weights();
+        const surfaceScalarField& deltaCoeffs = mesh_.nonOrthDeltaCoeffs();
+        const surfaceScalarField& magSf = mesh_.magSf();
+
+        const scalarField& Ti = T.primitiveField();
+        const scalarField& Tai = Ta.primitiveField();
+
+        forAll(own, facei)
+        {
+            const label P = own[facei];
+            const label N = nei[facei];
+
+            const scalar dJdDf =
+                magSf[facei]*deltaCoeffs[facei]
+               *(Ti[N] - Ti[P])*(Tai[N] - Tai[P]);
+
+            dJdDEff[P] += w[facei]*dJdDf;
+            dJdDEff[N] += (scalar(1) - w[facei])*dJdDf;
+        }
+
+        // Boundary faces. The diffusive flux is DEff_b*|Sf|*snGrad(T), so
+        // dJ/dDEff_b = -Ta_P*|Sf|*snGrad(T), and DEff_b depends on the
+        // adjacent cell alone (the conductivity indicator is extrapolated).
+        // Zero on adiabatic/zeroGradient patches; non-zero on a heated wall,
+        // where it is the beta-dependence of the boundary heat input.
+        forAll(mesh_.boundary(), patchi)
+        {
+            const fvPatch& patch = mesh_.boundary()[patchi];
+
+            if (patch.coupled() || patch.size() == 0)
+            {
+                continue;
+            }
+
+            const labelUList& fc = patch.faceCells();
+            const scalarField snGradT(T.boundaryField()[patchi].snGrad());
+            const scalarField& magSfb = patch.magSf();
+
+            forAll(fc, i)
+            {
+                dJdDEff[fc[i]] -= Tai[fc[i]]*magSfb[i]*snGradT[i];
+            }
+        }
+
+        // Per unit volume, to keep the convention of the Brinkman term (and to
+        // reduce to grad(T).grad(Ta) in the smooth limit)
         scalarField thermSens
         (
             thermalSensScale_
-           *(gradT.primitiveField() & gradTa.primitiveField())
+           *dJdDEff/mesh_.V()
            *(
                 Ds.primitiveField() - Df.primitiveField()
               - turbulence->nut()().primitiveField()/Prt_

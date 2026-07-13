@@ -17,9 +17,9 @@ primalSolvers
         }
         solutionControls
         {
-            nIters 6000;
+            nIters 20000;
             consistent true;
-            residualControl { "p.*" 1e-8; "U.*" 1e-8; "T.*" 1e-9; }
+            residualControl { "p.*" 1e-8; "U.*" 1e-8; "T.*" 1e-11; }
         }
     }
 }

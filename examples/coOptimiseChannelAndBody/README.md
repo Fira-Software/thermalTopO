@@ -45,28 +45,51 @@ Run: `./Allrun`. Gradient check: `./fd_check.py`.
 
 ## Verification status — why this is not yet a demonstrator
 
-`fd_check.py` compares the adjoint sensitivity against central finite
-differences on single design cells, against the **converged** primal:
+`fd_check.py` / `fd_sweep.py` compare the adjoint sensitivity against central
+finite differences on single design cells, against the **converged** primal.
 
-- **Sign: correct in 6/6 cells.**
-- **Magnitude: NOT verified.** The adjoint/FD ratio spans 4.2e-6 to 5.8e-5 —
-  a 14x spread across neighbouring cells. In `cases/fdcheck` and
-  `cases/varprops` the same check agrees to 0.4–1.6 %.
+First: the FD itself must be trusted. A step-size sweep shows a clean plateau
+at eps <= 0.002 (FD stable to 3 significant figures); at eps >= 0.01 the tanh
+projection (b = 20) is so nonlinear that the FD can even change sign. Anything
+outside the plateau is an artefact, not a finding.
 
-The suspected cause is the one thing this case has and the verified cases do
-not: **design cells directly abutting pinned-solid zones.** The conductivity
-sensitivity is currently a cell-centred form,
+Inside the plateau:
 
-    dJ/dbeta  ~  I_k'(beta) * (D_s - D_f - nu_t/Pr_t) * (grad(T) . grad(Ta))
+- **Sign: correct.**
+- **Magnitude: WRONG, and not yet explained.** With `weight 1e-6` and no
+  normalisation, `topOSens` must equal `weight * dJ/dalpha`, so the
+  adjoint/FD ratio must be **1e-6 in every cell** — which is what
+  `cases/fdcheck` shows (fitted scale 8.93e-7, cells agreeing to 0.4–1.6 %).
+  Here the ratio is **1e-5 to 4e-5**: both ~10–40x too large *and* varying by
+  3.3x between neighbouring cells.
 
-whereas the discrete primal diffusion operator uses *face* coefficients. At a
-face between an active design cell and a pinned solid cell — with a large
-conductivity contrast — the two are not the same, and the discrete derivative
-needs `dD_face/dD_cell` through the face interpolation. The FD-verified cases
-deliberately keep the design box several cells clear of walls and fixed zones,
-so they never exercised this. Fixing it properly means a **face-based discrete
-conductivity sensitivity**; that is the next piece of work, and until it is
-done the numbers from this case are not evidence of anything.
+**What has been ruled out:**
+
+- *Not* FD noise or step size — the plateau is flat and reproducible.
+- *Not* an unconverged primal — `residualControl` is met and the FD harness
+  refuses any sample whose objective is still moving.
+- *Not* cell-volume/geometry bookkeeping — the mesh is uniform (every cell
+  1.5 x 1.0 x 1.0 mm), so a `V`/`magSf` convention error cannot produce a
+  cell-to-cell spread.
+- *Not* the cell-centred vs face-based conductivity sensitivity. The
+  sensitivity is now computed **face-based** (differentiating the discrete
+  `fvm::laplacian(DEff, T)` operator itself, see the code comment in
+  `topOSensMultiplier`), which is the correct discrete derivative and is
+  kept. It moved the ratios from 1.244e-5 / 4.132e-5 to 1.074e-5 / 3.678e-5:
+  the 3.3x spread is **unchanged**. So the material-interface interpolation is
+  not the cause.
+
+**Leading remaining suspect: the regularisation/projection chain.** A pure
+interface error would not inflate the overall scale by an order of magnitude.
+With `tanh` projection at b = 20, dbeta/dalpha_filtered peaks near 10 and
+swings hard wherever the filtered field crosses the 0.5 threshold — which is
+exactly the body/channel interface in this case, and never happens in
+`cases/fdcheck`, whose design field sits at alpha = 0.05–0.35, far from the
+threshold. The next step is to instrument the chain: write `alphaTilda`,
+`beta`, and `dbeta/dalphaTilda`, and FD the chain itself
+(`dbeta_j/dalpha_i`) rather than the whole objective.
+
+Until that is closed, **nothing from this case is evidence of anything.**
 
 ## Findings that came out of building it (these ARE solid)
 
