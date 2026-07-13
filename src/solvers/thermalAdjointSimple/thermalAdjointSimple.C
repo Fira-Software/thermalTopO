@@ -268,6 +268,14 @@ void Foam::thermalAdjointSimple::addMomentumSource(fvVectorMatrix& matrix)
     // this is exactly the term under investigation (see
     // examples/coOptimiseChannelAndBody): the two forms are the cheap proxy for
     // "is our continuous source the discrete transpose of fvm::div(phi,T)?".
+    if (couplingForm_ == "none")
+    {
+        // Null test: no thermal coupling into adjoint momentum at all. Used to
+        // prove that Ua (and hence the Brinkman sensitivity) really is driven
+        // only by this term when there is no flow objective.
+        return;
+    }
+
     tmp<volVectorField> tSource;
 
     if (couplingForm_ == "negTGradTa")

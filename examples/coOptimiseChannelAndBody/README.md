@@ -315,17 +315,92 @@ not explain it either.
 The `couplingForm` switch is retained -- it is cheap, documented, and the right
 place to plug in a discrete face-based transpose when one is written.
 
+### Null test PASSES (no contamination)
+
+With `couplingForm none` + `thermalSensScale 0` and only the thermal objective
+active (no flow objective, no PtLosses adjoint in the sensitivity field):
+
+    1/Ua          = uniform (0 0 0)     EXACTLY
+    1/topOSensas1 = uniform 0           EXACTLY
+
+So the adjoint velocity, and therefore the entire Brinkman contribution to the
+thermal objective, is driven **solely** by our ATC-T coupling. The comparison is
+not contaminated by a stale Ua, a pressure-loss adjoint or a default objective
+source. `couplingForm none` is retained as a permanent guard.
+
+### Convection scheme: error shrinks with diffusivity, but the scheme test is INCONCLUSIVE
+
+The case uses `bounded Gauss upwind` for `div(phi,T)` and `div(-phi,Ta)` (forced
+by the limiter stall). The discrete transpose of an UPWIND convection matrix is a
+downwind operator, not the reversed-flux upwind operator, so
+`fvm::div(-phi,Ta)` is not guaranteed to be the algebraic transpose of
+`fvm::div(phi,T)`. To test, the case was smoothed (D_f 1e-5 -> 1e-4,
+D_s 1e-3 -> 1e-2, contrast unchanged; cell Peclet 3 -> 0.3) so that a
+near-self-adjoint scheme is admissible:
+
+| convection scheme | cell 628 | cell 626 |
+|---|---|---|
+| upwind (smoothed) | 5.73e-6 | 2.79e-6 |
+| linear (smoothed) | 5.28e-6 | 2.79e-6 |
+| *(original, Pe ~3, upwind)* | *1.04e-5* | *3.55e-5* |
+
+Two readings:
+
+1. **The scheme barely matters here -- but the test is WEAK.** At Pe ~ 0.3 upwind
+   and linear nearly coincide, so this cannot discriminate between them. A real
+   scheme test needs HIGH Pe with a self-adjoint scheme, which is exactly where
+   central convection oscillates. The scalar-transpose hypothesis is therefore
+   **not killed; it is untested.**
+
+2. **Raising the diffusivity 10x collapsed the error from 10-36x to 2.8-5.7x.**
+   That confirms the PATH: more diffusion -> weaker grad(T) -> smaller Ta ->
+   weaker ATC-T source -> smaller u_a -> smaller thermal-induced Brinkman term.
+   The error scales with the strength of exactly the path localised above.
+
+But it remains **3-6x off even in a smooth, low-Peclet, nearly self-adjoint
+configuration**, so the fault is not merely an upwind-transpose artefact.
+Something in the ATC-T -> Brinkman path is wrong independently of the convection
+scheme.
+
 ### Next diagnostic
 
-The remaining rigorous test is an **operator-only FD of ATC-T**, with no
-optimisation and no primal/adjoint solve. Freeze T, Ta, U, phi, C and the mesh.
+The remaining rigorous test is an **operator-only FD**, with no optimisation and
+no primal/adjoint solve. Do it in TWO parts, scalar first:
+
+**(1) Is `fvm::div(-phi,Ta)` the algebraic transpose of `fvm::div(phi,T)`?**
+Freeze phi, T, Ta, C, mesh and schemes. For an internal face f (owner P,
+neighbour N) with frozen primal face value `T_f = cP_f T_P + cN_f T_N` (freeze the
+limiter; for upwind cP/cN are 1/0 by flux sign), the primal contributes
+`R_P += phi_f T_f`, `R_N -= phi_f T_f`. The algebraic transpose is therefore
+
+    (A^T Ta)_P += phi_f * cP_f * (Ta_P - Ta_N)
+    (A^T Ta)_N += phi_f * cN_f * (Ta_P - Ta_N)
+
+which is NOT generally `fvm::div(-phi,Ta)` under the same named scheme. If this
+fails, u_a is wrong no matter how good addMomentumSource() is.
+
+**(2) Then the momentum source.** Freeze T, Ta, U, phi, C and the mesh.
 Define the functional corresponding to the primal thermal convection residual,
 
     M(U) = sum_cells Ta_P * R_conv,P(U, T)      // R_conv from fvm::div(phi(U), T)
 
 and finite-difference M with respect to a velocity component in the suspect
 open-fluid cells. Compare against the vector source that `addMomentumSource()`
-actually inserts. That settles unambiguously whether the continuous source is
+actually inserts. The exact face form should be, conceptually,
+
+    d/dphi_f [Ta^T R_T] = T_f * (Ta_P - Ta_N)
+    S_U,P += w_f       * T_f * (Ta_P - Ta_N) * Sf_f / V_P
+    S_U,N += (1 - w_f) * T_f * (Ta_P - Ta_N) * Sf_f / V_N
+
+with the sign settled by the FD, not by inspection (the fvMatrix source-side
+convention can flip what looks obvious on paper). For variable rho*cp, replace
+`(Ta_P - Ta_N)` with `(C_P Ta_P - C_N Ta_N)`, because the primal row-scales by
+`C.internalField()`, not by a face-interpolated `C_f`.
+
+The production candidate is `couplingForm exactFaceTranspose`. `TaGradT` and
+`negTGradTa` are DIAGNOSTIC ONLY: neither uses the same face interpolation,
+upwind selection, limiter, flux orientation, boundary treatment or row-scaling
+as the primal `fvm::div(phi,T)`, so neither can be expected to be its transpose. That settles unambiguously whether the continuous source is
 the discrete transpose of `fvm::div(phi,T)`, and it fixes the sign convention
 without guesswork. It is the exact analogue of `fd_chain.py`, but for
 
