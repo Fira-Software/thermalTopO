@@ -27,5 +27,7 @@ examples/*/system/optimisationDict.dponly
 # build artefacts
 src/Make/linux*/
 src/lnInclude/
+utilities/*/Make/linux*/
+utilities/*/lnInclude/
 *.o
 *.so
