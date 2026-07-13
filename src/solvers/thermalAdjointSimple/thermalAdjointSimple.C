@@ -276,6 +276,82 @@ void Foam::thermalAdjointSimple::addMomentumSource(fvVectorMatrix& matrix)
         return;
     }
 
+    if (couplingForm_ == "exactFaceTranspose")
+    {
+        // The EXACT discrete derivative of the primal convective term
+        // contracted with Ta, with respect to the velocity. The primal
+        // assembles fvm::div(phi,T) with a frozen face value
+        // T_f = cP T_P + cN T_N, so
+        //
+        //     d/dphi_f [ Ta^T R_conv ] = T_f * (Ta_P - Ta_N)
+        //
+        // and mapping phi_f = Sf_f . U_f with U_f = w_f U_P + (1-w_f) U_N back
+        // onto the cells gives
+        //
+        //     S_P += w_f     * T_f * (Ta_P - Ta_N) * Sf_f / V_P
+        //     S_N += (1-w_f) * T_f * (Ta_P - Ta_N) * Sf_f / V_N
+        //
+        // For variable rho*cp the primal ROW-scales the convection matrix by
+        // C_P (not by a face-interpolated C_f), so the jump becomes
+        // (C_P Ta_P - C_N Ta_N).
+        //
+        // The continuous forms Ta*grad(T) and -T*grad(Ta) are NOT this. They
+        // agree only in the smooth, low-velocity limit; with upwind convection
+        // in an open channel they differ by O(1) (measured: 102% relative,
+        // sign-flipped in the worst cells -- see utilities/testAdjointTranspose).
+        const surfaceScalarField& phi = primalVars_.phi();
+        const surfaceScalarField& w = mesh_.weights();
+        const surfaceVectorField& Sf = mesh_.Sf();
+        const scalarField& V = mesh_.V();
+        const labelUList& own = mesh_.owner();
+        const labelUList& nei = mesh_.neighbour();
+
+        tmp<volScalarField> tC;
+        if (props_.variableRhoCp())
+        {
+            tC = props_.CField(T, "rhoCpNorm");
+        }
+
+        auto tSrc =
+            tmp<volVectorField>::New
+            (
+                IOobject
+                (
+                    "ATCTsource",
+                    mesh_.time().timeName(),
+                    mesh_,
+                    IOobject::NO_READ,
+                    IOobject::NO_WRITE
+                ),
+                mesh_,
+                dimensionedVector(dimLength/sqr(dimTime), Zero)
+            );
+        vectorField& S = tSrc.ref().primitiveFieldRef();
+
+        forAll(own, facei)
+        {
+            const label P = own[facei];
+            const label N = nei[facei];
+
+            // the same frozen face value the primal upwind scheme uses
+            const scalar Tf = (phi[facei] > 0) ? T[P] : T[N];
+
+            const scalar jump =
+                props_.variableRhoCp()
+              ? (tC()[P]*Ta[P] - tC()[N]*Ta[N])
+              : (Ta[P] - Ta[N]);
+
+            const vector base(Tf*jump*Sf[facei]);
+
+            S[P] += w[facei]*base/V[P];
+            S[N] += (scalar(1) - w[facei])*base/V[N];
+        }
+
+        matrix += couplingSign_*tSrc();
+
+        return;
+    }
+
     tmp<volVectorField> tSource;
 
     if (couplingForm_ == "negTGradTa")

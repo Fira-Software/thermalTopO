@@ -362,6 +362,88 @@ configuration**, so the fault is not merely an upwind-transpose artefact.
 Something in the ATC-T -> Brinkman path is wrong independently of the convection
 scheme.
 
+### ROOT CAUSE FOUND: the adjoint momentum source is not the discrete transpose
+
+`utilities/testAdjointTranspose` is a pure operator test: no optimisation, no
+primal or adjoint solve. It reads a frozen (phi, T, Ta) state, assembles the
+primal convection matrix `A = fvm::div(phi,T)` with the case's own scheme, and
+compares against what the adjoint actually applies.
+
+**(1) The SCALAR convection transpose is CORRECT. Hypothesis dead.**
+
+    max|B.upper - A.lower| / scale = 0        (exactly)
+    max|B.lower - A.upper| / scale = 0        (exactly)
+    full A^T Ta vs div(-phi,Ta), interior cells: relative 1.6e-8
+
+So `fvm::div(-phi,Ta)` IS the exact algebraic transpose of `fvm::div(phi,T)` for
+upwind -- the reversed-flux upwind operator has exactly the transposed
+off-diagonals. The residual 1.6e-8 is the `bounded` Sp(div(phi)) term, which
+enters A and B with opposite signs (max|div(phi)| = 6e-8, i.e. continuity error).
+`Ta` is therefore the correct discrete adjoint temperature.
+
+(An earlier run of this test reported "relative 4.27" and looked damning. That
+was WRONG: it included the diagonal, which differs *legitimately* on boundary
+cells because T has `fixedValue 300` at the inlet while Ta has `fixedValue 0` --
+the correct adjoint BC, not an error.)
+
+**(2) The MOMENTUM SOURCE is NOT the transpose. This is the defect.**
+
+The exact discrete derivative of the primal convective term contracted with Ta is
+
+    d/dphi_f [ Ta^T R_conv ] = T_f * (Ta_P - Ta_N)
+
+with `T_f` the same frozen upwind face value the primal uses. Against the
+continuous `Ta*grad(T)` that `addMomentumSource()` actually inserts:
+
+    max|S exact face-based|      = 819363
+    max|S continuous Ta*grad(T)| = 265729
+    max|difference|              = 835500
+    relative                     = 1.02          <-- 102 % wrong
+
+    worst cell 1278:
+      exact      = (-237586,  784162, 0)
+      continuous = (   -645,  -17037, 0)
+
+Wrong by a factor of ~3 in magnitude and, in the worst cells, **wrong in
+direction** -- the y-component flips sign.
+
+**This explains everything.** In a low-velocity Brinkman sponge (`cases/fdcheck`,
+`cases/varprops`, `cases/demo2d`) `u . u_a` is tiny, so this error is invisible
+and every FD gate passes. In an **open channel** with upwind convection it is
+O(1), and `a'(beta) = betaMax * I'(beta)` at beta -> 0 (2500 * 21) then amplifies
+it into the 10-40x sensitivity error. It also explains why raising the
+diffusivity 10x shrank the error to 2.8-5.7x: weaker grad(T) -> smaller Ta ->
+weaker source -> smaller u_a.
+
+### The fix is NOT yet correct
+
+A first `couplingForm exactFaceTranspose` is implemented (see
+`addMomentumSource()`), mapping `phi_f = Sf_f . U_f` with
+`U_f = w_f U_P + (1-w_f) U_N` back onto the cells. **It makes the FD gate
+worse**, so it is not right:
+
+| couplingForm | cell 628 | cell 626 |
+|---|---|---|
+| `TaGradT` (current default) | 1.04e-5 | 3.55e-5 |
+| `exactFaceTranspose` | 1.79e-5 | 8.02e-5 |
+| `exactFaceTranspose`, sign -1 | -2.61e-5 | -1.05e-4 |
+
+Target is 1e-6. The likely reasons, in order:
+
+1. **Rhie-Chow.** In SIMPLE the face flux is NOT `interpolate(U).Sf` -- it
+   carries the Rhie-Chow pressure-smoothing correction. So `dphi_f/dU_P` is not
+   `w_f Sf_f`, and the chain from face flux back to cell velocity is wrong. The
+   framework's own adjoint machinery must already contain the correct
+   `dphi/dU` linearisation (that is what makes the stock PtLosses adjoint work);
+   the fix should reuse it rather than re-derive it.
+2. Boundary faces are omitted from the source.
+3. The `bounded` scheme's `Sp(div(phi))` term is omitted.
+
+So: the DEFECT is proven and located, but the REPLACEMENT is still open. The
+`couplingForm` switch (`TaGradT` | `negTGradTa` | `exactFaceTranspose` | `none`)
+is the place to land it, and `utilities/testAdjointTranspose` is the gate it must
+pass BEFORE any optimisation cycle is run.
+
 ### Next diagnostic
 
 The remaining rigorous test is an **operator-only FD**, with no optimisation and

@@ -1,0 +1,4 @@
+SOURCE = \
+testAdjointTranspose.C \
+
+# sources
