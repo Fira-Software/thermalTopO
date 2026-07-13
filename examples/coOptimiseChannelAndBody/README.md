@@ -232,24 +232,78 @@ D fails.
 cells under a raw-alpha perturbation, but their combined contribution is
 +0.01 to +0.02 % of the total. Ruled out.
 
+### It is NOT upstream OpenFOAM, and NOT the coupling sign
+
+**Stock upstream passes the same gate.** `fd_flowonly.py` runs the identical
+mesh, zones, filter and projection with the STOCK solvers only -- `simple` +
+`adjointSimple` + `PtLosses` -- with no thermalTopO in the sensitivity path at
+all:
+
+    cell 628:  adj/FD = 1.359e-6, 1.359e-6, 1.359e-6   (eps 5e-4 .. 2e-3)
+    cell 626:  adj/FD = 1.218e-6, 1.218e-6, 1.218e-6
+
+Both equal the objective weight. So the upstream Brinkman sensitivity, the
+filter, the projection and their composition are all CORRECT for a flow
+objective in this geometry. The bug is not upstream.
+
+**The coupling sign is right.** Flipping `couplingSign` to -1 in case D gives
+NEGATIVE ratios (-1.86e-5, -6.01e-5), i.e. worse. (The FD is identical for both
+signs, confirming `couplingSign` only affects the adjoint.)
+
+### What that leaves: the thermal -> momentum adjoint coupling
+
+The Brinkman sensitivity is `a'(beta) * (u . u_a)`. Its formula is upstream and
+now proven correct -- but the `u_a` it consumes is produced by OUR coupling term
+in `addMomentumSource()`:
+
+    matrix += couplingSign_ * (C(T) * Ta * grad(T))      // the ATC-T term
+
+`a'(beta) = betaMax * I'(beta)` is maximal as beta -> 0, so open-fluid cells
+amplify `u_a` enormously (a' = 2500 * 21 at beta = 0). Those are exactly the
+cells shown above to dominate the failing sum, and they carry ~100 % Brinkman /
+~0 % thermal sensitivity.
+
+**And this term has never been exercised where it matters.** `cases/fdcheck`,
+`cases/varprops` and `cases/demo2d` all put the design region in a low-velocity
+Brinkman *sponge* (alpha 0.05-0.35), so `u` is small, `u . u_a` is small, and
+the Brinkman contribution is negligible -- the thermal term dominates and the FD
+gate passes. This example is the first with an **open channel** carrying real
+velocity through the design space. If the ATC-T coupling is wrong in magnitude
+or form (rather than sign), this is the only case in the repo that would ever
+reveal it.
+
+Decomposing the sensitivity by coupling sign (the Brinkman term is linear in
+`u_a`, which is linear in the coupling source):
+
+    cell 628:  S_nocoupling/FD = -4.1e-6    S_coupling/FD = +1.45e-5
+    cell 626:  S_nocoupling/FD = -1.2e-5    S_coupling/FD = +4.8e-5
+
+Neither part equals the weight, so both the coupled and uncoupled halves are off
+at these cells.
+
 ### Next diagnostic
 
-Verify the pre-chain sensitivity `gbeta` **in a near-zero-beta cell**. That
-region is untested by every ablation so far, and it dominates the failing sum.
-It cannot be FD'd directly by perturbing its own raw alpha (those channel cells
-sit at alpha = 0, so the minus side clips), so use one of:
+Audit the **ATC-T coupling term** `couplingSign * C(T) * Ta * grad(T)` in
+`thermalAdjointSimple::addMomentumSource()` against the derivation
+(docs/derivation.md section 3.2), in a case where the Brinkman sensitivity is
+NOT negligible. Concretely:
 
-- a design whose channel cells start at alpha = 0.05 rather than 0, so a
-  central difference is admissible there;
-- or split the written sensitivity into its two parts --
+1. Build a variant of `cases/fdcheck` with an **open channel** through the
+   design box (initial alpha 0 there, not 0.05-0.35) so that `u . u_a` is
+   large and the Brinkman term carries real weight. Run the FD gate. If that
+   fails too, the ATC-T term is confirmed and the co-optimisation geometry is
+   incidental.
+2. Check the residual convention: the framework's adjoint momentum equation may
+   expect the source on the opposite side, or scaled by the volume, relative to
+   what `addMomentumSource()` adds. A constant factor would show up as a
+   constant ratio error; a `C(T)`- or `grad(T)`-dependent one would not.
+3. Only then revisit `postProcessSens`.
 
-      momPostChain   (from adjointSimple::topOSensMultiplier, the Brinkman term)
-      thermPostChain (ours, after sourceTermSensitivities)
-
-  and check which of the two carries the 1e5 magnitude at beta ~ 1e-4. The
-  Brinkman term is upstream code and scales as betaMax * I'(beta) = 2500 * 21 at
-  beta -> 0, so it is the more likely carrier -- in which case this is NOT a
-  thermalTopO bug at all.
+Note the derivation note (section 9, "Open questions for reviewers") already
+flags exactly this: *"Sign/normalisation of (ATC-T) against the NTUA residual
+convention -- checked in code against FD, but an independent eye is wanted."*
+The FD check referenced there could not have caught a magnitude error, because
+every case in the repo at that time had a negligible Brinkman contribution.
 
 Until that is closed, **nothing from this case is evidence of anything.**
 

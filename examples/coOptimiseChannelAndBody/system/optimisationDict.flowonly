@@ -1,0 +1,66 @@
+FoamFile { version 2.0; format ascii; class dictionary; object optimisationDict; }
+// PURE UPSTREAM TEST: stock simple + adjointSimple + PtLosses.
+// No thermalTopO solver, no thermal objective, no thermal sensitivity.
+// Same mesh, same zones, same filter+projection. If the FD gate fails HERE,
+// the bug is upstream OpenFOAM, not thermalTopO.
+optimisationManager steadyOptimisation;
+
+primalSolvers
+{
+    op1
+    {
+        active true; type incompressible; solver simple;
+        solutionControls
+        {
+            nIters 3000; consistent true;
+            residualControl { "p.*" 1e-8; "U.*" 1e-8; }
+        }
+    }
+}
+adjointManagers
+{
+    am1
+    {
+        primalSolver op1;
+        adjointSolvers
+        {
+            as1
+            {
+                active true; type incompressible; solver adjointSimple;
+                computeSensitivities true;
+                objectives
+                {
+                    type incompressible;
+                    objectiveNames
+                    {
+                        losses { weight 1e-6; type PtLosses; patches (inlet outlet); }
+                    }
+                }
+                ATCModel { ATCModel standard; }
+                solutionControls
+                {
+                    nIters 3000; consistent true;
+                    residualControl { "pa.*" 1e-8; "Ua.*" 1e-8; }
+                }
+            }
+        }
+    }
+}
+optimisation
+{
+    designVariables
+    {
+        type            topO;
+        sensitivityType topO;
+        writeAllFields  true;
+        writeFieldSens  true;
+        adjointPorousZones   (designSpace);
+        fixedPorousZones     (crustZone baseZone);
+        fixedPorousValues    (1 1);
+        fixedZeroPorousZones (inletPlug outletPlug);
+        regularisation { regularise true; growFromWalls false; meanRadiusMult 8; function tanh; b 20; }
+        betaMax    2500;
+        maxInitChange 0.02;
+    }
+    updateMethod { method steepestDescent; }
+}
