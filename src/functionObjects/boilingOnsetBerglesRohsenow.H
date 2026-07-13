@@ -27,7 +27,7 @@ Description
     optional patch fields qWallBR and qONB.
 
     Intended for conjugate-heat-transfer verification runs (compressible
-    thermo) - e.g. UKAEA ISSF Case Study 9, Annex 1 section 2.4.5.
+    thermo) typical of high-heat-flux plasma-facing component analysis.
 
     Example:
     \verbatim

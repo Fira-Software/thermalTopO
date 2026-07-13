@@ -18,7 +18,7 @@ FoamFile { version 2.0; format ascii; class dictionary; object optimisationDict;
 // The absolute values are those of a Pr ~ 0.1 liquid-metal-like fluid, not
 // water: they are chosen so that every property path is exercised well above
 // FD noise while the 2-D case stays well conditioned. Production runs load
-// the same tables with real coolant data (IAPWS water for CS9).
+// the same tables with real coolant data (e.g. IAPWS water).
 
 optimisationManager steadyOptimisation;
 

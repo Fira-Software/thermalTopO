@@ -49,9 +49,9 @@ Notes:
 3. **Turbulence masking.** ν_t/Pr_t is multiplied by (1 − I_k(β)) so
    solidified cells carry no turbulent diffusivity even where the turbulence
    model leaves residual ν_t.
-4. **Volumetric heating / boundary flux.** CS9 has a fixed surface heat flux
-   q_pf on the plasma-facing patch Γ_pf and adiabatic remaining boundaries;
-   no volumetric source. BCs: T = T_in at inlet, ∇T·n = 0 at outlet and
+4. **Volumetric heating / boundary flux.** The target problem class has a fixed
+   surface heat flux q_pf on the heat-incident patch Γ_pf and adiabatic
+   remaining boundaries; no volumetric source. BCs: T = T_in at inlet, ∇T·n = 0 at outlet and
    adiabatic walls, −k ∂T/∂n = −q_pf on Γ_pf (flux into domain).
 
 ## 2. Objective
@@ -277,7 +277,7 @@ off-diagonals, source and boundary coefficients), which is exactly
 C_P (u·∇T)_P V_P because the discrete face fluxes sum to zero. All properties
 are re-evaluated from the current T at every primal iteration, on cells *and*
 on boundary faces — the latter matters wherever solid meets a domain boundary
-(the CS9 plasma-facing surface), since a face diffusivity left at a constant
+(a heat-incident surface on a fixed solid crust), since a face diffusivity left at a constant
 would corrupt the wall heat flux.
 
 ### 6.2 Adjoint: frozen-property linearisation
@@ -366,8 +366,8 @@ for the frozen-ν_t term itself.
 
 The tables are the mechanism; the values above are chosen for verification
 conditioning. Production runs load real coolant and structural data through
-the same entries — for CS9, IAPWS water at 95 bar and the Annex 1 Table 2
-tungsten conductivity. Note ρ and μ appear in *two* dictionaries
+the same entries: for a water-cooled tungsten component, IAPWS water at the
+operating pressure and a tabulated tungsten conductivity. Note ρ and μ appear in *two* dictionaries
 (`constant/transportProperties` for the viscosity model,
 `optimisationDict`'s `thermal` subdict for the energy equation) because
 OpenFOAM constructs the transport model and the primal solver from different
@@ -375,7 +375,7 @@ files; they are not cross-checked, and must be kept consistent by hand.
 
 ## 7. Constraints and optimiser
 
-- **Pressure drop ≤ 340 Pa**: existing `objectivePtLosses` as an inequality
+- **Pressure-drop cap**: existing `objectivePtLosses` as an inequality
   constraint under the framework's ISQP/MMA update methods (upstream since
   v2312). No new code.
 - **No boiling (Bergles–Rohsenow ONB)**: v1 enforces a proxy constraint — a
@@ -392,17 +392,21 @@ files; they are not cross-checked, and must be kept consistent by hand.
   optimisation cycles (the 206:1 conductivity contrast makes early
   intermediate densities essential for a usable design space).
 
-## 8. CS9 mapping
+## 8. Mapping to a high-heat-flux component problem
 
-| CS9 element | Formulation element |
+The formulation targets the following generic problem class: a coolant channel
+inside a conducting block, with a fixed heat flux on one surface, a protected
+solid layer beneath it, and caps on pumping cost and on boiling margin.
+
+| Problem element | Formulation element |
 |---|---|
-| Case 1 design domain (channel interior) | topOZones: design cells = fluid cylinder; frozen fluid elsewhere |
-| Case 2 design domain (+ block minus 2 mm crust) | design cells extended to `Monoblock_main_body`; crust cells fixed solid |
-| Objective: peak plasma-facing T | `objectivePatchTemperaturePNorm` on Γ_pf |
-| ΔP ≤ 340 Pa | `objectivePtLosses` ISQP constraint |
+| Design domain: channel interior only | topOZones: design cells = fluid region; frozen fluid elsewhere |
+| Design domain: channel + surrounding body, minus a protected surface crust | design cells extended into the solid body; crust cells fixed solid (`fixedPorousZones`) |
+| Objective: peak temperature on the heat-incident surface | `objectivePatchTemperaturePNorm` on Γ_pf |
+| Pressure-drop cap | `objectivePtLosses` as an ISQP/nullSpace constraint |
 | No nucleate boiling | proxy constraint + ONB post-check (§7) |
-| Iterative geometry history (CS9R-4) | framework's per-cycle β/iso-surface writes (upstream) |
-| k_s(T) AND fluid rho,cp,k,mu (T) (CS9R-5, Desirable) | tabulated in primal, adjoint and sensitivities (§6) |
+| Iterative geometry history | framework's per-cycle β / iso-surface writes (upstream) |
+| Temperature-dependent solid AND fluid properties | tabulated in primal, adjoint and sensitivities (§6) |
 
 ## 9. Open questions for reviewers
 

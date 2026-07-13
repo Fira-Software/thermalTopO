@@ -39,18 +39,38 @@ of coolant channels in fusion plasma-facing components.
 Everything plugs into unmodified OpenFOAM v2512 through its runtime-selection
 and sensitivity extension points; no core sources are patched.
 
-## How the repository is organised
+## Status
 
-| Directory | Status |
+**Verified** (reproducible from a clean checkout, in `cases/`):
+
+- Conjugate-heat-transfer topology optimisation over a Brinkman design field.
+- Thermal objectives: zone mean and patch p-norm (peak-temperature surrogate).
+- Direct thermal conductivity topology sensitivities.
+- Temperature-dependent property tables, fluid **and** solid, active in primal,
+  adjoint and sensitivity assembly.
+- Fixed-zone design controls (pinned solid, pinned fluid, explicit design space).
+- Geometry and design-history output, every cycle.
+- Constrained demonstration: fin growth under a pressure-drop cap.
+- Onset-of-nucleate-boiling monitor.
+
+**Experimental** (in `examples/`, published for transparency and reuse):
+
+- Open-channel channel-and-body co-optimisation. This exercises the
+  thermal-induced Brinkman path in open-flow design cells. The next
+  implementation item is the projected-flux thermal adjoint coupling through the
+  SIMPLE pressure-projection step; see
+  [`docs/atc-t-open-channel.md`](docs/atc-t-open-channel.md).
+
+| Directory | |
 |---|---|
 | `src/` | the module |
-| **`cases/`** | **verified.** Every gradient claim in this README is reproduced here: `fdcheck` (FD gate), `varprops` (temperature-dependent properties), `demo2d` (constrained optimisation). Independently reproducible from a clean checkout. |
+| `cases/` | verified cases; every gradient claim in this README is reproduced here |
 | `utilities/` | verification tooling, incl. a no-solve operator-transpose gate |
-| `examples/` | **experimental.** Work in progress, published for transparency and reuse. Not evidence: see each example's own status section. |
+| `examples/` | experimental work in progress; not evidence |
 
 Verification is treated as a gate, not a report: an operator is checked
 algebraically before it is trusted, and a case is not cited until its gradients
-pass finite differences. `examples/` is where that work happens in the open.
+pass finite differences.
 
 ## Verification (gradient correctness)
 
