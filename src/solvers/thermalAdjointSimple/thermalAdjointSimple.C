@@ -334,6 +334,14 @@ bool Foam::thermalAdjointSimple::readDict(const dictionary& dict)
             thermalDict.getOrDefault<scalar>("couplingSign", 1);
         thermalSensScale_ =
             thermalDict.getOrDefault<scalar>("thermalSensScale", 1);
+        // rebuild: otherwise RAMP continuation through a dictionary re-read
+        // would be silently ignored
+        kInterpolation_ =
+            topOInterpolationFunction::New
+            (
+                mesh_,
+                thermalDict.subDict("kInterpolation")
+            );
 
         return true;
     }
@@ -388,9 +396,15 @@ void Foam::thermalAdjointSimple::topOSensMultiplier
     // drop-in for the continuous form used before. It differs precisely where
     // the continuous form is wrong: across a face with a large conductivity
     // jump, which is every fluid/solid interface in a topology optimisation
-    // once the projection re-sharpens beta. Measured on the co-optimisation
-    // example, the continuous form gave adjoint/FD ratios differing by 3.3x
-    // between neighbouring cells; the face-based form is the fix.
+    // once the projection re-sharpens beta.
+    //
+    // It is retained because it matches the finite-volume operator rather than
+    // its continuous analogue, and is necessary for hard material-interface
+    // cases. It is NOT, on its own, sufficient to verify the
+    // examples/coOptimiseChannelAndBody stress test: that case also exercises
+    // the filter/projection/fixed-zone chain, and switching to the face-based
+    // form left its adjoint/FD discrepancy unchanged. See that example's
+    // README for the open issue.
     if (mesh_.foundObject<topOVariablesBase>("topOVars"))
     {
         const volScalarField& T = TRef();
@@ -475,49 +489,55 @@ void Foam::thermalAdjointSimple::topOSensMultiplier
         // the design can actually change.
         const topOZones& zones = vars.getTopOZones();
 
-        auto zeroZone = [&](const label zoneID)
+        auto applyMask = [&](scalarField& sens)
         {
-            if (zoneID != -1)
+            auto zeroZone = [&](const label zoneID)
             {
-                for (const label celli : mesh_.cellZones()[zoneID])
+                if (zoneID != -1)
                 {
-                    thermSens[celli] = Zero;
+                    for (const label celli : mesh_.cellZones()[zoneID])
+                    {
+                        sens[celli] = Zero;
+                    }
+                }
+            };
+
+            for (const label zoneID : zones.fixedPorousZoneIDs())
+            {
+                zeroZone(zoneID);
+            }
+            for (const label zoneID : zones.fixedZeroPorousZoneIDs())
+            {
+                zeroZone(zoneID);
+            }
+            for (const label celli : zones.IOCells())
+            {
+                sens[celli] = Zero;
+            }
+
+            // If an explicit design space is given, keep only those cells
+            if (!zones.adjointPorousZoneIDs().empty())
+            {
+                bitSet isDesign(mesh_.nCells(), false);
+                for (const label zoneID : zones.adjointPorousZoneIDs())
+                {
+                    for (const label celli : mesh_.cellZones()[zoneID])
+                    {
+                        isDesign.set(celli);
+                    }
+                }
+                forAll(sens, celli)
+                {
+                    if (!isDesign.test(celli))
+                    {
+                        sens[celli] = Zero;
+                    }
                 }
             }
         };
 
-        for (const label zoneID : zones.fixedPorousZoneIDs())
-        {
-            zeroZone(zoneID);
-        }
-        for (const label zoneID : zones.fixedZeroPorousZoneIDs())
-        {
-            zeroZone(zoneID);
-        }
-        for (const label celli : zones.IOCells())
-        {
-            thermSens[celli] = Zero;
-        }
-
-        // If an explicit design space is given, keep only those cells
-        if (!zones.adjointPorousZoneIDs().empty())
-        {
-            bitSet isDesign(mesh_.nCells(), false);
-            for (const label zoneID : zones.adjointPorousZoneIDs())
-            {
-                for (const label celli : mesh_.cellZones()[zoneID])
-                {
-                    isDesign.set(celli);
-                }
-            }
-            forAll(thermSens, celli)
-            {
-                if (!isDesign.test(celli))
-                {
-                    thermSens[celli] = Zero;
-                }
-            }
-        }
+        // Mask the physical sensitivity BEFORE the chain ...
+        applyMask(thermSens);
 
         vars.sourceTermSensitivities
         (
@@ -527,6 +547,13 @@ void Foam::thermalAdjointSimple::topOSensMultiplier
             designVariablesName,
             "beta"
         );
+
+        // ... and again AFTER it. sourceTermSensitivities only multiplies by
+        // the interpolation derivative, so this is currently a no-op, but the
+        // regularisation transpose applied downstream spreads values across
+        // cells: masking on both sides of the chain keeps the guarantee true
+        // regardless of what the chain does.
+        applyMask(thermSens);
 
         betaMult += thermSens;
     }

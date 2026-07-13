@@ -228,6 +228,14 @@ bool Foam::thermalSimple::readDict(const dictionary& dict)
         const dictionary& thermalDict = dict.subDict("thermal");
         props_.read(thermalDict, mesh_);
         Prt_ = thermalDict.getOrDefault<scalar>("Prt", 0.85);
+        // rebuild: otherwise RAMP continuation through a dictionary re-read
+        // would be silently ignored
+        kInterpolation_ =
+            topOInterpolationFunction::New
+            (
+                mesh_,
+                thermalDict.subDict("kInterpolation")
+            );
 
         return true;
     }

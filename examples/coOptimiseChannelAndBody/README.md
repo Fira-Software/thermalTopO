@@ -83,7 +83,9 @@ Reproduce with `fd_sweep.py`, `fd_sweep_noreg.py`, `fd_chain.py`.
    1.074e-5 / 3.678e-5. **The 3.3x spread is unchanged**, so the material-
    interface interpolation is NOT the cause.
 5. **The thermal sensitivity itself (pre-chain dJ/dbeta) is CORRECT.**
-   `fd_sweep_noreg.py` reruns the gate with the Helmholtz filter off. Then:
+   `fd_sweep_noreg.py` reruns the gate with filter AND projection off
+   (ablation A -- see the table below; `project` defaults to `regularise`
+   upstream, so turning one off turns both off). Then:
 
        cell 628: ratio = 1.1286e-6      (FD 1.82170e-2 / 1.82165e-2 / 1.82173e-2)
        cell 626: ratio = 1.1700e-6
@@ -91,10 +93,9 @@ Reproduce with `fd_sweep.py`, `fd_sweep_noreg.py`, `fd_chain.py`.
    Both equal the objective **weight (1e-6)** and agree with each other to
    3.7 % — the same quality as `cases/fdcheck`. Whatever is broken, it is not
    the thermal adjoint, not the objective, and not the conductivity term.
-6. **The tanh projection derivative.** In the filter-off ablation the
-   projection is still active, and `dbeta/dalphaTilda` cancels exactly between
-   `topOSens` and the FD (it appears once in the forward map and once in the
-   transpose). That ablation passes, so the projection derivative is fine.
+6. **The tanh projection derivative, on its own.** Ablation B (projection on,
+   filter off) passes at 1.297e-6 / 1.311e-6. So the projection derivative is
+   not wrong by itself.
 7. **`postProcessSens` IS the exact transpose of the true beta(alpha) map.**
    `fd_chain.py` is a chain-only test with no PDE physics: freeze the
    pre-chain field `gbeta = topologySens`, measure the true Jacobian
@@ -105,16 +106,35 @@ Reproduce with `fd_sweep.py`, `fd_sweep_noreg.py`, `fd_chain.py`.
    `postProcessSens` applies at the end). A single raw-alpha perturbation
    correctly spreads to ~420 beta cells, so the filter really is active.
 
-### The remaining suspect: the filter path
+### The full ablation: only the COMBINATION fails
 
-Turning the Helmholtz filter on is what breaks it:
+Filter and projection are separate flags upstream
+(`project_(dict.getOrDefault<bool>("project", regularise_))`, so `project`
+*defaults to* `regularise` — a trap: switching `regularise` off silently
+switches the projection off too). Running all four combinations
+(`fd_ablation_B.py`, `fd_ablation_C.py`; eps = 1e-3):
 
-| cell | ratio, filter OFF | ratio, filter ON | inflation |
-|---|---|---|---|
-| 628 | 1.13e-6 | 1.07e-5 | **9.5x** |
-| 626 | 1.17e-6 | 3.68e-5 | **31.5x** |
+| | filter | projection | cell 628 | cell 626 | verdict |
+|---|---|---|---|---|---|
+| **A** | off | off | 1.13e-6 | 1.17e-6 | OK — equals the weight |
+| **B** | off | **on** | 1.297e-6 | 1.311e-6 | OK (cells agree to 1.1 %) |
+| **C** | **on** | off | 8.92e-7 | 9.14e-7 | OK (cells agree to 2.5 %) |
+| **D** | **on** | **on** | 1.07e-5 | 3.68e-5 | **FAILS: 10–40x off, 3.3x spread** |
 
-The relevant upstream code is `fieldRegularisation::postProcessSens`
+The filter alone is fine. The projection alone is fine. **Only the two together
+fail.** So neither operator is individually wrong, and the earlier readings
+("it's the projection", then "it's the filter") were both wrong.
+
+The one thing unique to D: beta is the *filtered-then-sharpened* field, so it
+is the only configuration carrying genuinely **intermediate (grey) beta at the
+interfaces**. In A and B beta is near-binary; in C beta is smooth but never
+sharpened. Note also that C can *mask* a pointwise error, because the filter
+transpose smooths it away, whereas in D the projection derivative (tanh, b=20,
+peaking near 10) amplifies exactly the cells where beta is intermediate. So the
+error most likely lives in the sensitivity **at intermediate beta**, and D is
+simply the only case that both produces it and amplifies it.
+
+The relevant upstream code, `fieldRegularisation::postProcessSens`
 (`.../topODesignVariables/regularisation/fieldRegularisation.C:154`):
 
     if (project_)    sens *= sharpenFunction_->derivative(betaArg_);  // dbeta/dalphaTilda
@@ -123,23 +143,27 @@ The relevant upstream code is `fieldRegularisation::postProcessSens`
 
 against the forward map in `updateBeta()`:
 
-    if (regularise_) regularise(alpha_, alphaTilda_(), true);         // filter
-    if (project_)    sharpenFunction_->interpolate(betaArg_, beta_);  // projection
+    if (regularise_) regularise(alpha_, alphaTilda_(), true);         // alphaTilda = H alpha
+    if (project_)    sharpenFunction_->interpolate(betaArg_, beta_);  // beta = P(alphaTilda)
 
-Note `project_` and `regularise_` are **separate flags**: the filter-off
-ablation above still projects.
+The ordering is correct (forward H then P; transpose P' then H^T), and
+`fd_chain.py` confirms `postProcessSens` reproduces the *measured* Jacobian
+transpose to 5 s.f. So the composition is right, which is what makes the D
+failure interesting rather than trivial.
 
-**Open logical tension, for whoever picks this up.** Test 7 says the transpose
-is exact; test 5 says the pre-chain sensitivity is correct; yet composing them
-fails. One of the two must be state-dependent — they were measured on
-*different* beta fields (near-binary with the filter off, smooth with it on).
-That is the thread to pull.
+### Next diagnostic
 
-**Next experiment (ablation C):** filter ON, projection OFF
-(`regularise true`, `project false`). That isolates the filter transpose with
-nothing else in the path. If the ratio stays at 1e-6 the bug is in the
-interaction; if it inflates, it is the Helmholtz transpose or its volume
-weighting.
+Stop altering the thermal operator. Instrument the chain instead: write the
+sensitivity **both before and after** `sourceTermSensitivities`, i.e.
+
+    scalarField thermSensPreChain(thermSens);
+    vars.sourceTermSensitivities(thermSens, ...);
+    scalarField thermSensPostChain(thermSens);
+
+and compare, cell by cell in the six probe cells, against `beta`, `alphaTilda`,
+the projection derivative `P'(alphaTilda)`, and the filter row/column sums.
+The failure is confined to cells with intermediate beta, so tabulating
+`ratio/weight` against `P'(alphaTilda)` is the direct test.
 
 Until that is closed, **nothing from this case is evidence of anything.**
 

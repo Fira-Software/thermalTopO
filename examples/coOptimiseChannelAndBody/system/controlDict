@@ -4,10 +4,10 @@ application     adjointOptimisationFoam;
 startFrom       startTime;
 startTime       0;
 stopAt          endTime;
-endTime         20;         // optimisation cycles
+endTime         1;
 deltaT          1;
 writeControl    timeStep;
-writeInterval   5;          // design history every 5 cycles
+writeInterval   1;
                              // (the beta iso-surface STL/VTK is written EVERY
                              //  cycle by the framework, to optimisation/topOIsoSurfaces)
 purgeWrite      0;
