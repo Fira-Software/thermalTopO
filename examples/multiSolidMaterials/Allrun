@@ -1,0 +1,12 @@
+#!/bin/sh
+cd "${0%/*}" || exit
+. ${WM_PROJECT_DIR:?}/bin/tools/RunFunctions
+runApplication blockMesh
+runApplication topoSet
+runApplication setFields
+runApplication postProcess -func writeCellCentres -time 0
+rm -f 0/C 0/Cz
+cp system/optimisationDict.multiMat system/optimisationDict
+runApplication $(getApplication)
+runApplication writeThermalProperties -time 1
+./checkMaterials.py

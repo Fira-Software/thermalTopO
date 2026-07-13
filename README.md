@@ -29,12 +29,14 @@ of coolant channels in fusion plasma-facing components.
 | Primal SIMPLE + energy equation over the design field | `thermalSimple` | working, verified |
 | Adjoint SIMPLE + adjoint energy equation and Ta∇T momentum coupling | `thermalAdjointSimple` | working, verified |
 | Temperature-dependent properties ρ(T), c_p(T), k_f(T), k_s(T) in primal, adjoint and sensitivities | `thermalPropertyTables` | working, FD-verified |
+| Several fixed solid materials, labelled by cellZone, each with its own D_s or D_s(T) | `thermalPropertyTables` | working, verified |
 | Temperature-dependent viscosity μ(T) in the momentum equation | `viscosityModels::temperatureTable` | working, verified |
 | Zone-mean temperature objective | `objectiveMeanTemperature` | working, FD-verified |
 | Patch p-norm (peak-surrogate) temperature objective | `objectivePatchTemperaturePNorm` | working |
 | Conductivity term in topology sensitivities | via `topOSensMultiplier` hook | working, FD-verified |
 | Bergles–Rohsenow onset-of-nucleate-boiling monitor | `boilingOnsetBerglesRohsenow` functionObject | working |
 | Discrete adjoint-transpose gate (no-solve operator test) | `utilities/testAdjointTranspose` | working |
+| Property-field reporting (`DSolid`, `DFluid`, `materialID`) | `utilities/writeThermalProperties` | working |
 
 Everything plugs into unmodified OpenFOAM v2512 through its runtime-selection
 and sensitivity extension points; no core sources are patched.
@@ -49,6 +51,10 @@ and sensitivity extension points; no core sources are patched.
 - Temperature-dependent property tables, fluid **and** solid, active in primal,
   adjoint and sensitivity assembly.
 - Fixed-zone design controls (pinned solid, pinned fluid, explicit design space).
+- Several fixed solid materials in one domain, each with its own constant or
+  temperature-dependent diffusivity, active throughout the optimisation
+  (`examples/multiSolidMaterials`). The design variable chooses fluid vs solid,
+  not which solid.
 - Geometry and design-history output, every cycle.
 - Constrained demonstration: fin growth under a pressure-drop cap.
 - Onset-of-nucleate-boiling monitor.

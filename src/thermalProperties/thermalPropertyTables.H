@@ -112,6 +112,29 @@ class thermalPropertyTables
         autoPtr<Function1<scalar>> kFluidPtr_;
         autoPtr<Function1<scalar>> DSolidPtr_;
 
+        // Optional multiple solid materials, labelled by cellZone.
+        // The design variable still chooses fluid vs SOLID; it does not choose
+        // WHICH solid. Material labels are fixed for the whole optimisation, and
+        // design cells that solidify take defaultGeneratedSolidMaterial.
+
+        //- True if a "solidMaterials" sub-dictionary was supplied
+        bool multiMaterial_;
+
+        //- Material names, in dictionary order
+        wordList materialNames_;
+
+        //- Constant diffusivity per material [m2/s] (used where no table)
+        scalarList materialConst_;
+
+        //- Optional D_s(T) table per material (entry may be unset)
+        PtrList<Function1<scalar>> materialTable_;
+
+        //- Material index per cell
+        labelList materialID_;
+
+        //- Material assigned to design cells that become solid
+        label defaultMaterial_;
+
 
     // Private Member Functions
 
@@ -133,6 +156,9 @@ class thermalPropertyTables
             const scalar value,
             const dimensionSet& dims
         ) const;
+
+        //- Solid diffusivity of one material at one temperature [m2/s]
+        scalar materialDSolid(const label matID, const scalar T) const;
 
 
 public:
@@ -156,6 +182,25 @@ public:
 
         //- True if the solid diffusivity is tabulated
         bool variableDSolid() const noexcept { return bool(DSolidPtr_); }
+
+        //- True if several solid materials are labelled in the domain
+        bool multiMaterial() const noexcept { return multiMaterial_; }
+
+        //- Material names, in dictionary order
+        const wordList& materialNames() const noexcept
+        {
+            return materialNames_;
+        }
+
+        //- Material index per cell
+        const labelList& materialID() const noexcept { return materialID_; }
+
+        //- Material index per cell, as a writable field (diagnostic/reporting)
+        tmp<volScalarField> materialIDField
+        (
+            const volScalarField& T,
+            const word& name
+        ) const;
 
         //- Reference volumetric heat capacity [J/m3/K]
         scalar rhoCpRef() const noexcept { return rhoCpRef_; }

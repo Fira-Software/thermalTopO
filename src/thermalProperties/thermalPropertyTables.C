@@ -24,7 +24,13 @@ Foam::thermalPropertyTables::thermalPropertyTables()
     rhoPtr_(nullptr),
     cpPtr_(nullptr),
     kFluidPtr_(nullptr),
-    DSolidPtr_(nullptr)
+    DSolidPtr_(nullptr),
+    multiMaterial_(false),
+    materialNames_(),
+    materialConst_(),
+    materialTable_(),
+    materialID_(),
+    defaultMaterial_(0)
 {}
 
 
@@ -92,6 +98,21 @@ Foam::tmp<Foam::volScalarField> Foam::thermalPropertyTables::evaluate
     }
 
     return tfld;
+}
+
+
+Foam::scalar Foam::thermalPropertyTables::materialDSolid
+(
+    const label matID,
+    const scalar T
+) const
+{
+    if (materialTable_.set(matID))
+    {
+        return materialTable_[matID].value(T);
+    }
+
+    return materialConst_[matID];
 }
 
 
@@ -169,6 +190,106 @@ void Foam::thermalPropertyTables::read
             << rhoCpRef_ << exit(FatalIOError);
     }
 
+    // ---- optional: several solid materials, labelled by cellZone -----------
+    // The design variable chooses fluid vs SOLID. It does NOT choose WHICH
+    // solid: material labels are fixed for the whole optimisation, and design
+    // cells that solidify take defaultGeneratedSolidMaterial.
+    multiMaterial_ = thermalDict.found("solidMaterials");
+
+    if (multiMaterial_)
+    {
+        const dictionary& matDict = thermalDict.subDict("solidMaterials");
+
+        materialNames_ = matDict.toc();
+        const label nMat = materialNames_.size();
+
+        if (!nMat)
+        {
+            FatalIOErrorInFunction(thermalDict)
+                << "solidMaterials is empty." << exit(FatalIOError);
+        }
+
+        materialConst_.setSize(nMat, Zero);
+        materialTable_.clear();
+        materialTable_.setSize(nMat);
+
+        forAll(materialNames_, i)
+        {
+            const dictionary& md = matDict.subDict(materialNames_[i]);
+
+            if (md.found("DSolidTable"))
+            {
+                materialTable_.set
+                (
+                    i,
+                    Function1<scalar>::New("DSolidTable", md, &mesh).ptr()
+                );
+            }
+            else
+            {
+                materialConst_[i] = md.get<scalar>("DSolid");
+            }
+        }
+
+        // material assigned to generated solid
+        const word defName
+        (
+            thermalDict.get<word>("defaultGeneratedSolidMaterial")
+        );
+        defaultMaterial_ = materialNames_.find(defName);
+
+        if (defaultMaterial_ == -1)
+        {
+            FatalIOErrorInFunction(thermalDict)
+                << "defaultGeneratedSolidMaterial " << defName
+                << " is not one of solidMaterials " << materialNames_
+                << exit(FatalIOError);
+        }
+
+        // label every cell: default first, then override by zone
+        materialID_.setSize(mesh.nCells(), defaultMaterial_);
+
+        if (thermalDict.found("solidMaterialZones"))
+        {
+            const dictionary& zd = thermalDict.subDict("solidMaterialZones");
+
+            for (const word& matName : zd.toc())
+            {
+                const label matID = materialNames_.find(matName);
+
+                if (matID == -1)
+                {
+                    FatalIOErrorInFunction(thermalDict)
+                        << "solidMaterialZones names material " << matName
+                        << ", which is not in solidMaterials "
+                        << materialNames_ << exit(FatalIOError);
+                }
+
+                for (const word& zoneName : zd.get<wordList>(matName))
+                {
+                    const label zoneID =
+                        mesh.cellZones().findZoneID(zoneName);
+
+                    if (zoneID == -1)
+                    {
+                        FatalIOErrorInFunction(thermalDict)
+                            << "No cellZone " << zoneName
+                            << " for solid material " << matName
+                            << exit(FatalIOError);
+                    }
+
+                    for (const label celli : mesh.cellZones()[zoneID])
+                    {
+                        materialID_[celli] = matID;
+                    }
+                }
+            }
+        }
+
+        Info<< "thermalTopO: " << nMat << " solid materials "
+            << materialNames_ << "; generated solid = " << defName << endl;
+    }
+
     if (rhoPtr_ || kFluidPtr_ || DSolidPtr_)
     {
         Info<< "thermalTopO: temperature-dependent properties active"
@@ -210,12 +331,66 @@ Foam::tmp<Foam::volScalarField> Foam::thermalPropertyTables::DSolidField
     const word& name
 ) const
 {
+    if (multiMaterial_)
+    {
+        // Spatially varying solid diffusivity: each cell uses its own labelled
+        // material, evaluated at the local temperature. The topology
+        // sensitivity term needs no change, because it already consumes D_s as
+        // a FIELD (Ds - Df - nut/Prt).
+        tmp<volScalarField> tDs(uniform(T, name, Zero, dimViscosity));
+        volScalarField& Ds = tDs.ref();
+
+        scalarField& Dsi = Ds.primitiveFieldRef();
+        const scalarField& Ti = T.primitiveField();
+        forAll(Dsi, celli)
+        {
+            Dsi[celli] = materialDSolid(materialID_[celli], Ti[celli]);
+        }
+
+        volScalarField::Boundary& bDs = Ds.boundaryFieldRef();
+        forAll(bDs, patchi)
+        {
+            const labelUList& fc = T.mesh().boundary()[patchi].faceCells();
+            const fvPatchScalarField& Tp = T.boundaryField()[patchi];
+            fvPatchScalarField& Dsp = bDs[patchi];
+
+            forAll(Dsp, facei)
+            {
+                Dsp[facei] =
+                    materialDSolid(materialID_[fc[facei]], Tp[facei]);
+            }
+        }
+
+        return tDs;
+    }
+
     if (DSolidPtr_)
     {
         return evaluate(*DSolidPtr_, T, name, scalar(1), dimViscosity);
     }
 
     return uniform(T, name, DSolid_, dimViscosity);
+}
+
+
+Foam::tmp<Foam::volScalarField> Foam::thermalPropertyTables::materialIDField
+(
+    const volScalarField& T,
+    const word& name
+) const
+{
+    tmp<volScalarField> tId(uniform(T, name, Zero, dimless));
+
+    if (multiMaterial_)
+    {
+        scalarField& f = tId.ref().primitiveFieldRef();
+        forAll(f, celli)
+        {
+            f[celli] = scalar(materialID_[celli]);
+        }
+    }
+
+    return tId;
 }
 
 

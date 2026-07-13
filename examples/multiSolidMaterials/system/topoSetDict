@@ -1,0 +1,18 @@
+FoamFile { version 2.0; format ascii; class dictionary; object topoSetDict; }
+actions
+(
+    // design space: the optimiser decides fluid vs SOLID here.
+    // Generated solid takes defaultGeneratedSolidMaterial (tungsten).
+    { name designSet;  type cellSet; action new; source boxToCell; box (0.02 0.002 -1) (0.08 0.018 1); }
+    { name designSpace; type cellZoneSet; action new; source setToCellZone; set designSet; }
+
+    // fixed solid regions with DIFFERENT materials, labelled by cellZone
+    { name cuSet;      type cellSet; action new; source boxToCell; box (0.0 0.0 -1) (0.02 0.004 1); }
+    { name CuCrZrZone; type cellZoneSet; action new; source setToCellZone; set cuSet; }
+
+    { name interSet;      type cellSet; action new; source boxToCell; box (0.08 0.0 -1) (0.10 0.004 1); }
+    { name copperZone;    type cellZoneSet; action new; source setToCellZone; set interSet; }
+
+    { name objSet; type cellSet; action new; source boxToCell; box (0.085 0 -1) (0.098 0.02 1); }
+    { name objZone; type cellZoneSet; action new; source setToCellZone; set objSet; }
+);
