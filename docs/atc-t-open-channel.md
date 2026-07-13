@@ -651,3 +651,99 @@ peak surface temperature down (426.3 → 397.4 K over four cycles) by pushing
 conductive material into the coolant, and the pressure loss climbs ~700x. That
 is a correct response to the objective it was given, and it is exactly why the
 constraint matters.
+
+---
+
+## Solution roadmap (13 Jul 2026) — the missing object is the adjoint of the SIMPLE pressure projection
+
+`gPhi_f` is proven (10-11 significant figures against an FD of the face
+Lagrangian). What is missing is not a coefficient but an entire elimination step.
+
+The primal flux that the energy equation actually convects with is the
+**pressure-corrected** flux:
+
+    phi = phiHbyA - pEqn.flux()
+
+Writing `F = phiHbyA`, `C` for the pressure-flux correction operator
+(`p -> pEqn.flux()`), `D` for the cell divergence and `L = D C` for the pressure
+equation operator:
+
+    dp   = L^-1 D dF
+    dphi = dF - C dp
+
+so, for a thermal flux sensitivity `g = gPhi = dL_T/dphi`,
+
+    dJ = g^T dphi = [ g - D^T lambda ]^T dF,      L^T lambda = C^T g
+
+**The correct predictor-flux sensitivity is therefore**
+
+    gF = gPhi - D^T lambda
+
+not `gPhi`. `exactFluxTranspose` currently maps `gPhi` straight onto the cells
+with `dphi_f/dU_P ~ w_f Sf_f`, which is equivalent to assuming
+`phi = interpolate(U) . Sf`. That injects the right face sensitivity into the
+**wrong variable**, and the omitted term is the whole adjoint of the pressure
+projection -- which is why `TaGradT`, `-T grad(Ta)` and `exactFluxTranspose` all
+sit in the same 10-40x band rather than differing.
+
+### Route A is NOT available (checked at source, 13 Jul)
+
+The natural fix would be to hand `gPhi` to upstream and let the existing adjoint
+flow machinery project it. **There is no such hook.** The complete set of
+derivative hooks an `objectiveIncompressible` may supply is
+
+    dJdv  dJdp  dJdT  dJdb  dJdbField  dJdnut  dJdGradU
+    + the boundary variants (boundarydJdv, boundarydJdp, ...)
+
+There is **no `dJdphi`, no flux-sensitivity concept anywhere in
+`optimisation/adjointOptimisation/adjoint`.** `objectivePtLosses` never needs
+one, because it is a *boundary* objective: it enters the adjoint through `dJdp`
+and `dJdv` on the inlet/outlet patches and never touches the interior flux
+operator. That is precisely why the stock `PtLosses` adjoint passes the same FD
+gate (1.22-1.36e-6) in this geometry under a continuous adjoint, while a thermal
+objective does not: **a thermal objective depends on velocity through the
+interior convection operator, evaluated on a SIMPLE-projected flux.**
+
+**This is a genuine capability gap in the framework, not a defect in it.** The
+continuous-adjoint architecture has no mechanism to express an objective
+sensitivity with respect to the discrete face flux -- which is exactly what any
+objective convected by `phi` requires once the discrete and continuous adjoints
+are asked to agree at O(1) accuracy in convection-dominated flow.
+
+### Route B — eliminated projection (the implementation target)
+
+    1. gPhi_f      from the proven chi=1 formula (done)
+    2. rhs         = C^T gPhi          (face -> cell)
+    3. solve       L^T lambda = rhs    (same operator as the pressure equation)
+    4. gF_f        = gPhi_f - (lambda_P - lambda_N)
+    5. Su_P       += w_f     gF_f Sf_f / V_P
+       Su_N       += (1-w_f) gF_f Sf_f / V_N
+    6. matrix     += couplingSign_ * Su
+
+with `c_f` in step 2 taken from the coefficient `pEqn.flux()` actually uses
+(`rAUf * magSf * nonOrthDeltaCoeffs`), **not** a guessed one. Do NOT combine this
+with a Route-A-style uneliminated coupling: that would double-count the
+projection.
+
+### Acceptance criteria — both are no-solve identities, and both must pass BEFORE any topology FD run
+
+**(i) Projection-adjoint identity.** Freeze `rAUf`, `F`, the mesh and the
+pressure-equation coefficients. For random `dF`:
+
+    L dp = D dF ;  dphi = dF - C dp
+    check:  sum_f gPhi_f dphi_f  ==  sum_f gF_f dF_f        (to roundoff)
+
+**(ii) HbyA mapping identity.** For random cell-vector `dH`:
+
+    dF_f = Sf_f . (w_f dH_P + (1-w_f) dH_N)
+    check:  sum_f gF_f dF_f  ==  sum_P V_P Su_P . dH_P      (to roundoff)
+
+Only then is the open-channel FD gate meaningful again. `utilities/
+testAdjointTranspose` is the natural home for both.
+
+### Scope note
+
+The scalar-adjoint transpose test stays in the suite regardless: for
+constant-property bounded upwind `fvm::div(-phi,Ta)` **is** the exact transpose
+(verified: off-diagonals match to 0), but that is a property of that scheme pair,
+not a general guarantee.
