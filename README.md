@@ -39,9 +39,9 @@ of coolant channels in fusion plasma-facing components.
       <td>working, verified</td>
     </tr>
     <tr>
-      <td>Adjoint SIMPLE + adjoint energy equation and Ta∇T momentum coupling</td>
+      <td>Adjoint SIMPLE + adjoint energy equation and thermal-to-momentum coupling</td>
       <td><code>thermalAdjointSimple</code></td>
-      <td>working, verified</td>
+      <td>working, FD-verified in porous verification cases; open-channel projected-flux path experimental</td>
     </tr>
     <tr>
       <td>Temperature-dependent properties ρ(T), c_p(T), k_f(T), k_s(T) in primal, adjoint and sensitivities</td>
@@ -318,8 +318,9 @@ reaches momentum was confirmed against an otherwise identical constant-ν run
 (22 % change in peak pressure, 11.5 % in peak velocity).
 
 The tables are the mechanism; the verification values are chosen for FD
-conditioning. Production runs load real coolant/structural data through the
-same entries (for a fusion monoblock: IAPWS water at 95 bar, tungsten k(T)).
+conditioning. Production runs load real coolant and structural data through the
+same entries, for example representative high-pressure water and tabulated
+solid conductivity.
 
 ## Build
 
@@ -418,10 +419,9 @@ within 0.03 % at cycle 80:
 - Near sharp Brinkman interfaces, prefer `bounded Gauss upwind` /
   `limitedLinear` over `cellLimited`-gradient `linearUpwind`: limiter
   flip-flop can stall SIMPLE at a constant residual plateau.
-- Keep the thermal objective weight small (about 1e-6 for SI Kelvin-scale
-  objectives): the adjoint fields of mean/peak-temperature objectives are
-  physically enormous, and segregated adjoint loops are happier at small
-  magnitudes. Scales cancel in the optimiser.
+- Small thermal objective weights can improve adjoint solver conditioning.
+  In constrained optimisation, use `normalise` or `normFactor` so objective
+  and constraint gradients are comparably scaled.
 - The `nullSpace` update method has proven more robust than ISQP on
   badly scale-separated constraint sets in our tests.
 
