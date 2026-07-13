@@ -444,6 +444,71 @@ So: the DEFECT is proven and located, but the REPLACEMENT is still open. The
 is the place to land it, and `utilities/testAdjointTranspose` is the gate it must
 pass BEFORE any optimisation cycle is run.
 
+### CONFIRMED: the exact flux sensitivity, including the bounded-convection term
+
+`utilities/testAdjointTranspose` test (4) finite-differences the face Lagrangian
+`L(phi) = Ta . (A(phi) T)` directly, with NO solve, and compares against the
+closed form. Writing `A_P = C_P Ta_P` (the primal ROW-scales by C_P, so the jump
+is `C_P Ta_P - C_N Ta_N`, NOT `C_f (Ta_P - Ta_N)`), and with `chi = 1` for a
+`bounded` scheme:
+
+    gPhi_f = T_f (A_P - A_N) - chi (A_P T_P - A_N T_N)
+
+Measured:
+
+       face      FD dL/dphi        gPhi(chi=1)        gPhi(chi=0)
+       2388   -304.074666184   -304.074666183       6.34
+       2390   -259.703889269   -259.703889270      90.73
+       2392   -230.509321407   -230.509321409     112.55
+       2547   -222.420199711   -222.420199709     -11.43
+
+The FD matches `chi = 1` to **10-11 significant figures**; `chi = 0` is
+completely wrong. So:
+
+- The **bounded-convection correction is real and essential.** OpenFOAM's
+  `bounded Gauss upwind` assembles `div(phi,T) - Sp(div(phi),T)`. At convergence
+  `div(phi) ~ 0`, so the primal RESIDUAL is unchanged -- but the DERIVATIVE with
+  respect to the flux is not: `d/dphi[-T div(phi)] = -T div(dphi) != 0`. Every
+  continuous form (`Ta grad(T)`, `-T grad(Ta)`) misses this term entirely, which
+  is why they all failed by the same O(1) factor.
+- For bounded upwind, `gPhi` collapses to the DOWNWIND adjoint value times the
+  temperature jump: `Ta_N (T_N - T_P)` for phi > 0, `Ta_P (T_N - T_P)` for
+  phi < 0. A completely different object from `Ta grad(T)`.
+
+`couplingForm exactFluxTranspose` implements exactly this and is committed.
+
+### The one remaining gap: dphi/dU is NOT w_f * Sf (Rhie-Chow)
+
+Even with the flux sensitivity proven correct, the FD gate still fails:
+
+| couplingForm | cell 628 | cell 626 |
+|---|---|---|
+| `TaGradT` | 1.04e-5 | 3.55e-5 |
+| `exactFluxTranspose` | 1.20e-5 | 3.83e-5 |
+| target | 1e-6 | 1e-6 |
+
+The flux sensitivity `gPhi_f` is right, so the error must now be in the MAPPING
+from face flux back to cell velocity. `exactFluxTranspose` currently assumes
+
+    phi_f = Sf_f . U_f,   U_f = w_f U_P + (1 - w_f) U_N
+    =>  dphi_f/dU_P = w_f Sf_f
+
+But in SIMPLE the face flux is **Rhie-Chow corrected**:
+
+    phi = interpolate(HbyA) . Sf - rAUf * snGrad(p) * |Sf|
+
+so `phi` is not a plain interpolation of U, and `dphi/dU != w_f Sf_f`. A flux
+sensitivity therefore cannot be expressed correctly as a pure CELL MOMENTUM
+source at all: in a SIMPLE/continuous-adjoint loop it has to enter through the
+adjoint flux / adjoint pressure coupling, which is precisely the machinery that
+makes the stock `PtLosses` adjoint work (and which passes the same FD gate at
+1.22-1.36e-6).
+
+**Next:** find where upstream injects a flux-level sensitivity for flow
+objectives (the adjoint pressure/flux equation, not `addMomentumSource`) and add
+`gPhi_f` there, rather than converting it to a cell source. Do NOT re-derive the
+Rhie-Chow linearisation -- reuse the framework's.
+
 ### Next diagnostic
 
 The remaining rigorous test is an **operator-only FD**, with no optimisation and

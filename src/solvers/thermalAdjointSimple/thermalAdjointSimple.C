@@ -276,29 +276,42 @@ void Foam::thermalAdjointSimple::addMomentumSource(fvVectorMatrix& matrix)
         return;
     }
 
-    if (couplingForm_ == "exactFaceTranspose")
+    if (couplingForm_ == "exactFluxTranspose")
     {
-        // The EXACT discrete derivative of the primal convective term
-        // contracted with Ta, with respect to the velocity. The primal
-        // assembles fvm::div(phi,T) with a frozen face value
-        // T_f = cP T_P + cN T_N, so
+        // EXACT derivative of the primal convective term contracted with Ta,
+        // with respect to the FACE FLUX -- including the bounded-convection
+        // correction, which is the term the continuous forms miss.
         //
-        //     d/dphi_f [ Ta^T R_conv ] = T_f * (Ta_P - Ta_N)
+        // OpenFOAM's "bounded Gauss <scheme>" assembles
         //
-        // and mapping phi_f = Sf_f . U_f with U_f = w_f U_P + (1-w_f) U_N back
-        // onto the cells gives
+        //     div(phi,T) - Sp(div(phi), T)            (chi = 1)
         //
-        //     S_P += w_f     * T_f * (Ta_P - Ta_N) * Sf_f / V_P
-        //     S_N += (1-w_f) * T_f * (Ta_P - Ta_N) * Sf_f / V_N
+        // rather than the conservative div(phi,T) (chi = 0). At a converged
+        // solution div(phi) ~ 0, so the two give the same primal RESIDUAL --
+        // but NOT the same derivative w.r.t. the flux:
         //
-        // For variable rho*cp the primal ROW-scales the convection matrix by
-        // C_P (not by a face-interpolated C_f), so the jump becomes
-        // (C_P Ta_P - C_N Ta_N).
+        //     d/dphi [ -T div(phi) ] = -T div(dphi)   != 0
         //
-        // The continuous forms Ta*grad(T) and -T*grad(Ta) are NOT this. They
-        // agree only in the smooth, low-velocity limit; with upwind convection
-        // in an open channel they differ by O(1) (measured: 102% relative,
-        // sign-flipped in the worst cells -- see utilities/testAdjointTranspose).
+        // Writing A_P = C_P Ta_P (C = 1 for constant properties; the primal
+        // ROW-scales by C_P, so the jump is C_P Ta_P - C_N Ta_N, NOT
+        // C_f (Ta_P - Ta_N)), the face Lagrangian is
+        //
+        //     L_f = phi_f [ T_f (A_P - A_N) - chi (A_P T_P - A_N T_N) ]
+        //
+        // so the exact flux sensitivity is
+        //
+        //     gPhi_f = T_f (A_P - A_N) - chi (A_P T_P - A_N T_N)
+        //
+        // For bounded upwind this collapses to
+        //     phi_f > 0 :  gPhi_f = Ta_N (T_N - T_P)
+        //     phi_f < 0 :  gPhi_f = Ta_P (T_N - T_P)
+        // i.e. the DOWNWIND adjoint value times the temperature jump -- a
+        // completely different object from Ta grad(T), which is why the
+        // continuous forms fail by O(1) in an open channel.
+        //
+        // Mapping phi_f = Sf_f . U_f with U_f = w_f U_P + (1-w_f) U_N:
+        //     S_P += w_f     * gPhi_f * Sf_f / V_P
+        //     S_N += (1-w_f) * gPhi_f * Sf_f / V_N
         const surfaceScalarField& phi = primalVars_.phi();
         const surfaceScalarField& w = mesh_.weights();
         const surfaceVectorField& Sf = mesh_.Sf();
@@ -306,10 +319,12 @@ void Foam::thermalAdjointSimple::addMomentumSource(fvVectorMatrix& matrix)
         const labelUList& own = mesh_.owner();
         const labelUList& nei = mesh_.neighbour();
 
+        const scalar chi = boundedConvection_ ? 1 : 0;
+
         tmp<volScalarField> tC;
         if (props_.variableRhoCp())
         {
-            tC = props_.CField(T, "rhoCpNorm");
+            tC = props_.CField(T, "rhoCpNormATC");
         }
 
         auto tSrc =
@@ -333,18 +348,22 @@ void Foam::thermalAdjointSimple::addMomentumSource(fvVectorMatrix& matrix)
             const label P = own[facei];
             const label N = nei[facei];
 
-            // the same frozen face value the primal upwind scheme uses
-            const scalar Tf = (phi[facei] > 0) ? T[P] : T[N];
+            const scalar CP = props_.variableRhoCp() ? tC()[P] : scalar(1);
+            const scalar CN = props_.variableRhoCp() ? tC()[N] : scalar(1);
 
-            const scalar jump =
-                props_.variableRhoCp()
-              ? (tC()[P]*Ta[P] - tC()[N]*Ta[N])
-              : (Ta[P] - Ta[N]);
+            const scalar AP = CP*Ta[P];
+            const scalar AN = CN*Ta[N];
 
-            const vector base(Tf*jump*Sf[facei]);
+            // frozen face interpolation, matching the primal's div scheme
+            const scalar Tf = (phi[facei] >= 0) ? T[P] : T[N];
 
-            S[P] += w[facei]*base/V[P];
-            S[N] += (scalar(1) - w[facei])*base/V[N];
+            const scalar gPhi =
+                Tf*(AP - AN) - chi*(AP*T[P] - AN*T[N]);
+
+            const vector Gf(gPhi*Sf[facei]);
+
+            S[P] += w[facei]*Gf/V[P];
+            S[N] += (scalar(1) - w[facei])*Gf/V[N];
         }
 
         matrix += couplingSign_*tSrc();
@@ -394,6 +413,7 @@ Foam::thermalAdjointSimple::thermalAdjointSimple
     couplingSign_(1),
     thermalSensScale_(1),
     couplingForm_("TaGradT"),
+    boundedConvection_(true),
     kInterpolation_(nullptr)
 {
     const dictionary& thermalDict = dict.subDict("thermal");
@@ -405,6 +425,8 @@ Foam::thermalAdjointSimple::thermalAdjointSimple
         thermalDict.getOrDefault<scalar>("thermalSensScale", 1);
     couplingForm_ =
         thermalDict.getOrDefault<word>("couplingForm", "TaGradT");
+    boundedConvection_ =
+        thermalDict.getOrDefault<bool>("boundedConvection", true);
     kInterpolation_ =
         topOInterpolationFunction::New
         (
@@ -445,6 +467,8 @@ bool Foam::thermalAdjointSimple::readDict(const dictionary& dict)
             thermalDict.getOrDefault<scalar>("thermalSensScale", 1);
         couplingForm_ =
             thermalDict.getOrDefault<word>("couplingForm", "TaGradT");
+        boundedConvection_ =
+            thermalDict.getOrDefault<bool>("boundedConvection", true);
         // rebuild: otherwise RAMP continuation through a dictionary re-read
         // would be silently ignored
         kInterpolation_ =

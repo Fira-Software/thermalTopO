@@ -38,7 +38,7 @@ adjointManagers
                 thermal
                 {
                     DFluid 1.0e-5; DSolid 1.0e-3; Prt 0.85;
-                    couplingSign -1; couplingForm exactFaceTranspose; thermalSensScale 1;
+                    couplingSign -1; couplingForm exactFluxTranspose; thermalSensScale 1;
                     kInterpolation { function BorrvallPetersson; b 20; }
                 }
                 objectives

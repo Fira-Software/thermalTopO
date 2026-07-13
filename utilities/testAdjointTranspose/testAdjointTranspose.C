@@ -225,6 +225,81 @@ int main(int argc, char *argv[])
         Info<< nl;
     }
 
+    // ---------------------------------------------------------------------
+    // (4) ALGEBRAIC VALIDATION of gPhi. No solve, no optimisation.
+    //     L(phi) = Ta . (A(phi) * T),  A = fvm::div(phi,T) with the case scheme
+    //     FD dL/dphi_f  vs   gPhi_f = T_f (Ta_P - Ta_N) - chi (Ta_P T_P - Ta_N T_N)
+    // ---------------------------------------------------------------------
+    {
+        auto Lagr = [&](const surfaceScalarField& ph) -> scalar
+        {
+            fvScalarMatrix M(fvm::div(ph, T));
+            const scalarField& d = M.diag();
+            const scalarField& up = M.upper();
+            const scalarField& lo = M.lower();
+            scalarField AT(nCells, Zero);
+            forAll(d, c) { AT[c] = d[c]*T[c]; }
+            forAll(own, f)
+            {
+                AT[own[f]] += up[f]*T[nei[f]];
+                AT[nei[f]] += lo[f]*T[own[f]];
+            }
+            scalar L = 0;
+            forAll(AT, c) { L += Ta[c]*AT[c]; }
+            return L;
+        };
+
+        // pick the faces where the term is actually ACTIVE: rank by the size
+        // of the exact flux sensitivity itself
+        labelList cand;
+        forAll(own, f)
+        {
+            if (!nearBoundary[own[f]] && !nearBoundary[nei[f]])
+            {
+                cand.append(f);
+            }
+        }
+        scalarField gmag(cand.size(), Zero);
+        forAll(cand, i)
+        {
+            const label f = cand[i];
+            const label P = own[f];
+            const label N = nei[f];
+            const scalar Tf = (phi[f] >= 0) ? T[P] : T[N];
+            gmag[i] = mag(Tf*(Ta[P] - Ta[N]) - (Ta[P]*T[P] - Ta[N]*T[N]));
+        }
+        labelList idx(cand.size());
+        forAll(idx, i) idx[i] = i;
+        sort(idx, [&](label a, label b){ return gmag[a] > gmag[b]; });
+        labelList probes;
+        for (label i = 0; i < min(label(6), cand.size()); ++i)
+        {
+            probes.append(cand[idx[i]]);
+        }
+
+        Info<< "=== (4) ALGEBRAIC CHECK of gPhi (FD of L(phi), no solve) ===" << nl
+            << "   face      FD dL/dphi     gPhi(chi=1)     gPhi(chi=0)" << endl;
+
+        const scalar eps = 1e-11;
+        for (const label f : probes)
+        {
+            surfaceScalarField pp(phi);
+            surfaceScalarField pm(phi);
+            pp.primitiveFieldRef()[f] += eps;
+            pm.primitiveFieldRef()[f] -= eps;
+            const scalar fd = (Lagr(pp) - Lagr(pm))/(2*eps);
+
+            const label P = own[f];
+            const label N = nei[f];
+            const scalar Tf = (phi[f] >= 0) ? T[P] : T[N];
+            const scalar g1 = Tf*(Ta[P] - Ta[N]) - (Ta[P]*T[P] - Ta[N]*T[N]);
+            const scalar g0 = Tf*(Ta[P] - Ta[N]);
+
+            Info<< "   " << f << "   " << fd << "   " << g1 << "   " << g0 << endl;
+        }
+        Info<< nl;
+    }
+
     Info<< "End" << nl << endl;
     return 0;
 }

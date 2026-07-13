@@ -109,9 +109,14 @@ protected:
         //- Scale (incl. sign) of the conductivity sensitivity term
         scalar thermalSensScale_;
 
-        //- Continuous form of the (ATC-T) coupling into adjoint momentum:
-        //- "TaGradT" (default) or "negTGradTa". See addMomentumSource().
+        //- Form of the (ATC-T) coupling into adjoint momentum:
+        //- "TaGradT" (default, continuous), "negTGradTa" (continuous),
+        //- "exactFluxTranspose" (discrete), or "none". See addMomentumSource().
         word couplingForm_;
+
+        //- Does the primal use a "bounded" convection scheme (chi = 1)?
+        //- Only affects couplingForm exactFluxTranspose.
+        bool boundedConvection_;
 
         //- Interpolation function for the conductivity RAMP
         autoPtr<topOInterpolationFunction> kInterpolation_;
