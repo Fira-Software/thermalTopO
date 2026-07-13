@@ -8,8 +8,8 @@ currently lacks: a temperature equation in the primal, the corresponding
 adjoint temperature equation with its coupling into adjoint momentum,
 thermal objective functions, and the conductivity-interpolation term in the
 topology sensitivities. With it, the existing porosity-based topology
-optimisation — including the upstream constrained update methods
-(ISQP / nullSpace / MMA) and the fully differentiated k-ω SST adjoint —
+optimisation, including the upstream constrained update methods
+(ISQP / nullSpace / MMA) and the fully differentiated k-ω SST adjoint,
 can optimise cooling geometries for thermal objectives such as *minimise
 peak wall temperature subject to a pressure-drop cap*.
 
@@ -24,19 +24,72 @@ of coolant channels in fusion plasma-facing components.
 
 ## What it adds
 
-| Component | Class | Status |
-|---|---|---|
-| Primal SIMPLE + energy equation over the design field | `thermalSimple` | working, verified |
-| Adjoint SIMPLE + adjoint energy equation and Ta∇T momentum coupling | `thermalAdjointSimple` | working, verified |
-| Temperature-dependent properties ρ(T), c_p(T), k_f(T), k_s(T) in primal, adjoint and sensitivities | `thermalPropertyTables` | working, FD-verified |
-| Several fixed solid materials, labelled by cellZone, each with its own D_s or D_s(T) | `thermalPropertyTables` | working, verified |
-| Temperature-dependent viscosity μ(T) in the momentum equation | `viscosityModels::temperatureTable` | working, verified |
-| Zone-mean temperature objective | `objectiveMeanTemperature` | working, FD-verified |
-| Patch p-norm (peak-surrogate) temperature objective | `objectivePatchTemperaturePNorm` | working |
-| Conductivity term in topology sensitivities | via `topOSensMultiplier` hook | working, FD-verified |
-| Bergles–Rohsenow onset-of-nucleate-boiling monitor | `boilingOnsetBerglesRohsenow` functionObject | working |
-| Discrete adjoint-transpose gate (no-solve operator test) | `utilities/testAdjointTranspose` | working |
-| Property-field reporting (`DSolid`, `DFluid`, `materialID`) | `utilities/writeThermalProperties` | working |
+<table>
+  <thead>
+    <tr>
+      <th>Component</th>
+      <th>Class</th>
+      <th>Status</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Primal SIMPLE + energy equation over the design field</td>
+      <td><code>thermalSimple</code></td>
+      <td>working, verified</td>
+    </tr>
+    <tr>
+      <td>Adjoint SIMPLE + adjoint energy equation and Ta∇T momentum coupling</td>
+      <td><code>thermalAdjointSimple</code></td>
+      <td>working, verified</td>
+    </tr>
+    <tr>
+      <td>Temperature-dependent properties ρ(T), c_p(T), k_f(T), k_s(T) in primal, adjoint and sensitivities</td>
+      <td><code>thermalPropertyTables</code></td>
+      <td>working, FD-verified</td>
+    </tr>
+    <tr>
+      <td>Several fixed solid materials, labelled by cellZone, each with its own D_s or D_s(T)</td>
+      <td><code>thermalPropertyTables</code></td>
+      <td>working, verified</td>
+    </tr>
+    <tr>
+      <td>Temperature-dependent viscosity μ(T) in the momentum equation</td>
+      <td><code>viscosityModels::temperatureTable</code></td>
+      <td>working, verified</td>
+    </tr>
+    <tr>
+      <td>Zone-mean temperature objective</td>
+      <td><code>objectiveMeanTemperature</code></td>
+      <td>working, FD-verified</td>
+    </tr>
+    <tr>
+      <td>Patch p-norm (peak-surrogate) temperature objective</td>
+      <td><code>objectivePatchTemperaturePNorm</code></td>
+      <td>working</td>
+    </tr>
+    <tr>
+      <td>Conductivity term in topology sensitivities</td>
+      <td>via <code>topOSensMultiplier</code> hook</td>
+      <td>working, FD-verified</td>
+    </tr>
+    <tr>
+      <td>Bergles-Rohsenow onset-of-nucleate-boiling monitor</td>
+      <td><code>boilingOnsetBerglesRohsenow</code> functionObject</td>
+      <td>working</td>
+    </tr>
+    <tr>
+      <td>Discrete adjoint-transpose gate (no-solve operator test)</td>
+      <td><code>utilities/testAdjointTranspose</code></td>
+      <td>working</td>
+    </tr>
+    <tr>
+      <td>Property-field reporting (<code>DSolid</code>, <code>DFluid</code>, <code>materialID</code>)</td>
+      <td><code>utilities/writeThermalProperties</code></td>
+      <td>working</td>
+    </tr>
+  </tbody>
+</table>
 
 Everything plugs into unmodified OpenFOAM v2512 through its runtime-selection
 and sensitivity extension points; no core sources are patched.
@@ -67,12 +120,32 @@ and sensitivity extension points; no core sources are patched.
   SIMPLE pressure-projection step; see
   [`docs/atc-t-open-channel.md`](docs/atc-t-open-channel.md).
 
-| Directory | |
-|---|---|
-| `src/` | the module |
-| `cases/` | verified cases; every gradient claim in this README is reproduced here |
-| `utilities/` | verification tooling, incl. a no-solve operator-transpose gate |
-| `examples/` | experimental work in progress; not evidence |
+<table>
+  <thead>
+    <tr>
+      <th>Directory</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>src/</code></td>
+      <td>the module</td>
+    </tr>
+    <tr>
+      <td><code>cases/</code></td>
+      <td>verified cases; every gradient claim in this README is reproduced here</td>
+    </tr>
+    <tr>
+      <td><code>utilities/</code></td>
+      <td>verification tooling, incl. a no-solve operator-transpose gate</td>
+    </tr>
+    <tr>
+      <td><code>examples/</code></td>
+      <td>experimental work in progress; not evidence</td>
+    </tr>
+  </tbody>
+</table>
 
 Verification is treated as a gate, not a report: an operator is checked
 algebraically before it is trusted, and a case is not cited until its gradients
@@ -92,20 +165,20 @@ residuals with automated guards:
   zone-mean objective median |error| 0.5 % (max 2.1 %); patch p-norm
   objective median |error| 0.2 % (max 0.9 %).** Against the derivation
   note's pre-registered < 1 % laminar gate: the p-norm campaign passes it
-  outright; the zone-mean campaign passes on median with max 2.1 %. The
+  outright. The zone-mean campaign passes on median with max 2.1 %. The
   p-norm campaign exercises the boundary-driven adjoint flux path used by
   peak-temperature objectives.
 - **Production configuration (regularisation on, p-norm objective,
   chained sensitivities): all regimes verify to max 1.7 % per cell**
-  (solid 0.5 % median, edge 0.6 %, sponge 1.2 %) - the design-step error
+  (solid 0.5 % median, edge 0.6 %, sponge 1.2 %). The design-step error
   localisation observed without regularisation vanishes, as predicted.
   Note for reproducers: with regularisation active compare FD against
   `topOSens<solver>` (enable `writeAllFields`), not `topologySens<solver>`,
   which upstream writes before the filter/projection chain rule.
-- Directional derivatives across 720 design cells: 1–3 % on
+- Directional derivatives across 720 design cells: 1 to 3 % on
   gradient-dominant directions.
 - With 1st-order upwind advection the solid-interior error grows to a
-  uniform ≈ +11 % — an advection-scheme-consistency effect, not a
+  uniform bias of about +11 %. This is an advection-scheme-consistency effect, not a
   formulation error. Cells adjacent to *unfiltered* step discontinuities
   in the design field carry larger local errors; regularisation (on in
   any production run) removes that configuration by construction.
@@ -119,17 +192,50 @@ Full derivation and verification protocol: [docs/derivation.md](docs/derivation.
 ## Temperature-dependent fluid and solid properties
 
 Properties can be tabulated in temperature **in both the fluid and the solid**,
-and they stay active **throughout** the optimisation — primal, adjoint and
-sensitivity assembly — not just in a final verification run.
+and they stay active **throughout** the optimisation: primal, adjoint and
+sensitivity assembly, not only a final verification run.
 
-| Property | Entry | Where it acts |
-|---|---|---|
-| ρ(T) [kg/m³] | `rhoTable` | volumetric heat capacity, and ν = μ/ρ |
-| c_p(T) [J/kg/K] | `cpTable` | volumetric heat capacity |
-| k_f(T) [W/m/K] | `kFluidTable` | fluid diffusivity D_f = k_f/(ρc_p)_ref |
-| μ(T) [Pa s] | `muTable` | momentum, via ν(T) = μ(T)/ρ(T) |
-| k_s(T), as D_s [m²/s] | `DSolidTable` | solid diffusivity |
-| Pr_t | `Prt` | constant (default 0.85), documented, frozen in the adjoint |
+<table>
+  <thead>
+    <tr>
+      <th>Property</th>
+      <th>Entry</th>
+      <th>Where it acts</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>ρ(T) [kg/m³]</td>
+      <td><code>rhoTable</code></td>
+      <td>volumetric heat capacity, and ν = μ/ρ</td>
+    </tr>
+    <tr>
+      <td>c_p(T) [J/kg/K]</td>
+      <td><code>cpTable</code></td>
+      <td>volumetric heat capacity</td>
+    </tr>
+    <tr>
+      <td>k_f(T) [W/m/K]</td>
+      <td><code>kFluidTable</code></td>
+      <td>fluid diffusivity D_f = k_f/(ρc_p)_ref</td>
+    </tr>
+    <tr>
+      <td>μ(T) [Pa s]</td>
+      <td><code>muTable</code></td>
+      <td>momentum, via ν(T) = μ(T)/ρ(T)</td>
+    </tr>
+    <tr>
+      <td>k_s(T), as D_s [m²/s]</td>
+      <td><code>DSolidTable</code></td>
+      <td>solid diffusivity</td>
+    </tr>
+    <tr>
+      <td>Pr_t</td>
+      <td><code>Prt</code></td>
+      <td>constant (default 0.85), documented, frozen in the adjoint</td>
+    </tr>
+  </tbody>
+</table>
 
 The energy equation is solved as
 
@@ -138,7 +244,7 @@ The energy equation is solved as
 
 i.e. the ρc_p variation is carried on the **convective** term, scaled by a
 *constant* reference (ρc_p)_ref. That is not cosmetic: dividing by the *local*
-ρc_p instead — putting α(T) = k/(ρc_p) straight into the Laplacian — breaks
+ρc_p instead, putting α(T) = k/(ρc_p) straight into the Laplacian, breaks
 continuity of the physical heat flux k∇T at the fluid/solid interface, which
 is the one thing a conjugate formulation may not get wrong. The local thermal
 diffusivity α(T) = k/(ρc_p) = D_f/C is computed by the property class
@@ -179,7 +285,7 @@ thermal
 A table overrides its constant (`DFluid`, `DSolid`), so constant-property
 cases take an unchanged code path. `rhoTable`
 appears in both dictionaries because OpenFOAM builds the transport model and
-the primal solver from different files; **keep them consistent — they are not
+the primal solver from different files; **keep them consistent. They are not
 cross-checked.** A variable-property case must also declare the adjoint's
 C-weighted convective flux in `fvSchemes`, which must *not* be `bounded`:
 
@@ -193,19 +299,20 @@ primal solution. The cost of that is measured, not assumed.
 
 **Verification** (`cases/varprops`, laminar, production configuration, all
 five tables active at once: ρ, c_p, k_f, μ *and* D_s. Across the tabulated
-300–340 K span, which the case's temperature field realises to 338.8 K:
-ρc_p −23.5 %, ν −41 %, k_f +10 %, D_s −33 %):
+300 to 340 K span, which the case's temperature field realises to 338.8 K:
+ρc_p -23.5 %, ν -41 %, k_f +10 %, D_s -33 %):
 
-| Regime | median \|err\| | max \|err\| | same case, constant properties |
-|---|---|---|---|
-| solid interior | 0.4 % | 0.8 % | 0.5 % / 1.0 % |
-| interface edge | 0.7 % | 0.9 % | 0.6 % / 1.5 % |
-| sponge | 1.4 % | 1.6 % | 1.2 % / 1.7 % |
+- Solid interior: median error 0.4 %, maximum error 0.8 %; constant-property
+  reference 0.5 % / 1.0 %.
+- Interface edge: median error 0.7 %, maximum error 0.9 %; constant-property
+  reference 0.6 % / 1.5 %.
+- Sponge: median error 1.4 %, maximum error 1.6 %; constant-property reference
+  1.2 % / 1.7 %.
 
 Sign agreement 18/18 cells. Per-cell gradient accuracy with every property
 tabulated is indistinguishable from the constant-property campaign. Across
 the five directional derivatives the sign is likewise always correct, with
-magnitude errors of 2.0–5.8 % against 1–3 % constant-property — a modest,
+magnitude errors of 2.0 to 5.8 % against 1 to 3 % constant-property, a modest,
 honestly-reported cost of the frozen-property terms. That μ(T) genuinely
 reaches momentum was confirmed against an otherwise identical constant-ν run
 (22 % change in peak pressure, 11.5 % in peak velocity).
@@ -288,7 +395,7 @@ adjointManagers
 
 Fields: `0/T` (primal temperature) and `0/Ta` (adjoint temperature,
 dimensions `[0 2 -2 -1 0 0 0]`; fixedValue 0 at inlets *and* outlets,
-fixedGradient elsewhere — the solver drives objective-patch gradients).
+fixedGradient elsewhere. The solver drives objective-patch gradients).
 The Brinkman source is the upstream `topOSource` fvOption on `(U Ua)`;
 initial designs are supplied through the `alpha` field.
 
@@ -303,7 +410,7 @@ within 0.03 % at cycle 80:
 
 ## Practical notes (learned the hard way)
 
-- Solve `T` and `Ta` with tight inner tolerances (`relTol 0;`) — they are
+- Solve `T` and `Ta` with tight inner tolerances (`relTol 0;`). They are
   linear given the flow; loose inner solves turn convergence into a crawl.
 - Do **not** under-relax `Ta`: even `relax(1.0)` clips for diagonal
   dominance against the current field and biases the fixed point. Leave
@@ -311,7 +418,7 @@ within 0.03 % at cycle 80:
 - Near sharp Brinkman interfaces, prefer `bounded Gauss upwind` /
   `limitedLinear` over `cellLimited`-gradient `linearUpwind`: limiter
   flip-flop can stall SIMPLE at a constant residual plateau.
-- Keep the thermal objective weight small (≈1e-6 for SI Kelvin-scale
+- Keep the thermal objective weight small (about 1e-6 for SI Kelvin-scale
   objectives): the adjoint fields of mean/peak-temperature objectives are
   physically enormous, and segregated adjoint loops are happier at small
   magnitudes. Scales cancel in the optimiser.
