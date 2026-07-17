@@ -388,6 +388,9 @@ protected:
             vectorField barUFromBoundary;
 
             scalarField barpNew;
+            scalarField barpSolveFromRelaxOnly;
+            scalarField barpSolveFromPhiFlux;
+            scalarField barpSolveTotal;
             scalarField barpSolve;
 
             scalarField barF2Internal;
@@ -439,6 +442,9 @@ protected:
                 barUBoundary(mesh.boundary().size()),
                 barUFromBoundary(mesh.nCells(), vector::zero),
                 barpNew(mesh.nCells(), Zero),
+                barpSolveFromRelaxOnly(mesh.nCells(), Zero),
+                barpSolveFromPhiFlux(mesh.nCells(), Zero),
+                barpSolveTotal(mesh.nCells(), Zero),
                 barpSolve(mesh.nCells(), Zero),
                 barF2Internal(mesh.nInternalFaces(), Zero),
                 barF2Boundary(mesh.boundary().size()),

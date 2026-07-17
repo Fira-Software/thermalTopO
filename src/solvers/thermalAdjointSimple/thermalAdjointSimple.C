@@ -3310,6 +3310,7 @@ Foam::thermalAdjointSimple::reverseOneSimpleMapSeedImpl
 
     scalarField pSolveSeed(pSeed);
     pSolveSeed *= pRelaxCoeff;
+    scalarField pSolveSeedFromRelaxOnly(pSolveSeed);
 
     const scalarField& pLower = pEqn.lower();
     const scalarField& pUpper = pEqn.upper();
@@ -3345,6 +3346,10 @@ Foam::thermalAdjointSimple::reverseOneSimpleMapSeedImpl
     }
     if (trace)
     {
+        trace->barpSolveFromRelaxOnly = pSolveSeedFromRelaxOnly;
+        trace->barpSolveFromPhiFlux = pSolveSeed;
+        trace->barpSolveFromPhiFlux -= pSolveSeedFromRelaxOnly;
+        trace->barpSolveTotal = pSolveSeed;
         trace->barpSolve = pSolveSeed;
     }
 
@@ -13400,6 +13405,345 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                     << endl;
             };
 
+            auto makeZeroSurfaceBoundary =
+                [&]()
+            {
+                List<scalarField> zeroBoundary(mesh_.boundary().size());
+                forAll(zeroBoundary, patchi)
+                {
+                    zeroBoundary[patchi].setSize
+                    (
+                        mesh_.boundary()[patchi].size(),
+                        Zero
+                    );
+                }
+                return zeroBoundary;
+            };
+
+            auto pressureBlockAtF2Direction =
+                [&]
+                (
+                    const scalarField& dF2Internal,
+                    const List<scalarField>& dF2Boundary,
+                    const scalar h,
+                    const scalar sign,
+                    const word& namePrefix
+                )
+            {
+                surfaceScalarField F2Probe
+                (
+                    IOobject
+                    (
+                        namePrefix + "F2Probe",
+                        mesh_.time().timeName(),
+                        mesh_,
+                        IOobject::NO_READ,
+                        IOobject::NO_WRITE
+                    ),
+                    phiBase
+                );
+                F2Probe.primitiveFieldRef() =
+                    baseTapeForStages.F2Internal;
+                forAll(F2Probe.boundaryFieldRef(), patchi)
+                {
+                    F2Probe.boundaryFieldRef()[patchi] ==
+                        baseTapeForStages.F2Boundary[patchi];
+                }
+
+                forAll(F2Probe.primitiveFieldRef(), facei)
+                {
+                    F2Probe.primitiveFieldRef()[facei] +=
+                        sign*h*dF2Internal[facei];
+                }
+                forAll(F2Probe.boundaryFieldRef(), patchi)
+                {
+                    fvsPatchScalarField& F2p =
+                        F2Probe.boundaryFieldRef()[patchi];
+                    forAll(F2p, facei)
+                    {
+                        F2p[facei] += sign*h*dF2Boundary[patchi][facei];
+                    }
+                }
+
+                volScalarField pWork
+                (
+                    IOobject
+                    (
+                        namePrefix + "Pressure",
+                        mesh_.time().timeName(),
+                        mesh_,
+                        IOobject::NO_READ,
+                        IOobject::NO_WRITE
+                    ),
+                    p
+                );
+                pWork.storePrevIter();
+                constrainPressure(pWork, U, F2Probe, rAtUBase);
+                mesh_.setFluxRequired(pWork.name());
+
+                fvScalarMatrix pEqn
+                (
+                    fvm::laplacian(rAtUBase, pWork) == fvc::div(F2Probe)
+                );
+                pEqn.setReference
+                (
+                    solverControl_().pRefCell(),
+                    solverControl_().pRefValue()
+                );
+                dictionary pSolver(pEqn.solverDict("p"));
+                pSolver.set("relTol", scalar(0));
+                pSolver.set("tolerance", scalar(1e-12));
+                pEqn.solve(pSolver);
+
+                SimpleMapTape out(mesh_);
+                out.pBoundaryAfterConstrainInternal =
+                    pWork.primitiveField();
+                forAll(out.pBoundaryAfterConstrainBoundary, patchi)
+                {
+                    out.pBoundaryAfterConstrainBoundary[patchi] =
+                        pWork.boundaryField()[patchi];
+                }
+                out.pSolve = pWork.primitiveField();
+                forAll(out.pSolveBoundary, patchi)
+                {
+                    out.pSolveBoundary[patchi] =
+                        pWork.boundaryField()[patchi];
+                }
+
+                surfaceScalarField pressureFlux
+                (
+                    IOobject
+                    (
+                        namePrefix + "PressureFlux",
+                        mesh_.time().timeName(),
+                        mesh_,
+                        IOobject::NO_READ,
+                        IOobject::NO_WRITE
+                    ),
+                    pEqn.flux()
+                );
+                surfaceScalarField phiNew
+                (
+                    IOobject
+                    (
+                        namePrefix + "PhiNew",
+                        mesh_.time().timeName(),
+                        mesh_,
+                        IOobject::NO_READ,
+                        IOobject::NO_WRITE
+                    ),
+                    F2Probe - pressureFlux
+                );
+                copySurfaceToTape
+                (
+                    pressureFlux,
+                    out.pressureFluxInternal,
+                    out.pressureFluxBoundary
+                );
+                copySurfaceToTape
+                (
+                    phiNew,
+                    out.phiNewInternal,
+                    out.phiNewBoundary
+                );
+
+                return out;
+            };
+
+            auto pressureBlockF2Difference =
+                [&]
+                (
+                    const scalarField& dF2Internal,
+                    const List<scalarField>& dF2Boundary,
+                    const scalar h,
+                    const word& namePrefix
+                )
+            {
+                const SimpleMapTape plus =
+                    pressureBlockAtF2Direction
+                    (
+                        dF2Internal,
+                        dF2Boundary,
+                        h,
+                        scalar(1),
+                        namePrefix + "Plus"
+                    );
+                const SimpleMapTape minus =
+                    pressureBlockAtF2Direction
+                    (
+                        dF2Internal,
+                        dF2Boundary,
+                        h,
+                        scalar(-1),
+                        namePrefix + "Minus"
+                    );
+
+                return tapeDifference(plus, minus, h);
+            };
+
+            auto pressureBlockSeedDot =
+                [&]
+                (
+                    const scalarField& barPSolve,
+                    const SimpleMapSeed& barPhiNew,
+                    const SimpleMapTape& dPressure
+                )
+            {
+                scalar value =
+                    tapeScalarDot(barPSolve, dPressure.pSolve);
+                forAll(barPhiNew.barPhiInternal, facei)
+                {
+                    value +=
+                        barPhiNew.barPhiInternal[facei]
+                       *dPressure.phiNewInternal[facei];
+                }
+                forAll(barPhiNew.barPhiBoundary, patchi)
+                {
+                    forAll(barPhiNew.barPhiBoundary[patchi], facei)
+                    {
+                        value +=
+                            barPhiNew.barPhiBoundary[patchi][facei]
+                           *dPressure.phiNewBoundary[patchi][facei];
+                    }
+                }
+                reduce(value, sumOp<scalar>());
+                return value;
+            };
+
+            auto surfaceSeedDotDirection =
+                [&]
+                (
+                    const surfaceScalarField& seed,
+                    const scalarField& dF2Internal,
+                    const List<scalarField>& dF2Boundary
+                )
+            {
+                scalar value = Zero;
+                forAll(seed.primitiveField(), facei)
+                {
+                    value += seed.primitiveField()[facei]*dF2Internal[facei];
+                }
+                forAll(seed.boundaryField(), patchi)
+                {
+                    forAll(seed.boundaryField()[patchi], facei)
+                    {
+                        value +=
+                            seed.boundaryField()[patchi][facei]
+                           *dF2Boundary[patchi][facei];
+                    }
+                }
+                reduce(value, sumOp<scalar>());
+                return value;
+            };
+
+            auto printPressureF2Check =
+                [&]
+                (
+                    const word& splitName,
+                    const scalarField& dF2Internal,
+                    const List<scalarField>& dF2Boundary
+                )
+            {
+                const SimpleMapTape dPressure =
+                    pressureBlockF2Difference
+                    (
+                        dF2Internal,
+                        dF2Boundary,
+                        eps,
+                        "ATCTPressureF2" + seedName + directionName + splitName
+                    );
+                const scalar lhsPressure =
+                    pressureBlockSeedDot
+                    (
+                        trace.barpSolveFromRelaxOnly,
+                        seedNew,
+                        dPressure
+                    );
+                surfaceScalarField barF2Current
+                (
+                    IOobject
+                    (
+                        "ATCTPressureF2CurrentSeed",
+                        mesh_.time().timeName(),
+                        mesh_,
+                        IOobject::NO_READ,
+                        IOobject::NO_WRITE
+                    ),
+                    phiBase
+                );
+                barF2Current.primitiveFieldRef() = trace.barF2Internal;
+                forAll(barF2Current.boundaryFieldRef(), patchi)
+                {
+                    barF2Current.boundaryFieldRef()[patchi] ==
+                        trace.barF2Boundary[patchi];
+                }
+
+                const scalar rhsPressure =
+                    surfaceSeedDotDirection
+                    (
+                        barF2Current,
+                        dF2Internal,
+                        dF2Boundary
+                    );
+                const scalar signedGap = lhsPressure - rhsPressure;
+                const scalar gapScale =
+                    mag(lhsPressure) + mag(rhsPressure) + VSMALL;
+
+                scalar internalL1 = Zero;
+                scalar boundaryL1 = Zero;
+                forAll(dF2Internal, facei)
+                {
+                    internalL1 += mag(dF2Internal[facei]);
+                }
+                forAll(dF2Boundary, patchi)
+                {
+                    forAll(dF2Boundary[patchi], facei)
+                    {
+                        boundaryL1 += mag(dF2Boundary[patchi][facei]);
+                    }
+                }
+                reduce(internalL1, sumOp<scalar>());
+                reduce(boundaryL1, sumOp<scalar>());
+
+                Info<< "ATC-T pressure F2 direct transpose: "
+                    << seedName << " " << directionName
+                    << " eps " << eps
+                    << " split " << splitName
+                    << " lhs " << lhsPressure
+                    << " rhsCurrent " << rhsPressure
+                    << " signedGap " << signedGap
+                    << " absoluteGap " << mag(signedGap)
+                    << " symmetricRelativeGap "
+                    << mag(signedGap)/gapScale
+                    << " gapOverL1 " << mag(signedGap)/gapScale
+                    << " dF2InternalL1 " << internalL1
+                    << " dF2BoundaryL1 " << boundaryL1
+                    << endl;
+
+                forAll(dF2Boundary, patchi)
+                {
+                    scalar patchL1 = Zero;
+                    forAll(dF2Boundary[patchi], facei)
+                    {
+                        patchL1 += mag(dF2Boundary[patchi][facei]);
+                    }
+                    reduce(patchL1, sumOp<scalar>());
+                    if (patchL1 > SMALL)
+                    {
+                        Info<< "ATC-T pressure F2 split boundary L1: "
+                            << seedName << " " << directionName
+                            << " eps " << eps
+                            << " split " << splitName
+                            << " patch "
+                            << mesh_.boundary()[patchi].name()
+                            << " patchType "
+                            << p.boundaryField()[patchi].type()
+                            << " dF2BoundaryL1 " << patchL1
+                            << endl;
+                    }
+                }
+            };
+
             const scalar dYInternalNorm = tapeVectorNorm(dTape.Y);
             const scalar dYBoundaryNorm =
                 tapeBoundaryVectorNorm(dTape.YBoundary);
@@ -14926,6 +15270,520 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
             const scalar scaleCons =
                 mag(lhsCons) + mag(rhsConsTotal) + VSMALL;
 
+            const surfaceScalarField snGradPFull(fvc::snGrad(p));
+            tmp<fv::snGradScheme<scalar>> tSnGradSchemeForQ =
+                fv::snGradScheme<scalar>::New
+                (
+                    mesh_,
+                    mesh_.snGradScheme("snGrad(" + p.name() + ')')
+                );
+            tmp<surfaceScalarField> tSnGradDeltaCoeffsForQ =
+                tSnGradSchemeForQ().deltaCoeffs(p);
+            const surfaceScalarField& snGradDeltaCoeffsForQ =
+                tSnGradDeltaCoeffsForQ();
+            const surfaceScalarField& magSfForQ = mesh_.magSf();
+            const surfaceScalarField& weightsForQ = mesh_.weights();
+
+            scalar snGradFullL1 = Zero;
+            scalar snGradOrthL1 = Zero;
+            scalar snGradCorrectionL1 = Zero;
+            scalar snGradCorrectionMax = Zero;
+            label snGradCorrectionMaxFace = -1;
+            scalarField barQFaceOrth(mesh_.nInternalFaces(), Zero);
+            scalarField barQFaceFull(mesh_.nInternalFaces(), Zero);
+            scalarField barQFaceCorrection(mesh_.nInternalFaces(), Zero);
+            scalarField barqFromF2Orth(mesh_.nCells(), Zero);
+            scalarField barqFromF2Full(mesh_.nCells(), Zero);
+            scalarField barqFromF2Correction(mesh_.nCells(), Zero);
+            scalar lhsQInternalOrth = Zero;
+            scalar lhsQInternalFull = Zero;
+            scalar lhsQInternalCorrection = Zero;
+
+            forAll(mesh_.owner(), facei)
+            {
+                const label P = mesh_.owner()[facei];
+                const label N = mesh_.neighbour()[facei];
+                const scalar snGradOrth =
+                    snGradDeltaCoeffsForQ[facei]*(p[N] - p[P]);
+                const scalar snGradFull = snGradPFull[facei];
+                const scalar snGradCorrection = snGradFull - snGradOrth;
+                const scalar FSeed = trace.barF2Internal[facei];
+
+                snGradFullL1 += mag(snGradFull);
+                snGradOrthL1 += mag(snGradOrth);
+                snGradCorrectionL1 += mag(snGradCorrection);
+                if (mag(snGradCorrection) > snGradCorrectionMax)
+                {
+                    snGradCorrectionMax = mag(snGradCorrection);
+                    snGradCorrectionMaxFace = facei;
+                }
+
+                barQFaceOrth[facei] =
+                    FSeed*magSfForQ[facei]*snGradOrth;
+                barQFaceFull[facei] =
+                    FSeed*magSfForQ[facei]*snGradFull;
+                barQFaceCorrection[facei] =
+                    barQFaceFull[facei] - barQFaceOrth[facei];
+
+                const scalar ownerSeedOrth =
+                    weightsForQ[facei]*barQFaceOrth[facei];
+                const scalar neighbourSeedOrth =
+                    (scalar(1) - weightsForQ[facei])*barQFaceOrth[facei];
+                const scalar ownerSeedFull =
+                    weightsForQ[facei]*barQFaceFull[facei];
+                const scalar neighbourSeedFull =
+                    (scalar(1) - weightsForQ[facei])*barQFaceFull[facei];
+                const scalar ownerSeedCorrection =
+                    weightsForQ[facei]*barQFaceCorrection[facei];
+                const scalar neighbourSeedCorrection =
+                    (scalar(1) - weightsForQ[facei])
+                   *barQFaceCorrection[facei];
+
+                barqFromF2Orth[P] += ownerSeedOrth;
+                barqFromF2Orth[N] += neighbourSeedOrth;
+                barqFromF2Full[P] += ownerSeedFull;
+                barqFromF2Full[N] += neighbourSeedFull;
+                barqFromF2Correction[P] += ownerSeedCorrection;
+                barqFromF2Correction[N] += neighbourSeedCorrection;
+
+                lhsQInternalOrth +=
+                    barQFaceOrth[facei]*dTape.qFaceInternal[facei];
+                lhsQInternalFull +=
+                    barQFaceFull[facei]*dTape.qFaceInternal[facei];
+                lhsQInternalCorrection +=
+                    barQFaceCorrection[facei]*dTape.qFaceInternal[facei];
+            }
+            reduce(snGradFullL1, sumOp<scalar>());
+            reduce(snGradOrthL1, sumOp<scalar>());
+            reduce(snGradCorrectionL1, sumOp<scalar>());
+            reduce(snGradCorrectionMax, maxOp<scalar>());
+            reduce(lhsQInternalOrth, sumOp<scalar>());
+            reduce(lhsQInternalFull, sumOp<scalar>());
+            reduce(lhsQInternalCorrection, sumOp<scalar>());
+
+            scalarField barqOrth(trace.barqFromH1);
+            barqOrth += barqFromF2Orth;
+            barqOrth += trace.barqFromF2BoundaryCurrent;
+            scalarField barqFull(trace.barqFromH1);
+            barqFull += barqFromF2Full;
+            barqFull += trace.barqFromF2BoundaryCurrent;
+            scalarField barqCorrection(barqFromF2Correction);
+
+            scalar productionVsFullMaxDiff = Zero;
+            forAll(trace.barq, celli)
+            {
+                productionVsFullMaxDiff =
+                    max
+                    (
+                        productionVsFullMaxDiff,
+                        mag(trace.barq[celli] - barqFull[celli])
+                    );
+            }
+            reduce(productionVsFullMaxDiff, maxOp<scalar>());
+
+            scalar boundarySnGradCheckL1 = Zero;
+            scalar boundarySnGradCheckScale = VSMALL;
+            forAll(mesh_.boundary(), patchi)
+            {
+                if
+                (
+                    mesh_.boundary()[patchi].type() == "empty"
+                 || mesh_.boundary()[patchi].coupled()
+                )
+                {
+                    continue;
+                }
+
+                const labelUList& faceCells =
+                    mesh_.boundary()[patchi].faceCells();
+                const fvsPatchScalarField& snGradPp =
+                    snGradPFull.boundaryField()[patchi];
+
+                tmp<scalarField> tpGradientInternalCoeffs =
+                    p.boundaryField()[patchi].gradientInternalCoeffs();
+                const scalarField& pGradientInternalCoeffs =
+                    tpGradientInternalCoeffs();
+                tmp<scalarField> tpGradientBoundaryCoeffs =
+                    p.boundaryField()[patchi].gradientBoundaryCoeffs();
+                const scalarField& pGradientBoundaryCoeffs =
+                    tpGradientBoundaryCoeffs();
+
+                scalar patchSnGradDiff = Zero;
+                scalar patchSnGradScale = VSMALL;
+                forAll(faceCells, facei)
+                {
+                    const label celli = faceCells[facei];
+                    const scalar snGradFormula =
+                        pGradientInternalCoeffs[facei]*p[celli]
+                      + pGradientBoundaryCoeffs[facei];
+                    patchSnGradDiff +=
+                        mag(snGradFormula - snGradPp[facei]);
+                    patchSnGradScale +=
+                        max(mag(snGradFormula), mag(snGradPp[facei]));
+                }
+                reduce(patchSnGradDiff, sumOp<scalar>());
+                reduce(patchSnGradScale, sumOp<scalar>());
+                boundarySnGradCheckL1 += patchSnGradDiff;
+                boundarySnGradCheckScale += patchSnGradScale;
+
+                if (patchSnGradScale > VSMALL)
+                {
+                    Info<< "ATC-T consistent-q boundary snGrad check: "
+                        << seedName << " " << directionName
+                        << " eps " << eps
+                        << " patch " << mesh_.boundary()[patchi].name()
+                        << " pPatchType "
+                        << p.boundaryField()[patchi].type()
+                        << " diffL1 " << patchSnGradDiff
+                        << " relL1 "
+                        << patchSnGradDiff/patchSnGradScale
+                        << endl;
+                }
+            }
+            reduce(boundarySnGradCheckL1, sumOp<scalar>());
+            reduce(boundarySnGradCheckScale, sumOp<scalar>());
+
+            const scalar lhsQDirectOrth =
+                lhsQH1 + lhsQInternalOrth + lhsQBoundary;
+            const scalar lhsQDirectFull =
+                lhsQH1 + lhsQInternalFull + lhsQBoundary;
+            const scalar rhsQDirectOrth =
+                tapeScalarDot(barqOrth, dTape.q);
+            const scalar rhsQDirectFull =
+                tapeScalarDot(barqFull, dTape.q);
+            const scalar missingCorrectionContraction =
+                tapeScalarDot(barqCorrection, dTape.q);
+            const scalar rhsConsistentOrth =
+                barH0DirectContraction
+              + barF1TraceDotF1
+              + rhsQDirectOrth;
+            const scalar rhsConsistentFull =
+                barH0DirectContraction
+              + barF1TraceDotF1
+              + rhsQDirectFull;
+            const scalar currentOrthGap =
+                lhsCons - rhsConsistentOrth;
+            const scalar fullSnGradGap =
+                lhsCons - rhsConsistentFull;
+            const scalar missingCorrectionResidual =
+                currentOrthGap - missingCorrectionContraction;
+            const scalar directQOrthGap =
+                lhsQDirectOrth - rhsQDirectOrth;
+            const scalar directQFullGap =
+                lhsQDirectFull - rhsQDirectFull;
+
+            auto printDirectQBasis =
+                [&](const label basisCell, const word& basisName)
+            {
+                if (basisCell < 0 || basisCell >= mesh_.nCells())
+                {
+                    return;
+                }
+
+                scalar lhsBasis =
+                    trace.barqFromH1[basisCell];
+                forAll(mesh_.owner(), facei)
+                {
+                    const label P = mesh_.owner()[facei];
+                    const label N = mesh_.neighbour()[facei];
+                    if (P == basisCell)
+                    {
+                        lhsBasis +=
+                            weightsForQ[facei]*barQFaceFull[facei];
+                    }
+                    if (N == basisCell)
+                    {
+                        lhsBasis +=
+                            (scalar(1) - weightsForQ[facei])
+                           *barQFaceFull[facei];
+                    }
+                }
+                forAll(mesh_.boundary(), patchi)
+                {
+                    const labelUList& faceCells =
+                        mesh_.boundary()[patchi].faceCells();
+                    forAll(faceCells, facei)
+                    {
+                        if (faceCells[facei] == basisCell)
+                        {
+                            lhsBasis +=
+                                trace.barQFaceBoundary[patchi][facei];
+                        }
+                    }
+                }
+
+                const scalar rhsBasis = barqFull[basisCell];
+                Info<< "ATC-T consistent-q direct basis: "
+                    << seedName << " " << directionName
+                    << " eps " << eps
+                    << " basis " << basisName
+                    << " cell " << basisCell
+                    << " lhsFull " << lhsBasis
+                    << " rhsFull " << rhsBasis
+                    << " gap " << lhsBasis - rhsBasis
+                    << " rel "
+                    << mag(lhsBasis - rhsBasis)
+                       /(mag(lhsBasis) + mag(rhsBasis) + VSMALL)
+                    << endl;
+            };
+
+            if (snGradCorrectionMaxFace >= 0)
+            {
+                printDirectQBasis
+                (
+                    mesh_.owner()[snGradCorrectionMaxFace],
+                    "maxCorrectionOwner"
+                );
+                printDirectQBasis
+                (
+                    mesh_.neighbour()[snGradCorrectionMaxFace],
+                    "maxCorrectionNeighbour"
+                );
+            }
+
+            Info<< "ATC-T consistent-q corrected snGrad: "
+                << seedName << " " << directionName
+                << " eps " << eps
+                << " snGradFullL1 " << snGradFullL1
+                << " snGradOrthogonalL1 " << snGradOrthL1
+                << " snGradCorrectionL1 " << snGradCorrectionL1
+                << " snGradCorrectionMax " << snGradCorrectionMax
+                << " snGradCorrectionMaxFace "
+                << snGradCorrectionMaxFace
+                << " lhsQInternalOrth " << lhsQInternalOrth
+                << " lhsQInternalFull " << lhsQInternalFull
+                << " lhsQInternalCorrection "
+                << lhsQInternalCorrection
+                << " lhsQDirectOrth " << lhsQDirectOrth
+                << " rhsQDirectOrth " << rhsQDirectOrth
+                << " directQOrthGap " << directQOrthGap
+                << " lhsQDirectFull " << lhsQDirectFull
+                << " rhsQDirectFull " << rhsQDirectFull
+                << " directQFullGap " << directQFullGap
+                << " missingCorrectionContraction "
+                << missingCorrectionContraction
+                << " currentOrthConsistentGap "
+                << currentOrthGap
+                << " missingCorrectionResidual "
+                << missingCorrectionResidual
+                << " fullSnGradConsistentGap "
+                << fullSnGradGap
+                << " productionVsFullMaxDiff "
+                << productionVsFullMaxDiff
+                << " boundarySnGradDiffL1 "
+                << boundarySnGradCheckL1
+                << " boundarySnGradRelL1 "
+                << boundarySnGradCheckL1/boundarySnGradCheckScale
+                << endl;
+
+            static bool printedPressureF2Source = false;
+            if (!printedPressureF2Source)
+            {
+                Info<< "ATC-T pressure F2 source paths: "
+                    << "constrainPressure "
+                    << "/usr/lib/openfoam/openfoam2512/src/finiteVolume/"
+                    << "cfdTools/general/constrainPressure/"
+                    << "constrainPressure.C:38-78 "
+                    << "fixedFluxPressure updateSnGrad "
+                    << "/usr/lib/openfoam/openfoam2512/src/finiteVolume/"
+                    << "fields/fvPatchFields/derived/fixedFluxPressure/"
+                    << "fixedFluxPressureFvPatchScalarField.C:133-147 "
+                    << "formula snGrad = (F2 - Sf.U)/(magSf*rAtU) "
+                    << "for updateableSnGrad patches"
+                    << endl;
+                printedPressureF2Source = true;
+            }
+
+            scalarField zeroF2Internal(mesh_.nInternalFaces(), Zero);
+            List<scalarField> zeroF2Boundary = makeZeroSurfaceBoundary();
+            const SimpleMapTape pressureBaseCheck =
+                pressureBlockAtF2Direction
+                (
+                    zeroF2Internal,
+                    zeroF2Boundary,
+                    eps,
+                    scalar(0),
+                    "ATCTPressureF2Base" + seedName + directionName
+                );
+            scalar pressureBasePSolveDiff = Zero;
+            scalar pressureBasePSolveScale = VSMALL;
+            forAll(pressureBaseCheck.pSolve, celli)
+            {
+                pressureBasePSolveDiff +=
+                    mag
+                    (
+                        pressureBaseCheck.pSolve[celli]
+                      - baseTapeForStages.pSolve[celli]
+                    );
+                pressureBasePSolveScale +=
+                    max
+                    (
+                        mag(pressureBaseCheck.pSolve[celli]),
+                        mag(baseTapeForStages.pSolve[celli])
+                    );
+            }
+            scalar pressureBaseFluxDiff = Zero;
+            scalar pressureBaseFluxScale = VSMALL;
+            scalar pressureBasePhiDiff = Zero;
+            scalar pressureBasePhiScale = VSMALL;
+            forAll(pressureBaseCheck.pressureFluxInternal, facei)
+            {
+                pressureBaseFluxDiff +=
+                    mag
+                    (
+                        pressureBaseCheck.pressureFluxInternal[facei]
+                      - baseTapeForStages.pressureFluxInternal[facei]
+                    );
+                pressureBaseFluxScale +=
+                    max
+                    (
+                        mag(pressureBaseCheck.pressureFluxInternal[facei]),
+                        mag(baseTapeForStages.pressureFluxInternal[facei])
+                    );
+                pressureBasePhiDiff +=
+                    mag
+                    (
+                        pressureBaseCheck.phiNewInternal[facei]
+                      - baseTapeForStages.phiNewInternal[facei]
+                    );
+                pressureBasePhiScale +=
+                    max
+                    (
+                        mag(pressureBaseCheck.phiNewInternal[facei]),
+                        mag(baseTapeForStages.phiNewInternal[facei])
+                    );
+            }
+            forAll(pressureBaseCheck.pressureFluxBoundary, patchi)
+            {
+                forAll(pressureBaseCheck.pressureFluxBoundary[patchi], facei)
+                {
+                    pressureBaseFluxDiff +=
+                        mag
+                        (
+                            pressureBaseCheck
+                                .pressureFluxBoundary[patchi][facei]
+                          - baseTapeForStages
+                                .pressureFluxBoundary[patchi][facei]
+                        );
+                    pressureBaseFluxScale +=
+                        max
+                        (
+                            mag
+                            (
+                                pressureBaseCheck
+                                    .pressureFluxBoundary[patchi][facei]
+                            ),
+                            mag
+                            (
+                                baseTapeForStages
+                                    .pressureFluxBoundary[patchi][facei]
+                            )
+                        );
+                    pressureBasePhiDiff +=
+                        mag
+                        (
+                            pressureBaseCheck.phiNewBoundary[patchi][facei]
+                          - baseTapeForStages.phiNewBoundary[patchi][facei]
+                        );
+                    pressureBasePhiScale +=
+                        max
+                        (
+                            mag
+                            (
+                                pressureBaseCheck
+                                    .phiNewBoundary[patchi][facei]
+                            ),
+                            mag
+                            (
+                                baseTapeForStages
+                                    .phiNewBoundary[patchi][facei]
+                            )
+                        );
+                }
+            }
+            reduce(pressureBasePSolveDiff, sumOp<scalar>());
+            reduce(pressureBasePSolveScale, sumOp<scalar>());
+            reduce(pressureBaseFluxDiff, sumOp<scalar>());
+            reduce(pressureBaseFluxScale, sumOp<scalar>());
+            reduce(pressureBasePhiDiff, sumOp<scalar>());
+            reduce(pressureBasePhiScale, sumOp<scalar>());
+
+            Info<< "ATC-T pressure F2 base reproduction: "
+                << seedName << " " << directionName
+                << " eps " << eps
+                << " pSolveRel "
+                << pressureBasePSolveDiff/pressureBasePSolveScale
+                << " pressureFluxRel "
+                << pressureBaseFluxDiff/pressureBaseFluxScale
+                << " phiNewRel "
+                << pressureBasePhiDiff/pressureBasePhiScale
+                << endl;
+
+            List<scalarField> dF2ActualBoundary(dTape.F2Boundary);
+            List<scalarField> dF2InternalOnlyBoundary =
+                makeZeroSurfaceBoundary();
+            List<scalarField> dF2BoundaryOnlyBoundary(dTape.F2Boundary);
+            scalarField dF2BoundaryOnlyInternal
+            (
+                mesh_.nInternalFaces(),
+                Zero
+            );
+            scalar f2SplitInternalResidual = Zero;
+            scalar f2SplitBoundaryResidual = Zero;
+            forAll(dTape.F2Internal, facei)
+            {
+                f2SplitInternalResidual +=
+                    mag
+                    (
+                        dTape.F2Internal[facei]
+                      - dTape.F2Internal[facei]
+                      - dF2BoundaryOnlyInternal[facei]
+                    );
+            }
+            forAll(dTape.F2Boundary, patchi)
+            {
+                forAll(dTape.F2Boundary[patchi], facei)
+                {
+                    f2SplitBoundaryResidual +=
+                        mag
+                        (
+                            dTape.F2Boundary[patchi][facei]
+                          - dF2InternalOnlyBoundary[patchi][facei]
+                          - dF2BoundaryOnlyBoundary[patchi][facei]
+                        );
+                }
+            }
+            reduce(f2SplitInternalResidual, sumOp<scalar>());
+            reduce(f2SplitBoundaryResidual, sumOp<scalar>());
+
+            Info<< "ATC-T pressure F2 split reconstruction: "
+                << seedName << " " << directionName
+                << " eps " << eps
+                << " internalResidual "
+                << f2SplitInternalResidual
+                << " boundaryResidual "
+                << f2SplitBoundaryResidual
+                << endl;
+
+            printPressureF2Check
+            (
+                "actual",
+                dTape.F2Internal,
+                dF2ActualBoundary
+            );
+            printPressureF2Check
+            (
+                "internalOnly",
+                dTape.F2Internal,
+                dF2InternalOnlyBoundary
+            );
+            printPressureF2Check
+            (
+                "boundaryOnly",
+                dF2BoundaryOnlyInternal,
+                dF2BoundaryOnlyBoundary
+            );
+
             const scalar lhsAdjust = barF1TraceDotF1;
             const scalar rhsAdjust = barF0TraceDotF0;
             const scalar gapAdjust = lhsAdjust - rhsAdjust;
@@ -14960,8 +15818,21 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
             SimpleMapTape dPressure =
                 tapeDifference(pressurePlus, pressureMinus, hPressure);
 
-            const scalar pSolveCoeff =
-                tapeScalarDot(barpSolve, dPressure.pSolve);
+            const scalar pSolveCoeffRelaxOnly =
+                tapeScalarDot
+                (
+                    trace.barpSolveFromRelaxOnly,
+                    dPressure.pSolve
+                );
+            const scalar pSolveCoeffPhiFlux =
+                tapeScalarDot
+                (
+                    trace.barpSolveFromPhiFlux,
+                    dPressure.pSolve
+                );
+            const scalar pSolveCoeffTotal =
+                tapeScalarDot(trace.barpSolveTotal, dPressure.pSolve);
+            const scalar pSolveCoeff = pSolveCoeffRelaxOnly;
             scalar phiCoeffI = Zero;
             forAll(seedNew.barPhiInternal, facei)
             {
@@ -15398,6 +16269,20 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
 
             const scalar finalRAtUContribution =
                 tapeScalarDot(trace.barrAtUFromFinalCorrection, dTape.rAtU);
+            scalar pSolveSeedSplitDiff = Zero;
+            scalar pSolveSeedSplitScale = VSMALL;
+            forAll(trace.barpSolveTotal, celli)
+            {
+                const scalar splitValue =
+                    trace.barpSolveFromRelaxOnly[celli]
+                  + trace.barpSolveFromPhiFlux[celli];
+                pSolveSeedSplitDiff +=
+                    mag(trace.barpSolveTotal[celli] - splitValue);
+                pSolveSeedSplitScale +=
+                    max(mag(trace.barpSolveTotal[celli]), mag(splitValue));
+            }
+            reduce(pSolveSeedSplitDiff, sumOp<scalar>());
+            reduce(pSolveSeedSplitScale, sumOp<scalar>());
             const scalar barUBoundaryContraction =
                 tapeBoundaryVectorDot(trace.barUBoundary, dTape.UoldBoundary);
             const scalar barUFromBoundaryContraction =
@@ -15796,7 +16681,7 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
               + finalRAtUContribution;
             const scalar c2AfterRelax =
                 tapeVectorDot(seedNew.barU, dTape.H1)
-              + tapeScalarDot(trace.barpSolve, dTape.pSolve)
+              + tapeScalarDot(trace.barpSolveFromRelaxOnly, dTape.pSolve)
               + tapePhiDot(seedNew, dTape)
               + finalRAtUContribution;
             const scalar c3AfterPressureFixed =
@@ -15843,6 +16728,59 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
             const scalar c9AfterPredictorReverse =
                 rhsPredictor + barUFromBoundaryContraction;
             const scalar c10OldState = rhs;
+
+            const scalar gapFinal = c0Output - c1AfterFinal;
+            const scalar gapPressureRelax =
+                c1AfterFinal - c2AfterRelax;
+            const scalar pressureBlockActualGap =
+                c2AfterRelax - c4ActualPressureReverse;
+            const scalar pressureFixedPart =
+                c2AfterRelax - c3AfterPressureFixed;
+            const scalar pressureCoefficientBridge =
+                c3AfterPressureFixed - c4ActualPressureReverse;
+            const scalar pressureBridgeSum =
+                pressureFixedPart + pressureCoefficientBridge;
+            const scalar pressureBridgeResidual =
+                pressureBlockActualGap - pressureBridgeSum;
+            const scalar gapConsistentComplete =
+                c4ActualPressureReverse - c5AfterConsistentActual;
+            const scalar gapCoefficientActual =
+                c5AfterConsistentActual - c6AfterCoeffAlgebra;
+            const scalar gapFluxActual =
+                c6AfterCoeffAlgebra - c7AfterFlux;
+            const scalar gapConstrainActual =
+                c7AfterFlux - c7AfterPredictorInputs;
+            const scalar gapBoundaryEvaluation =
+                c7AfterPredictorInputs - c8AfterBoundaryEval;
+            const scalar gapPredictorReverse =
+                c8AfterBoundaryEval - c9AfterPredictorReverse;
+            const scalar gapOldStateProjection =
+                c9AfterPredictorReverse - c10OldState;
+            const scalar groupedActualSum =
+                gapFinal
+              + gapPressureRelax
+              + pressureBlockActualGap
+              + gapConsistentComplete
+              + gapCoefficientActual
+              + gapFluxActual
+              + gapConstrainActual
+              + gapBoundaryEvaluation
+              + gapPredictorReverse
+              + gapOldStateProjection;
+            const scalar groupedActualGap =
+                groupedActualSum - fullSignedGap;
+            const scalar groupedActualL1 =
+                mag(gapFinal)
+              + mag(gapPressureRelax)
+              + mag(pressureBlockActualGap)
+              + mag(gapConsistentComplete)
+              + mag(gapCoefficientActual)
+              + mag(gapFluxActual)
+              + mag(gapConstrainActual)
+              + mag(gapBoundaryEvaluation)
+              + mag(gapPredictorReverse)
+              + mag(gapOldStateProjection)
+              + VSMALL;
 
             const scalar gapCoeffDiag =
                 lhsCoeffCombined - rhsCoeffCombinedDiag;
@@ -15913,6 +16851,37 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                 << " selectedReconRel "
                 << mag(c5ActualMinusC6 - c5c6ReconExact)
                   /(mag(c5ActualMinusC6) + mag(c5c6ReconExact) + VSMALL)
+                << endl;
+
+            Info<< "ATC-T grouped actual residuals: "
+                << seedName << " " << directionName
+                << " eps " << eps
+                << " gapFinal " << gapFinal
+                << " gapPressureRelax " << gapPressureRelax
+                << " pressureBlockActualGap "
+                << pressureBlockActualGap
+                << " pressureFixedPart " << pressureFixedPart
+                << " pressureCoefficientBridge "
+                << pressureCoefficientBridge
+                << " pressureBridgeSum " << pressureBridgeSum
+                << " pressureBridgeResidual "
+                << pressureBridgeResidual
+                << " gapConsistentComplete "
+                << gapConsistentComplete
+                << " gapCoefficient " << gapCoefficientActual
+                << " gapFlux " << gapFluxActual
+                << " gapConstrain " << gapConstrainActual
+                << " gapBoundaryEvaluation "
+                << gapBoundaryEvaluation
+                << " gapPredictorReverse "
+                << gapPredictorReverse
+                << " gapOldStateProjection "
+                << gapOldStateProjection
+                << " groupedActualSum " << groupedActualSum
+                << " fullSignedGap " << fullSignedGap
+                << " groupedActualGap " << groupedActualGap
+                << " groupedActualGapOverL1 "
+                << mag(groupedActualGap)/groupedActualL1
                 << endl;
 
             scalarField coeffResidualCell(mesh_.nCells(), Zero);
@@ -16275,7 +17244,14 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                 << " gapConsistent " << gapCons
                 << " gapConsistentRel "
                 << mag(gapCons)/max(scaleCons, VSMALL)
-                << " pressurePSolveCoeff " << pSolveCoeff
+                << " pressurePSolveCoeffRelaxOnly "
+                << pSolveCoeffRelaxOnly
+                << " pressurePSolveCoeffPhiFlux "
+                << pSolveCoeffPhiFlux
+                << " pressurePSolveCoeffTotal "
+                << pSolveCoeffTotal
+                << " pressurePSolveSeedSplitRel "
+                << pSolveSeedSplitDiff/pSolveSeedSplitScale
                 << " pressurePhiInternalCoeff " << phiCoeffI
                 << " pressurePhiBoundaryCoeff " << phiCoeffB
                 << " lhsPressureCoeff " << lhsPressureCoeff
