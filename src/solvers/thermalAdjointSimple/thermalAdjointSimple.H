@@ -205,6 +205,42 @@ protected:
         //- Diagnostic only: compare tangent GMRES against converged map FD
         bool checkFixedPointTangentAgainstFD_;
 
+        //- Solve the matrix-free fixed-point adjoint equation
+        bool solveFixedPointAdjoint_;
+
+        //- Check algebraic properties of the fixed-point adjoint operator
+        bool checkFixedPointAdjointOperator_;
+
+        //- Check the solved fixed-point adjoint residual
+        bool checkFixedPointAdjointSolve_;
+
+        //- Repeat the fixed-point adjoint solve from zero
+        bool checkFixedPointAdjointRepeatability_;
+
+        //- Write the fixed-point adjoint state fields
+        bool writeFixedPointAdjointFields_;
+
+        //- Compare GMRES against the truncated Neumann sequence
+        bool checkFixedPointAdjointNeumann_;
+
+        //- Restart length for fixed-point adjoint GMRES
+        label fixedPointAdjointRestart_;
+
+        //- Maximum fixed-point adjoint GMRES iterations
+        label fixedPointAdjointMaxIters_;
+
+        //- Truncated Neumann iterations for comparison
+        label fixedPointAdjointNeumannIters_;
+
+        //- Relative tolerance for fixed-point adjoint GMRES
+        scalar fixedPointAdjointRelTol_;
+
+        //- Absolute tolerance for fixed-point adjoint GMRES
+        scalar fixedPointAdjointAbsTol_;
+
+        //- Arnoldi breakdown tolerance for fixed-point adjoint GMRES
+        scalar fixedPointAdjointBreakdownTol_;
+
         //- Maximum iterations for converged map FD validation
         label fixedPointValidationMaxIters_;
 
@@ -249,6 +285,21 @@ protected:
                     barPhiBoundary[patchi] = Zero;
                 }
             }
+        };
+
+        //- Result of the matrix-free fixed-point adjoint solve
+        struct FixedPointAdjointResult
+        {
+            SimpleMapSeed psi;
+            bool converged;
+            label iterations;
+            label restarts;
+            scalar initialResidual;
+            scalar finalResidual;
+            scalar finalRelativeResidual;
+            List<scalar> residualHistory;
+
+            explicit FixedPointAdjointResult(const fvMesh& mesh);
         };
 
         //- Reverse seed returned by the SIMPLE predictor map
@@ -560,6 +611,15 @@ protected:
         //- Guard exact discrete diagnostics against the legacy scalar adjoint
         void validateExactThermalCouplingOptions() const;
 
+        //- Validate the fixed-point adjoint dictionary controls
+        void validateFixedPointAdjointControls() const;
+
+        //- Guard the fixed-point adjoint solve to the validated branch
+        void validateFixedPointAdjointScope() const;
+
+        //- Guard the fixed-point adjoint RHS to reduced thermal objectives
+        void validateFixedPointObjectiveScope() const;
+
         //- Exact thermal sensitivity with respect to the pressure-corrected
         //- primal face flux
         tmp<surfaceScalarField> thermalFluxSensitivity() const;
@@ -706,6 +766,134 @@ protected:
             const SimpleMapSeed& seedNew,
             const volScalarField& rAtU
         );
+
+        //- Validate a SimpleMapSeed's dimensions
+        void checkSimpleMapSeedSizes
+        (
+            const SimpleMapSeed& seed,
+            const word& where
+        ) const;
+
+        //- Set every SimpleMapSeed block to zero
+        void zeroSimpleMapSeed(SimpleMapSeed& seed) const;
+
+        //- Apply the validated full-state seed projection
+        void projectSimpleMapSeed(SimpleMapSeed& seed);
+
+        //- y += a*x for SimpleMapSeed values
+        void axpySimpleMapSeed
+        (
+            SimpleMapSeed& y,
+            scalar a,
+            const SimpleMapSeed& x
+        ) const;
+
+        //- y *= a for SimpleMapSeed values
+        void scaleSimpleMapSeed(SimpleMapSeed& y, scalar a) const;
+
+        //- Dual-space weighted inner product for SimpleMapSeed values
+        scalar dotSimpleMapSeed
+        (
+            const SimpleMapSeed& a,
+            const SimpleMapSeed& b,
+            scalar UStateScale,
+            scalar pStateScale,
+            scalar phiStateScale
+        ) const;
+
+        //- Dual-space weighted norm for SimpleMapSeed values
+        scalar normSimpleMapSeed
+        (
+            const SimpleMapSeed& a,
+            scalar UStateScale,
+            scalar pStateScale,
+            scalar phiStateScale
+        ) const;
+
+        //- Raw block norms for reporting
+        void simpleMapSeedBlockNorms
+        (
+            const SimpleMapSeed& seed,
+            scalar& UNorm,
+            scalar& pNorm,
+            scalar& phiInternalNorm,
+            scalar& phiBoundaryNorm
+        ) const;
+
+        //- Maximum componentwise difference between two seeds
+        scalar maxDifferenceSimpleMapSeed
+        (
+            const SimpleMapSeed& a,
+            const SimpleMapSeed& b
+        ) const;
+
+        //- Base physical state scales used in the dual-space metric
+        void fixedPointAdjointStateScales
+        (
+            scalar& UStateScale,
+            scalar& pStateScale,
+            scalar& phiStateScale
+        );
+
+        //- Rebuild the frozen rAtU coefficient field for the converged state
+        tmp<volScalarField> fixedPointAdjointRAtUBase();
+
+        //- Construct the thermal exact-flux full-state objective seed
+        SimpleMapSeed fixedPointObjectiveSeed();
+
+        //- Apply (I - M_x^T) to a full-state seed
+        SimpleMapSeed applyFixedPointAdjointOperator
+        (
+            const SimpleMapSeed& input,
+            const volScalarField& rAtUBase
+        );
+
+        //- Run algebraic operator checks before the fixed-point adjoint solve
+        void checkFixedPointAdjointOperator
+        (
+            const volScalarField& rAtUBase,
+            scalar UStateScale,
+            scalar pStateScale,
+            scalar phiStateScale
+        );
+
+        //- Solve (I - M_x)^T psi = rhs with restarted GMRES
+        FixedPointAdjointResult solveFixedPointAdjointSystem
+        (
+            const SimpleMapSeed& rhs,
+            const volScalarField& rAtUBase
+        );
+
+        //- Check the fixed-point adjoint residual and optional auxiliary solves
+        void checkFixedPointAdjointSolution
+        (
+            const SimpleMapSeed& rhs,
+            const FixedPointAdjointResult& result,
+            const volScalarField& rAtUBase,
+            scalar UStateScale,
+            scalar pStateScale,
+            scalar phiStateScale
+        );
+
+        //- Optional Neumann-series comparison against GMRES
+        void checkFixedPointAdjointNeumannSeries
+        (
+            const SimpleMapSeed& rhs,
+            const FixedPointAdjointResult& result,
+            const volScalarField& rAtUBase,
+            scalar UStateScale,
+            scalar pStateScale,
+            scalar phiStateScale
+        );
+
+        //- Write algebraic fixed-point adjoint diagnostic fields
+        void writeFixedPointAdjointFields
+        (
+            const SimpleMapSeed& psi
+        ) const;
+
+        //- Top-level fixed-point adjoint driver
+        void runFixedPointAdjointSolve();
 
         //- One velocity-only reverse pass of the frozen SIMPLE map
         tmp<vectorField> reverseSimpleMapVelocitySeed

@@ -770,7 +770,12 @@ void Foam::thermalAdjointSimple::validateExactThermalCouplingOptions() const
      || checkFixedPointTangentAgainstFD_
      || usePredictorReverseMomentumSens_
      || checkFixedPointMapAdjoint_
-     || checkFullStateMapTranspose_;
+     || checkFullStateMapTranspose_
+     || solveFixedPointAdjoint_
+     || checkFixedPointAdjointOperator_
+     || checkFixedPointAdjointSolve_
+     || checkFixedPointAdjointRepeatability_
+     || checkFixedPointAdjointNeumann_;
 
     if (needsExactScalar && !exactScalarThermalTranspose_)
     {
@@ -785,6 +790,171 @@ void Foam::thermalAdjointSimple::validateExactThermalCouplingOptions() const
             << "thermal coupling diagnostics."
             << exit(FatalError);
     }
+}
+
+
+void Foam::thermalAdjointSimple::validateFixedPointAdjointControls() const
+{
+    if (fixedPointAdjointRestart_ < 2)
+    {
+        FatalErrorInFunction
+            << "fixedPointAdjointRestart must be at least 2. Current value: "
+            << fixedPointAdjointRestart_ << exit(FatalError);
+    }
+
+    if (fixedPointAdjointMaxIters_ < 1)
+    {
+        FatalErrorInFunction
+            << "fixedPointAdjointMaxIters must be at least 1. Current value: "
+            << fixedPointAdjointMaxIters_ << exit(FatalError);
+    }
+
+    if (fixedPointAdjointRestart_ > fixedPointAdjointMaxIters_)
+    {
+        FatalErrorInFunction
+            << "fixedPointAdjointRestart must not exceed "
+            << "fixedPointAdjointMaxIters. Values: "
+            << fixedPointAdjointRestart_ << " and "
+            << fixedPointAdjointMaxIters_ << exit(FatalError);
+    }
+
+    if (fixedPointAdjointRelTol_ <= scalar(0))
+    {
+        FatalErrorInFunction
+            << "fixedPointAdjointRelTol must be positive. Current value: "
+            << fixedPointAdjointRelTol_ << exit(FatalError);
+    }
+
+    if (fixedPointAdjointAbsTol_ < scalar(0))
+    {
+        FatalErrorInFunction
+            << "fixedPointAdjointAbsTol must be non-negative. Current value: "
+            << fixedPointAdjointAbsTol_ << exit(FatalError);
+    }
+
+    if (fixedPointAdjointBreakdownTol_ <= scalar(0))
+    {
+        FatalErrorInFunction
+            << "fixedPointAdjointBreakdownTol must be positive. Current value: "
+            << fixedPointAdjointBreakdownTol_ << exit(FatalError);
+    }
+}
+
+
+void Foam::thermalAdjointSimple::validateFixedPointAdjointScope() const
+{
+    if (!solveFixedPointAdjoint_)
+    {
+        return;
+    }
+
+    if (!exactScalarThermalTranspose_)
+    {
+        FatalErrorInFunction
+            << "solveFixedPointAdjoint requires exactScalarThermalTranspose "
+            << "true." << exit(FatalError);
+    }
+
+    if (couplingForm_ != "exactFluxTranspose")
+    {
+        FatalErrorInFunction
+            << "solveFixedPointAdjoint currently supports only "
+            << "couplingForm exactFluxTranspose. Current value: "
+            << couplingForm_ << exit(FatalError);
+    }
+
+    if (!solverControl_().consistent())
+    {
+        FatalErrorInFunction
+            << "solveFixedPointAdjoint is guarded to consistent SIMPLE."
+            << exit(FatalError);
+    }
+
+    if (Pstream::parRun())
+    {
+        FatalErrorInFunction
+            << "solveFixedPointAdjoint currently supports the validated serial "
+            << "branch only." << exit(FatalError);
+    }
+
+    const autoPtr<incompressible::turbulenceModel>& turbulence =
+        primalVars_.turbulence();
+
+    if (turbulence->type() != "Stokes")
+    {
+        FatalErrorInFunction
+            << "solveFixedPointAdjoint is guarded to the Stokes turbulence "
+            << "model. Runtime model is " << turbulence->type() << "."
+            << exit(FatalError);
+    }
+
+    forAll(mesh_.boundary(), patchi)
+    {
+        if (mesh_.boundary()[patchi].coupled() && mesh_.boundary()[patchi].size())
+        {
+            FatalErrorInFunction
+                << "solveFixedPointAdjoint does not support non-empty coupled "
+                << "patch " << mesh_.boundary()[patchi].name() << "."
+                << exit(FatalError);
+        }
+    }
+}
+
+
+void Foam::thermalAdjointSimple::validateFixedPointObjectiveScope() const
+{
+    const PtrList<objective>& functions =
+        objectiveManager_.getObjectiveFunctions();
+
+    bool hasThermalObjectiveDerivative = false;
+
+    for (const objective& func : functions)
+    {
+        const objectiveIncompressible& funcI =
+            refCast<const objectiveIncompressible>(func);
+
+        if (funcI.hasdJdT() || funcI.hasBoundarydJdT())
+        {
+            hasThermalObjectiveDerivative = true;
+        }
+
+        if
+        (
+            funcI.hasdJdv()
+         || funcI.hasdJdp()
+         || funcI.hasdJdTMVar1()
+         || funcI.hasdJdTMVar2()
+         || funcI.hasBoundarydJdv()
+         || funcI.hasBoundarydJdvn()
+         || funcI.hasBoundarydJdvt()
+         || funcI.hasBoundarydJdp()
+         || funcI.hasBoundarydJdTMVar1()
+         || funcI.hasBoundarydJdTMVar2()
+         || funcI.hasBoundarydJdnut()
+         || funcI.hasBoundarydJdGradU()
+        )
+        {
+            FatalErrorInFunction
+                << "solveFixedPointAdjoint currently supports the exact "
+                << "reduced thermal objective RHS only. Objective "
+                << func.objectiveName()
+                << " exposes direct flow-state or turbulence objective "
+                << "derivatives that are not included in fixedPointObjectiveSeed()."
+                << exit(FatalError);
+        }
+    }
+
+    if (!hasThermalObjectiveDerivative)
+    {
+        FatalErrorInFunction
+            << "solveFixedPointAdjoint requires at least one active reduced "
+            << "thermal objective derivative dJdT or boundarydJdT. "
+            << "The current fixedPointObjectiveSeed() populates only the "
+            << "exact thermal flux RHS." << exit(FatalError);
+    }
+
+    Info<< "ATC-T fixed-point adjoint objective scope: exact reduced "
+        << "thermal objective RHS only." << endl;
 }
 
 
@@ -3961,6 +4131,2220 @@ Foam::thermalAdjointSimple::reverseOneSimpleMapSeed
 )
 {
     return reverseOneSimpleMapSeedImpl(seedNew, rAtUBase, nullptr);
+}
+
+
+Foam::thermalAdjointSimple::FixedPointAdjointResult::FixedPointAdjointResult
+(
+    const fvMesh& mesh
+)
+:
+    psi(mesh),
+    converged(false),
+    iterations(0),
+    restarts(0),
+    initialResidual(GREAT),
+    finalResidual(GREAT),
+    finalRelativeResidual(GREAT),
+    residualHistory()
+{}
+
+
+void Foam::thermalAdjointSimple::checkSimpleMapSeedSizes
+(
+    const SimpleMapSeed& seed,
+    const word& where
+) const
+{
+    if (seed.barU.size() != mesh_.nCells())
+    {
+        FatalErrorInFunction
+            << "SimpleMapSeed barU size mismatch in " << where
+            << ": " << seed.barU.size() << " vs " << mesh_.nCells()
+            << exit(FatalError);
+    }
+
+    if (seed.barp.size() != mesh_.nCells())
+    {
+        FatalErrorInFunction
+            << "SimpleMapSeed barp size mismatch in " << where
+            << ": " << seed.barp.size() << " vs " << mesh_.nCells()
+            << exit(FatalError);
+    }
+
+    if (seed.barPhiInternal.size() != mesh_.nInternalFaces())
+    {
+        FatalErrorInFunction
+            << "SimpleMapSeed barPhiInternal size mismatch in " << where
+            << ": " << seed.barPhiInternal.size() << " vs "
+            << mesh_.nInternalFaces() << exit(FatalError);
+    }
+
+    if (seed.barPhiBoundary.size() != mesh_.boundary().size())
+    {
+        FatalErrorInFunction
+            << "SimpleMapSeed barPhiBoundary list size mismatch in " << where
+            << ": " << seed.barPhiBoundary.size() << " vs "
+            << mesh_.boundary().size() << exit(FatalError);
+    }
+
+    forAll(seed.barPhiBoundary, patchi)
+    {
+        if (seed.barPhiBoundary[patchi].size() != mesh_.boundary()[patchi].size())
+        {
+            FatalErrorInFunction
+                << "SimpleMapSeed barPhiBoundary patch size mismatch in "
+                << where << " on patch "
+                << mesh_.boundary()[patchi].name() << ": "
+                << seed.barPhiBoundary[patchi].size() << " vs "
+                << mesh_.boundary()[patchi].size() << exit(FatalError);
+        }
+    }
+}
+
+
+void Foam::thermalAdjointSimple::zeroSimpleMapSeed(SimpleMapSeed& seed) const
+{
+    checkSimpleMapSeedSizes(seed, "zeroSimpleMapSeed");
+
+    seed.barU = vector::zero;
+    seed.barp = Zero;
+    seed.barPhiInternal = Zero;
+    forAll(seed.barPhiBoundary, patchi)
+    {
+        seed.barPhiBoundary[patchi] = Zero;
+    }
+}
+
+
+void Foam::thermalAdjointSimple::projectSimpleMapSeed(SimpleMapSeed& seed)
+{
+    checkSimpleMapSeedSizes(seed, "projectSimpleMapSeed");
+
+    typename pTraits<vector>::labelType validVectorComponents
+    (
+        mesh_.validComponents<vector>()
+    );
+
+    for (direction cmpt = 0; cmpt < vector::nComponents; ++cmpt)
+    {
+        if (component(validVectorComponents, cmpt) == -1)
+        {
+            forAll(seed.barU, celli)
+            {
+                seed.barU[celli][cmpt] = Zero;
+            }
+        }
+    }
+
+    const volScalarField& p = primalVars_.p();
+    if (!p.needReference())
+    {
+        return;
+    }
+
+    const label pRefCell = solverControl_().pRefCell();
+    if (pRefCell >= 0 && pRefCell < mesh_.nCells())
+    {
+        seed.barp[pRefCell] = Zero;
+    }
+    else
+    {
+        const label n = returnReduce(seed.barp.size(), sumOp<label>());
+        if (n > 0)
+        {
+            seed.barp -= gSum(seed.barp)/scalar(n);
+        }
+    }
+}
+
+
+void Foam::thermalAdjointSimple::axpySimpleMapSeed
+(
+    SimpleMapSeed& y,
+    const scalar a,
+    const SimpleMapSeed& x
+) const
+{
+    checkSimpleMapSeedSizes(y, "axpySimpleMapSeed y");
+    checkSimpleMapSeedSizes(x, "axpySimpleMapSeed x");
+
+    y.barU += a*x.barU;
+    y.barp += a*x.barp;
+    y.barPhiInternal += a*x.barPhiInternal;
+    forAll(y.barPhiBoundary, patchi)
+    {
+        y.barPhiBoundary[patchi] += a*x.barPhiBoundary[patchi];
+    }
+}
+
+
+void Foam::thermalAdjointSimple::scaleSimpleMapSeed
+(
+    SimpleMapSeed& y,
+    const scalar a
+) const
+{
+    checkSimpleMapSeedSizes(y, "scaleSimpleMapSeed");
+
+    y.barU *= a;
+    y.barp *= a;
+    y.barPhiInternal *= a;
+    forAll(y.barPhiBoundary, patchi)
+    {
+        y.barPhiBoundary[patchi] *= a;
+    }
+}
+
+
+Foam::scalar Foam::thermalAdjointSimple::dotSimpleMapSeed
+(
+    const SimpleMapSeed& a,
+    const SimpleMapSeed& b,
+    const scalar UStateScale,
+    const scalar pStateScale,
+    const scalar phiStateScale
+) const
+{
+    checkSimpleMapSeedSizes(a, "dotSimpleMapSeed a");
+    checkSimpleMapSeedSizes(b, "dotSimpleMapSeed b");
+
+    scalar val = Zero;
+    const scalar USqr = sqr(max(UStateScale, SMALL));
+    const scalar pSqr = sqr(max(pStateScale, SMALL));
+    const scalar phiSqr = sqr(max(phiStateScale, SMALL));
+
+    forAll(a.barU, celli)
+    {
+        val += USqr*(a.barU[celli] & b.barU[celli]);
+        val += pSqr*a.barp[celli]*b.barp[celli];
+    }
+
+    forAll(a.barPhiInternal, facei)
+    {
+        val += phiSqr*a.barPhiInternal[facei]*b.barPhiInternal[facei];
+    }
+
+    forAll(a.barPhiBoundary, patchi)
+    {
+        forAll(a.barPhiBoundary[patchi], facei)
+        {
+            val +=
+                phiSqr
+               *a.barPhiBoundary[patchi][facei]
+               *b.barPhiBoundary[patchi][facei];
+        }
+    }
+
+    return returnReduce(val, sumOp<scalar>());
+}
+
+
+Foam::scalar Foam::thermalAdjointSimple::normSimpleMapSeed
+(
+    const SimpleMapSeed& a,
+    const scalar UStateScale,
+    const scalar pStateScale,
+    const scalar phiStateScale
+) const
+{
+    return sqrt
+    (
+        max
+        (
+            dotSimpleMapSeed
+            (
+                a,
+                a,
+                UStateScale,
+                pStateScale,
+                phiStateScale
+            ),
+            Zero
+        )
+    );
+}
+
+
+void Foam::thermalAdjointSimple::simpleMapSeedBlockNorms
+(
+    const SimpleMapSeed& seed,
+    scalar& UNorm,
+    scalar& pNorm,
+    scalar& phiInternalNorm,
+    scalar& phiBoundaryNorm
+) const
+{
+    checkSimpleMapSeedSizes(seed, "simpleMapSeedBlockNorms");
+
+    scalar USqr = Zero;
+    scalar pSqr = Zero;
+    scalar phiInternalSqr = Zero;
+    scalar phiBoundarySqr = Zero;
+
+    forAll(seed.barU, celli)
+    {
+        USqr += magSqr(seed.barU[celli]);
+        pSqr += sqr(seed.barp[celli]);
+    }
+
+    forAll(seed.barPhiInternal, facei)
+    {
+        phiInternalSqr += sqr(seed.barPhiInternal[facei]);
+    }
+
+    forAll(seed.barPhiBoundary, patchi)
+    {
+        forAll(seed.barPhiBoundary[patchi], facei)
+        {
+            phiBoundarySqr += sqr(seed.barPhiBoundary[patchi][facei]);
+        }
+    }
+
+    UNorm = sqrt(max(returnReduce(USqr, sumOp<scalar>()), Zero));
+    pNorm = sqrt(max(returnReduce(pSqr, sumOp<scalar>()), Zero));
+    phiInternalNorm =
+        sqrt(max(returnReduce(phiInternalSqr, sumOp<scalar>()), Zero));
+    phiBoundaryNorm =
+        sqrt(max(returnReduce(phiBoundarySqr, sumOp<scalar>()), Zero));
+}
+
+
+Foam::scalar Foam::thermalAdjointSimple::maxDifferenceSimpleMapSeed
+(
+    const SimpleMapSeed& a,
+    const SimpleMapSeed& b
+) const
+{
+    checkSimpleMapSeedSizes(a, "maxDifferenceSimpleMapSeed a");
+    checkSimpleMapSeedSizes(b, "maxDifferenceSimpleMapSeed b");
+
+    scalar maxDiff = Zero;
+    forAll(a.barU, celli)
+    {
+        maxDiff = max(maxDiff, mag(a.barU[celli] - b.barU[celli]));
+        maxDiff = max(maxDiff, mag(a.barp[celli] - b.barp[celli]));
+    }
+
+    forAll(a.barPhiInternal, facei)
+    {
+        maxDiff =
+            max
+            (
+                maxDiff,
+                mag(a.barPhiInternal[facei] - b.barPhiInternal[facei])
+            );
+    }
+
+    forAll(a.barPhiBoundary, patchi)
+    {
+        forAll(a.barPhiBoundary[patchi], facei)
+        {
+            maxDiff =
+                max
+                (
+                    maxDiff,
+                    mag
+                    (
+                        a.barPhiBoundary[patchi][facei]
+                      - b.barPhiBoundary[patchi][facei]
+                    )
+                );
+        }
+    }
+
+    return returnReduce(maxDiff, maxOp<scalar>());
+}
+
+
+void Foam::thermalAdjointSimple::fixedPointAdjointStateScales
+(
+    scalar& UStateScale,
+    scalar& pStateScale,
+    scalar& phiStateScale
+)
+{
+    const volVectorField& U = primalVars_.U();
+    const volScalarField& p = primalVars_.p();
+    const surfaceScalarField& phi = primalVars_.phi();
+
+    scalar UMax = gMax(mag(U.primitiveField()));
+    forAll(U.boundaryField(), patchi)
+    {
+        if (U.boundaryField()[patchi].size())
+        {
+            UMax = max(UMax, gMax(mag(U.boundaryField()[patchi])));
+        }
+    }
+
+    scalarField pGauge(p.primitiveField());
+    if (p.needReference())
+    {
+        const label pRefCell = solverControl_().pRefCell();
+        if (pRefCell >= 0 && pRefCell < mesh_.nCells())
+        {
+            pGauge -= pGauge[pRefCell] - solverControl_().pRefValue();
+        }
+        else
+        {
+            const label n = returnReduce(pGauge.size(), sumOp<label>());
+            if (n > 0)
+            {
+                pGauge -= gSum(pGauge)/scalar(n);
+            }
+        }
+    }
+    scalar pMax = gMax(mag(pGauge));
+
+    scalar phiMax = gMax(mag(phi.primitiveField()));
+    forAll(phi.boundaryField(), patchi)
+    {
+        if (phi.boundaryField()[patchi].size())
+        {
+            phiMax = max(phiMax, gMax(mag(phi.boundaryField()[patchi])));
+        }
+    }
+
+    UStateScale = max(UMax, SMALL);
+    pStateScale = max(pMax, SMALL);
+    phiStateScale = max(phiMax, SMALL);
+}
+
+
+Foam::tmp<Foam::volScalarField>
+Foam::thermalAdjointSimple::fixedPointAdjointRAtUBase()
+{
+    volVectorField& U = primalVars_.U();
+    const surfaceScalarField& phi = primalVars_.phi();
+    const autoPtr<incompressible::turbulenceModel>& turbulence =
+        primalVars_.turbulence();
+    fv::options& fvOptions(fv::options::New(this->mesh_));
+
+    tmp<fvVectorMatrix> tUEqn
+    (
+        fvm::div(phi, U)
+      + turbulence->divDevReff(U)
+     ==
+        fvOptions(U)
+    );
+    fvVectorMatrix& UEqn = tUEqn.ref();
+
+    UEqn.relax();
+    fvOptions.constrain(UEqn);
+
+    volScalarField rAU
+    (
+        IOobject
+        (
+            "ATCTFixedPointAdjointRAUBase",
+            mesh_.time().timeName(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE
+        ),
+        1.0/UEqn.A()
+    );
+
+    tmp<volScalarField> tRAtU
+    (
+        new volScalarField
+        (
+            IOobject
+            (
+                "ATCTFixedPointAdjointRAtUBase",
+                mesh_.time().timeName(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE
+            ),
+            rAU
+        )
+    );
+
+    if (solverControl_().consistent())
+    {
+        tmp<volVectorField> tYForH1(rAU*UEqn.H());
+        tRAtU.ref() = 1.0/(1.0/rAU - UEqn.H1());
+    }
+
+    return tRAtU;
+}
+
+
+Foam::thermalAdjointSimple::SimpleMapSeed
+Foam::thermalAdjointSimple::fixedPointObjectiveSeed()
+{
+    if (!exactScalarThermalTranspose_)
+    {
+        FatalErrorInFunction
+            << "fixedPointObjectiveSeed requires exactScalarThermalTranspose "
+            << "true." << exit(FatalError);
+    }
+
+    if (couplingForm_ != "exactFluxTranspose")
+    {
+        FatalErrorInFunction
+            << "fixedPointObjectiveSeed supports only couplingForm "
+            << "exactFluxTranspose in this pass. Current value: "
+            << couplingForm_ << exit(FatalError);
+    }
+
+    validateFixedPointObjectiveScope();
+
+    SimpleMapSeed seed(mesh_);
+    zeroSimpleMapSeed(seed);
+
+    tmp<surfaceScalarField> tGPhi = thermalFluxSensitivity();
+    const surfaceScalarField& gPhi = tGPhi();
+
+    seed.barPhiInternal = gPhi.primitiveField();
+    seed.barPhiInternal *= couplingSign_;
+    forAll(seed.barPhiBoundary, patchi)
+    {
+        seed.barPhiBoundary[patchi] = gPhi.boundaryField()[patchi];
+        seed.barPhiBoundary[patchi] *= couplingSign_;
+    }
+
+    projectSimpleMapSeed(seed);
+
+    scalar UStateScale = Zero;
+    scalar pStateScale = Zero;
+    scalar phiStateScale = Zero;
+    fixedPointAdjointStateScales(UStateScale, pStateScale, phiStateScale);
+
+    scalar UNorm = Zero;
+    scalar pNorm = Zero;
+    scalar phiInternalNorm = Zero;
+    scalar phiBoundaryNorm = Zero;
+    simpleMapSeedBlockNorms
+    (
+        seed,
+        UNorm,
+        pNorm,
+        phiInternalNorm,
+        phiBoundaryNorm
+    );
+
+    const scalar totalNorm =
+        normSimpleMapSeed(seed, UStateScale, pStateScale, phiStateScale);
+
+    Info<< "ATC-T fixed-point adjoint objective seed: "
+        << "UNorm " << UNorm
+        << " pNorm " << pNorm
+        << " phiInternalNorm " << phiInternalNorm
+        << " phiBoundaryNorm " << phiBoundaryNorm
+        << " weightedNorm " << totalNorm
+        << endl;
+
+    if (totalNorm <= VSMALL)
+    {
+        FatalErrorInFunction
+            << "The fixed-point adjoint RHS is zero. This pass expects a "
+            << "nonzero exact thermal flux objective seed." << exit(FatalError);
+    }
+
+    return seed;
+}
+
+
+Foam::thermalAdjointSimple::SimpleMapSeed
+Foam::thermalAdjointSimple::applyFixedPointAdjointOperator
+(
+    const SimpleMapSeed& input,
+    const volScalarField& rAtUBase
+)
+{
+    SimpleMapSeed v(input);
+    projectSimpleMapSeed(v);
+
+    SimpleMapSeed MTv = reverseOneSimpleMapSeed(v, rAtUBase);
+    projectSimpleMapSeed(MTv);
+
+    SimpleMapSeed result(v);
+    axpySimpleMapSeed(result, scalar(-1), MTv);
+    projectSimpleMapSeed(result);
+
+    return result;
+}
+
+
+void Foam::thermalAdjointSimple::checkFixedPointAdjointOperator
+(
+    const volScalarField& rAtUBase,
+    const scalar UStateScale,
+    const scalar pStateScale,
+    const scalar phiStateScale
+)
+{
+    auto makeSeed = [&](const label salt)
+    {
+        SimpleMapSeed seed(mesh_);
+
+        forAll(seed.barU, celli)
+        {
+            seed.barU[celli].x() =
+                scalar(((celli + 17*salt) % 1009) - 504)/scalar(503);
+            seed.barU[celli].y() =
+                scalar(((3*celli + 31*salt) % 1013) - 506)/scalar(509);
+            seed.barU[celli].z() =
+                scalar(((7*celli + 43*salt) % 1019) - 509)/scalar(511);
+            seed.barp[celli] =
+                scalar(((11*celli + 59*salt) % 1021) - 510)/scalar(521);
+        }
+
+        forAll(seed.barPhiInternal, facei)
+        {
+            seed.barPhiInternal[facei] =
+                scalar(((13*facei + 71*salt) % 1031) - 515)/scalar(523);
+        }
+
+        forAll(seed.barPhiBoundary, patchi)
+        {
+            forAll(seed.barPhiBoundary[patchi], facei)
+            {
+                seed.barPhiBoundary[patchi][facei] =
+                    scalar
+                    (
+                        (
+                            17*(facei + 1)
+                          + 19*(patchi + 1)
+                          + 83*salt
+                        ) % 1033 - 516
+                    )/scalar(541);
+            }
+        }
+
+        projectSimpleMapSeed(seed);
+        return seed;
+    };
+
+    struct PrimalFieldSnapshot
+    {
+        vectorField UInternal;
+        List<vectorField> UBoundary;
+        scalarField pInternal;
+        List<scalarField> pBoundary;
+        scalarField phiInternal;
+        List<scalarField> phiBoundary;
+
+        explicit PrimalFieldSnapshot(const fvMesh& mesh)
+        :
+            UInternal(mesh.nCells(), vector::zero),
+            UBoundary(mesh.boundary().size()),
+            pInternal(mesh.nCells(), Zero),
+            pBoundary(mesh.boundary().size()),
+            phiInternal(mesh.nInternalFaces(), Zero),
+            phiBoundary(mesh.boundary().size())
+        {
+            forAll(mesh.boundary(), patchi)
+            {
+                UBoundary[patchi].setSize
+                (
+                    mesh.boundary()[patchi].size(),
+                    vector::zero
+                );
+                pBoundary[patchi].setSize(mesh.boundary()[patchi].size(), Zero);
+                phiBoundary[patchi].setSize
+                (
+                    mesh.boundary()[patchi].size(),
+                    Zero
+                );
+            }
+        }
+    };
+
+    auto capturePrimalFields = [&](PrimalFieldSnapshot& snap)
+    {
+        const volVectorField& U = primalVars_.U();
+        const volScalarField& p = primalVars_.p();
+        const surfaceScalarField& phi = primalVars_.phi();
+
+        snap.UInternal = U.primitiveField();
+        snap.pInternal = p.primitiveField();
+        snap.phiInternal = phi.primitiveField();
+
+        forAll(mesh_.boundary(), patchi)
+        {
+            snap.UBoundary[patchi] = U.boundaryField()[patchi];
+            snap.pBoundary[patchi] = p.boundaryField()[patchi];
+            snap.phiBoundary[patchi] = phi.boundaryField()[patchi];
+        }
+    };
+
+    PrimalFieldSnapshot beforeOperator(mesh_);
+    capturePrimalFields(beforeOperator);
+    SimpleMapSeed preservationSeed = makeSeed(307);
+    (void)applyFixedPointAdjointOperator(preservationSeed, rAtUBase);
+    PrimalFieldSnapshot afterOperator(mesh_);
+    capturePrimalFields(afterOperator);
+
+    scalar maxStateDiff = Zero;
+    word maxStateField("none");
+    word maxStatePatch("internal");
+    label maxStateIndex = -1;
+
+    auto updateMaxStateDiff =
+        [&]
+        (
+            const scalar diff,
+            const scalar scale,
+            const word& fieldName,
+            const word& patchName,
+            const label index
+        )
+    {
+        const scalar scaledDiff = diff/max(scale, VSMALL);
+        if (scaledDiff > maxStateDiff)
+        {
+            maxStateDiff = scaledDiff;
+            maxStateField = fieldName;
+            maxStatePatch = patchName;
+            maxStateIndex = index;
+        }
+    };
+
+    forAll(beforeOperator.UInternal, celli)
+    {
+        updateMaxStateDiff
+        (
+            mag(afterOperator.UInternal[celli] - beforeOperator.UInternal[celli]),
+            UStateScale,
+            "U",
+            "internal",
+            celli
+        );
+        updateMaxStateDiff
+        (
+            mag(afterOperator.pInternal[celli] - beforeOperator.pInternal[celli]),
+            pStateScale,
+            "p",
+            "internal",
+            celli
+        );
+    }
+
+    forAll(beforeOperator.phiInternal, facei)
+    {
+        updateMaxStateDiff
+        (
+            mag
+            (
+                afterOperator.phiInternal[facei]
+              - beforeOperator.phiInternal[facei]
+            ),
+            phiStateScale,
+            "phi",
+            "internal",
+            facei
+        );
+    }
+
+    forAll(mesh_.boundary(), patchi)
+    {
+        const word patchName(mesh_.boundary()[patchi].name());
+        forAll(beforeOperator.UBoundary[patchi], facei)
+        {
+            updateMaxStateDiff
+            (
+                mag
+                (
+                    afterOperator.UBoundary[patchi][facei]
+                  - beforeOperator.UBoundary[patchi][facei]
+                ),
+                UStateScale,
+                "U",
+                patchName,
+                facei
+            );
+            updateMaxStateDiff
+            (
+                mag
+                (
+                    afterOperator.pBoundary[patchi][facei]
+                  - beforeOperator.pBoundary[patchi][facei]
+                ),
+                pStateScale,
+                "p",
+                patchName,
+                facei
+            );
+            updateMaxStateDiff
+            (
+                mag
+                (
+                    afterOperator.phiBoundary[patchi][facei]
+                  - beforeOperator.phiBoundary[patchi][facei]
+                ),
+                phiStateScale,
+                "phi",
+                patchName,
+                facei
+            );
+        }
+    }
+
+    reduce(maxStateDiff, maxOp<scalar>());
+
+    Info<< "ATC-T fixed-point adjoint operator state preservation: "
+        << "maxScaledDiff " << maxStateDiff
+        << " field " << maxStateField
+        << " patch " << maxStatePatch
+        << " index " << maxStateIndex
+        << endl;
+
+    if (maxStateDiff > scalar(1e-13))
+    {
+        FatalErrorInFunction
+            << "Fixed-point adjoint operator changed the primal state. "
+            << "maxScaledDiff " << maxStateDiff
+            << " field " << maxStateField
+            << " patch " << maxStatePatch
+            << " index " << maxStateIndex
+            << exit(FatalError);
+    }
+
+    SimpleMapSeed zeroSeed(mesh_);
+    zeroSimpleMapSeed(zeroSeed);
+    SimpleMapSeed AZero =
+        applyFixedPointAdjointOperator(zeroSeed, rAtUBase);
+    const scalar zeroNorm =
+        normSimpleMapSeed(AZero, UStateScale, pStateScale, phiStateScale);
+
+    Info<< "ATC-T fixed-point adjoint operator zero test: norm "
+        << zeroNorm << endl;
+
+    if (zeroNorm > scalar(1e-14))
+    {
+        FatalErrorInFunction
+            << "Fixed-point adjoint operator zero test failed with norm "
+            << zeroNorm << exit(FatalError);
+    }
+
+    const scalar alpha = scalar(0.731);
+    const scalar beta = scalar(-1.217);
+
+    for (label pairi = 0; pairi < 3; ++pairi)
+    {
+        SimpleMapSeed seedA = makeSeed(101 + 2*pairi);
+        SimpleMapSeed seedB = makeSeed(203 + 2*pairi);
+
+        SimpleMapSeed combo(seedA);
+        scaleSimpleMapSeed(combo, alpha);
+        axpySimpleMapSeed(combo, beta, seedB);
+
+        SimpleMapSeed lhs =
+            applyFixedPointAdjointOperator(combo, rAtUBase);
+        SimpleMapSeed rhs =
+            applyFixedPointAdjointOperator(seedA, rAtUBase);
+        scaleSimpleMapSeed(rhs, alpha);
+        SimpleMapSeed AB =
+            applyFixedPointAdjointOperator(seedB, rAtUBase);
+        axpySimpleMapSeed(rhs, beta, AB);
+
+        SimpleMapSeed diff(lhs);
+        axpySimpleMapSeed(diff, scalar(-1), rhs);
+
+        const scalar diffNorm =
+            normSimpleMapSeed(diff, UStateScale, pStateScale, phiStateScale);
+        const scalar relDiff =
+            diffNorm
+           /max
+            (
+                normSimpleMapSeed(lhs, UStateScale, pStateScale, phiStateScale)
+              + normSimpleMapSeed(rhs, UStateScale, pStateScale, phiStateScale),
+                VSMALL
+            );
+
+        Info<< "ATC-T fixed-point adjoint operator linearity: pair "
+            << pairi
+            << " absDiff " << diffNorm
+            << " relDiff " << relDiff
+            << endl;
+
+        if (relDiff > scalar(1e-10) && diffNorm > scalar(1e-12))
+        {
+            FatalErrorInFunction
+                << "Fixed-point adjoint operator linearity test failed for "
+                << "pair " << pairi
+                << ": absDiff " << diffNorm
+                << ", relDiff " << relDiff
+                << exit(FatalError);
+        }
+    }
+
+    SimpleMapSeed detSeed = makeSeed(409);
+    SimpleMapSeed detA =
+        applyFixedPointAdjointOperator(detSeed, rAtUBase);
+    SimpleMapSeed detB =
+        applyFixedPointAdjointOperator(detSeed, rAtUBase);
+    const scalar maxDiff = maxDifferenceSimpleMapSeed(detA, detB);
+
+    Info<< "ATC-T fixed-point adjoint operator determinism: maxDiff "
+        << maxDiff << endl;
+
+    if (maxDiff > scalar(1e-13))
+    {
+        FatalErrorInFunction
+            << "Fixed-point adjoint operator determinism failed with maxDiff "
+            << maxDiff << exit(FatalError);
+    }
+
+    Info<< "ATC-T fixed-point adjoint operator transpose identity: "
+        << "the finite-difference state identity is covered by the guarded "
+        << "one-step full-state transpose diagnostic. This pass reuses that "
+        << "validated M_x^T action and checks only the new algebraic "
+        << "I - M_x^T wrapper." << endl;
+}
+
+
+Foam::thermalAdjointSimple::FixedPointAdjointResult
+Foam::thermalAdjointSimple::solveFixedPointAdjointSystem
+(
+    const SimpleMapSeed& rhsIn,
+    const volScalarField& rAtUBase
+)
+{
+    scalar UStateScale = Zero;
+    scalar pStateScale = Zero;
+    scalar phiStateScale = Zero;
+    fixedPointAdjointStateScales(UStateScale, pStateScale, phiStateScale);
+
+    SimpleMapSeed rhs(rhsIn);
+    projectSimpleMapSeed(rhs);
+
+    const scalar rhsNorm =
+        normSimpleMapSeed(rhs, UStateScale, pStateScale, phiStateScale);
+
+    FixedPointAdjointResult result(mesh_);
+    zeroSimpleMapSeed(result.psi);
+    result.initialResidual = rhsNorm;
+
+    const scalar tolerance =
+        max(fixedPointAdjointAbsTol_, fixedPointAdjointRelTol_*rhsNorm);
+
+    auto appendResidual = [&](const scalar residual)
+    {
+        const label n = result.residualHistory.size();
+        result.residualHistory.setSize(n + 1);
+        result.residualHistory[n] = residual;
+    };
+
+    auto residual = [&](const SimpleMapSeed& psi)
+    {
+        SimpleMapSeed Apsi =
+            applyFixedPointAdjointOperator(psi, rAtUBase);
+        SimpleMapSeed r(rhs);
+        axpySimpleMapSeed(r, scalar(-1), Apsi);
+        projectSimpleMapSeed(r);
+        return r;
+    };
+
+    auto printBlockResiduals =
+        [&](const word& labelText, const SimpleMapSeed& r)
+    {
+        scalar UNorm = Zero;
+        scalar pNorm = Zero;
+        scalar phiInternalNorm = Zero;
+        scalar phiBoundaryNorm = Zero;
+        simpleMapSeedBlockNorms
+        (
+            r,
+            UNorm,
+            pNorm,
+            phiInternalNorm,
+            phiBoundaryNorm
+        );
+
+        Info<< "ATC-T fixed-point adjoint GMRES " << labelText
+            << ": weightedResidual "
+            << normSimpleMapSeed(r, UStateScale, pStateScale, phiStateScale)
+            << " weightedRelative "
+            << normSimpleMapSeed(r, UStateScale, pStateScale, phiStateScale)
+              /max(rhsNorm, VSMALL)
+            << " rawU " << UNorm
+            << " rawP " << pNorm
+            << " rawPhiInternal " << phiInternalNorm
+            << " rawPhiBoundary " << phiBoundaryNorm
+            << endl;
+    };
+
+    if (rhsNorm <= fixedPointAdjointAbsTol_)
+    {
+        result.converged = true;
+        result.finalResidual = rhsNorm;
+        result.finalRelativeResidual = Zero;
+        appendResidual(rhsNorm);
+        return result;
+    }
+
+    label outer = 0;
+    while (result.iterations < fixedPointAdjointMaxIters_)
+    {
+        SimpleMapSeed r = residual(result.psi);
+        scalar betaNorm =
+            normSimpleMapSeed(r, UStateScale, pStateScale, phiStateScale);
+
+        appendResidual(betaNorm);
+        printBlockResiduals("restartResidual", r);
+
+        if (outer == 0)
+        {
+            result.initialResidual = betaNorm;
+        }
+
+        if (betaNorm <= tolerance)
+        {
+            result.converged = true;
+            result.finalResidual = betaNorm;
+            result.finalRelativeResidual = betaNorm/max(rhsNorm, VSMALL);
+            break;
+        }
+
+        PtrList<SimpleMapSeed> basis(fixedPointAdjointRestart_ + 1);
+        forAll(basis, i)
+        {
+            basis.set(i, new SimpleMapSeed(mesh_));
+        }
+
+        basis[0] = r;
+        scaleSimpleMapSeed(basis[0], scalar(1)/betaNorm);
+
+        List<scalarField> H(fixedPointAdjointRestart_ + 1);
+        forAll(H, rowi)
+        {
+            H[rowi].setSize(fixedPointAdjointRestart_, Zero);
+        }
+
+        scalarField cs(fixedPointAdjointRestart_, Zero);
+        scalarField sn(fixedPointAdjointRestart_, Zero);
+        scalarField g(fixedPointAdjointRestart_ + 1, Zero);
+        g[0] = betaNorm;
+
+        label m = 0;
+        bool restartDone = false;
+        bool breakdown = false;
+
+        for
+        (
+            label j = 0;
+            j < fixedPointAdjointRestart_
+         && result.iterations < fixedPointAdjointMaxIters_;
+            ++j
+        )
+        {
+            SimpleMapSeed w =
+                applyFixedPointAdjointOperator(basis[j], rAtUBase);
+
+            for (label i = 0; i <= j; ++i)
+            {
+                const scalar hij =
+                    dotSimpleMapSeed
+                    (
+                        w,
+                        basis[i],
+                        UStateScale,
+                        pStateScale,
+                        phiStateScale
+                    );
+                H[i][j] += hij;
+                axpySimpleMapSeed(w, -hij, basis[i]);
+            }
+
+            for (label i = 0; i <= j; ++i)
+            {
+                const scalar corr =
+                    dotSimpleMapSeed
+                    (
+                        w,
+                        basis[i],
+                        UStateScale,
+                        pStateScale,
+                        phiStateScale
+                    );
+                H[i][j] += corr;
+                axpySimpleMapSeed(w, -corr, basis[i]);
+            }
+
+            H[j + 1][j] =
+                normSimpleMapSeed(w, UStateScale, pStateScale, phiStateScale);
+            const scalar rawHNext = H[j + 1][j];
+
+            if (rawHNext > fixedPointAdjointBreakdownTol_)
+            {
+                basis[j + 1] = w;
+                scaleSimpleMapSeed(basis[j + 1], scalar(1)/rawHNext);
+            }
+            else
+            {
+                breakdown = true;
+            }
+
+            for (label i = 0; i < j; ++i)
+            {
+                const scalar h0 = H[i][j];
+                const scalar h1 = H[i + 1][j];
+                H[i][j] = cs[i]*h0 + sn[i]*h1;
+                H[i + 1][j] = -sn[i]*h0 + cs[i]*h1;
+            }
+
+            const scalar h0 = H[j][j];
+            const scalar h1 = H[j + 1][j];
+            const scalar denom = Foam::hypot(h0, h1);
+            if (denom <= fixedPointAdjointBreakdownTol_)
+            {
+                cs[j] = scalar(1);
+                sn[j] = Zero;
+            }
+            else
+            {
+                cs[j] = h0/denom;
+                sn[j] = h1/denom;
+            }
+
+            H[j][j] = cs[j]*h0 + sn[j]*h1;
+            H[j + 1][j] = Zero;
+
+            const scalar gj = g[j];
+            g[j] = cs[j]*gj;
+            g[j + 1] = -sn[j]*gj;
+
+            ++result.iterations;
+            m = j + 1;
+
+            const scalar estimatedResidual = mag(g[j + 1]);
+            Info<< "ATC-T fixed-point adjoint GMRES iter: total "
+                << result.iterations
+                << " restart " << outer
+                << " inner " << j
+                << " estimatedResidual " << estimatedResidual
+                << " estimatedRelative "
+                << estimatedResidual/max(rhsNorm, VSMALL)
+                << " hNext " << rawHNext
+                << endl;
+
+            if
+            (
+                estimatedResidual <= tolerance
+             || result.iterations >= fixedPointAdjointMaxIters_
+             || breakdown
+            )
+            {
+                restartDone = true;
+                break;
+            }
+        }
+
+        scalar maxOffDiag = Zero;
+        scalar maxDiagErr = Zero;
+        for (label i = 0; i < m; ++i)
+        {
+            for (label j = 0; j < m; ++j)
+            {
+                const scalar dotij =
+                    dotSimpleMapSeed
+                    (
+                        basis[i],
+                        basis[j],
+                        UStateScale,
+                        pStateScale,
+                        phiStateScale
+                    );
+                if (i == j)
+                {
+                    maxDiagErr = max(maxDiagErr, mag(dotij - scalar(1)));
+                }
+                else
+                {
+                    maxOffDiag = max(maxOffDiag, mag(dotij));
+                }
+            }
+        }
+
+        Info<< "ATC-T fixed-point adjoint Arnoldi orthogonality: restart "
+            << outer
+            << " vectors " << m
+            << " maxOffDiagonal " << maxOffDiag
+            << " maxDiagonalError " << maxDiagErr
+            << endl;
+
+        if
+        (
+            !breakdown
+         && (maxOffDiag > scalar(1e-9) || maxDiagErr > scalar(1e-10))
+        )
+        {
+            FatalErrorInFunction
+                << "Fixed-point adjoint Arnoldi orthogonality failed: "
+                << "maxOffDiagonal " << maxOffDiag
+                << ", maxDiagonalError " << maxDiagErr
+                << exit(FatalError);
+        }
+
+        if (!restartDone && m == 0)
+        {
+            FatalErrorInFunction
+                << "Fixed-point adjoint GMRES made no Arnoldi progress."
+                << exit(FatalError);
+        }
+
+        scalarField y(m, Zero);
+        bool triangularBreakdown = false;
+        for (label i = m - 1; i >= 0; --i)
+        {
+            scalar sum = g[i];
+            for (label k = i + 1; k < m; ++k)
+            {
+                sum -= H[i][k]*y[k];
+            }
+
+            if (mag(H[i][i]) <= fixedPointAdjointBreakdownTol_)
+            {
+                Info<< "ATC-T fixed-point adjoint GMRES: near-zero "
+                    << "triangular diagonal at row " << i
+                    << ", value " << H[i][i]
+                    << ", residual numerator " << sum
+                    << ". Forming a projected candidate before deciding "
+                    << "breakdown." << endl;
+                triangularBreakdown = true;
+                y[i] = Zero;
+                continue;
+            }
+
+            y[i] = sum/H[i][i];
+        }
+
+        for (label k = 0; k < m; ++k)
+        {
+            axpySimpleMapSeed(result.psi, y[k], basis[k]);
+        }
+        projectSimpleMapSeed(result.psi);
+
+        SimpleMapSeed rTrue = residual(result.psi);
+        betaNorm =
+            normSimpleMapSeed
+            (
+                rTrue,
+                UStateScale,
+                pStateScale,
+                phiStateScale
+            );
+        appendResidual(betaNorm);
+
+        result.finalResidual = betaNorm;
+        result.finalRelativeResidual = betaNorm/max(rhsNorm, VSMALL);
+        printBlockResiduals("trueResidual", rTrue);
+
+        if (betaNorm <= tolerance)
+        {
+            result.converged = true;
+            break;
+        }
+
+        if (triangularBreakdown)
+        {
+            Info<< "ATC-T fixed-point adjoint GMRES: non-converged "
+                << "triangular breakdown, true residual " << betaNorm
+                << " tolerance " << tolerance << endl;
+            result.converged = false;
+            break;
+        }
+
+        if (breakdown)
+        {
+            Info<< "ATC-T fixed-point adjoint GMRES: non-converged Arnoldi "
+                << "breakdown, true residual " << betaNorm
+                << " tolerance " << tolerance << endl;
+            result.converged = false;
+            break;
+        }
+
+        ++outer;
+        result.restarts = outer;
+    }
+
+    result.finalRelativeResidual =
+        result.finalResidual/max(rhsNorm, VSMALL);
+
+    Info<< "ATC-T fixed-point adjoint GMRES result: converged "
+        << result.converged
+        << " iterations " << result.iterations
+        << " restarts " << result.restarts
+        << " initialResidual " << result.initialResidual
+        << " finalResidual " << result.finalResidual
+        << " finalRelativeResidual " << result.finalRelativeResidual
+        << " tolerance " << tolerance
+        << endl;
+
+    return result;
+}
+
+
+void Foam::thermalAdjointSimple::checkFixedPointAdjointSolution
+(
+    const SimpleMapSeed& rhs,
+    const FixedPointAdjointResult& result,
+    const volScalarField& rAtUBase,
+    const scalar UStateScale,
+    const scalar pStateScale,
+    const scalar phiStateScale
+)
+{
+    SimpleMapSeed Apsi =
+        applyFixedPointAdjointOperator(result.psi, rAtUBase);
+    SimpleMapSeed residual(rhs);
+    axpySimpleMapSeed(residual, scalar(-1), Apsi);
+    projectSimpleMapSeed(residual);
+
+    const scalar rhsNorm =
+        normSimpleMapSeed(rhs, UStateScale, pStateScale, phiStateScale);
+    const scalar residualNorm =
+        normSimpleMapSeed(residual, UStateScale, pStateScale, phiStateScale);
+
+    scalar UNorm = Zero;
+    scalar pNorm = Zero;
+    scalar phiInternalNorm = Zero;
+    scalar phiBoundaryNorm = Zero;
+    simpleMapSeedBlockNorms
+    (
+        residual,
+        UNorm,
+        pNorm,
+        phiInternalNorm,
+        phiBoundaryNorm
+    );
+
+    Info<< "ATC-T fixed-point adjoint direct residual: weighted "
+        << residualNorm
+        << " relative " << residualNorm/max(rhsNorm, VSMALL)
+        << " rawU " << UNorm
+        << " rawP " << pNorm
+        << " rawPhiInternal " << phiInternalNorm
+        << " rawPhiBoundary " << phiBoundaryNorm
+        << endl;
+
+    if (residualNorm/max(rhsNorm, VSMALL) > scalar(1e-8))
+    {
+        FatalErrorInFunction
+            << "Fixed-point adjoint solve residual failed validation: "
+            << residualNorm/max(rhsNorm, VSMALL)
+            << exit(FatalError);
+    }
+
+    volVectorField& U = primalVars_.U();
+    volScalarField& p = primalVars_.p();
+    surfaceScalarField& phi = primalVars_.phi();
+
+    const vectorField UBaseInternal(U.primitiveField());
+    const scalarField pBaseInternal(p.primitiveField());
+    const scalarField phiBaseInternal(phi.primitiveField());
+    List<vectorField> UBaseBoundary(mesh_.boundary().size());
+    List<scalarField> pBaseBoundary(mesh_.boundary().size());
+    List<scalarField> phiBaseBoundary(mesh_.boundary().size());
+    forAll(mesh_.boundary(), patchi)
+    {
+        UBaseBoundary[patchi] = U.boundaryField()[patchi];
+        pBaseBoundary[patchi] = p.boundaryField()[patchi];
+        phiBaseBoundary[patchi] = phi.boundaryField()[patchi];
+    }
+
+    const bool pressureNeedsReference = p.needReference();
+    const label pRefCell = solverControl_().pRefCell();
+
+    auto removeMean = [](scalarField& fld)
+    {
+        const label n = returnReduce(fld.size(), sumOp<label>());
+        if (n > 0)
+        {
+            fld -= gSum(fld)/scalar(n);
+        }
+    };
+
+    auto projectPressureDirection = [&](scalarField& fld)
+    {
+        if (!pressureNeedsReference)
+        {
+            return;
+        }
+
+        if (pRefCell >= 0 && pRefCell < mesh_.nCells())
+        {
+            fld[pRefCell] = Zero;
+        }
+        else
+        {
+            removeMean(fld);
+        }
+    };
+
+    typename pTraits<vector>::labelType validVectorComponents
+    (
+        mesh_.validComponents<vector>()
+    );
+    auto projectValidVectorComponents = [&](vectorField& vf)
+    {
+        forAll(vf, celli)
+        {
+            for (direction cmpt = 0; cmpt < vector::nComponents; ++cmpt)
+            {
+                if (component(validVectorComponents, cmpt) == -1)
+                {
+                    vf[celli][cmpt] = Zero;
+                }
+            }
+        }
+    };
+
+    auto enforcePressureBoundaryState = [&]()
+    {
+        bool hasUpdateablePressureSnGrad = false;
+        forAll(p.boundaryField(), patchi)
+        {
+            if
+            (
+                mesh_.boundary()[patchi].type() == "empty"
+             || mesh_.boundary()[patchi].coupled()
+            )
+            {
+                continue;
+            }
+
+            if
+            (
+                isA<updateablePatchTypes::updateableSnGrad>
+                (
+                    p.boundaryField()[patchi]
+                )
+            )
+            {
+                hasUpdateablePressureSnGrad = true;
+            }
+        }
+
+        forAll(p.boundaryFieldRef(), patchi)
+        {
+            p.boundaryFieldRef()[patchi] == pBaseBoundary[patchi];
+        }
+
+        if (!hasUpdateablePressureSnGrad)
+        {
+            p.correctBoundaryConditions();
+        }
+    };
+
+    auto restoreState = [&]()
+    {
+        U.primitiveFieldRef() = UBaseInternal;
+        p.primitiveFieldRef() = pBaseInternal;
+        phi.primitiveFieldRef() = phiBaseInternal;
+
+        forAll(U.boundaryFieldRef(), patchi)
+        {
+            U.boundaryFieldRef()[patchi] == UBaseBoundary[patchi];
+        }
+        U.correctBoundaryConditions();
+
+        forAll(p.boundaryFieldRef(), patchi)
+        {
+            p.boundaryFieldRef()[patchi] == pBaseBoundary[patchi];
+        }
+        enforcePressureBoundaryState();
+
+        forAll(phi.boundaryFieldRef(), patchi)
+        {
+            phi.boundaryFieldRef()[patchi] == phiBaseBoundary[patchi];
+        }
+    };
+
+    auto checkStateSizes = [&](const SimpleMapState& state, const word& where)
+    {
+        if
+        (
+            state.U.size() != mesh_.nCells()
+         || state.p.size() != mesh_.nCells()
+         || state.phiInternal.size() != mesh_.nInternalFaces()
+         || state.phiBoundary.size() != mesh_.boundary().size()
+        )
+        {
+            FatalErrorInFunction
+                << "SimpleMapState size mismatch in " << where
+                << exit(FatalError);
+        }
+        forAll(state.phiBoundary, patchi)
+        {
+            if (state.phiBoundary[patchi].size() != mesh_.boundary()[patchi].size())
+            {
+                FatalErrorInFunction
+                    << "SimpleMapState boundary size mismatch in " << where
+                    << " on patch " << mesh_.boundary()[patchi].name()
+                    << exit(FatalError);
+            }
+        }
+    };
+
+    auto stateAxpy =
+        [&](SimpleMapState& y, const scalar a, const SimpleMapState& x)
+    {
+        checkStateSizes(y, "fixedPointAdjointIdentity stateAxpy y");
+        checkStateSizes(x, "fixedPointAdjointIdentity stateAxpy x");
+
+        y.U += a*x.U;
+        y.p += a*x.p;
+        y.phiInternal += a*x.phiInternal;
+        forAll(y.phiBoundary, patchi)
+        {
+            y.phiBoundary[patchi] += a*x.phiBoundary[patchi];
+        }
+    };
+
+    auto stateScale = [&](SimpleMapState& y, const scalar a)
+    {
+        checkStateSizes(y, "fixedPointAdjointIdentity stateScale");
+
+        y.U *= a;
+        y.p *= a;
+        y.phiInternal *= a;
+        forAll(y.phiBoundary, patchi)
+        {
+            y.phiBoundary[patchi] *= a;
+        }
+    };
+
+    auto projectStateDirection = [&](SimpleMapState& state)
+    {
+        projectValidVectorComponents(state.U);
+        projectPressureDirection(state.p);
+    };
+
+    auto seedStateBlocks =
+        [&]
+        (
+            const SimpleMapSeed& seed,
+            const SimpleMapState& state,
+            scalar& uPart,
+            scalar& pPart,
+            scalar& phiInternalPart,
+            scalar& phiBoundaryPart
+        )
+    {
+        checkSimpleMapSeedSizes(seed, "fixedPointAdjointIdentity seed");
+        checkStateSizes(state, "fixedPointAdjointIdentity state");
+
+        uPart = Zero;
+        pPart = Zero;
+        phiInternalPart = Zero;
+        phiBoundaryPart = Zero;
+
+        forAll(seed.barU, celli)
+        {
+            uPart += seed.barU[celli] & state.U[celli];
+            pPart += seed.barp[celli]*state.p[celli];
+        }
+
+        forAll(seed.barPhiInternal, facei)
+        {
+            phiInternalPart +=
+                seed.barPhiInternal[facei]*state.phiInternal[facei];
+        }
+
+        forAll(seed.barPhiBoundary, patchi)
+        {
+            forAll(seed.barPhiBoundary[patchi], facei)
+            {
+                phiBoundaryPart +=
+                    seed.barPhiBoundary[patchi][facei]
+                   *state.phiBoundary[patchi][facei];
+            }
+        }
+
+        reduce(uPart, sumOp<scalar>());
+        reduce(pPart, sumOp<scalar>());
+        reduce(phiInternalPart, sumOp<scalar>());
+        reduce(phiBoundaryPart, sumOp<scalar>());
+    };
+
+    auto installState = [&](const SimpleMapState& state)
+    {
+        checkStateSizes(state, "fixedPointAdjointIdentity installState");
+
+        U.primitiveFieldRef() = state.U;
+        p.primitiveFieldRef() = state.p;
+        phi.primitiveFieldRef() = state.phiInternal;
+
+        forAll(U.boundaryFieldRef(), patchi)
+        {
+            U.boundaryFieldRef()[patchi] == UBaseBoundary[patchi];
+        }
+        U.correctBoundaryConditions();
+
+        forAll(p.boundaryFieldRef(), patchi)
+        {
+            p.boundaryFieldRef()[patchi] == pBaseBoundary[patchi];
+        }
+        enforcePressureBoundaryState();
+
+        forAll(phi.boundaryFieldRef(), patchi)
+        {
+            phi.boundaryFieldRef()[patchi] == state.phiBoundary[patchi];
+        }
+    };
+
+    auto mapStateDifference =
+        [&]
+        (
+            const SimpleMapState& plus,
+            const SimpleMapState& minus,
+            const scalar eps
+        )
+    {
+        SimpleMapState diff(plus);
+        stateAxpy(diff, scalar(-1), minus);
+        stateScale(diff, scalar(1)/(2*eps));
+        projectStateDirection(diff);
+        return diff;
+    };
+
+    auto applyMx =
+        [&]
+        (
+            const SimpleMapState& base,
+            const SimpleMapState& direction,
+            const scalar eps,
+            const word& namePrefix
+        )
+    {
+        SimpleMapState plus(base);
+        stateAxpy(plus, eps, direction);
+        installState(plus);
+        SimpleMapState mapPlus =
+            primalSimpleMapStateAtFrozenState(namePrefix + "Plus");
+
+        SimpleMapState minus(base);
+        stateAxpy(minus, -eps, direction);
+        installState(minus);
+        SimpleMapState mapMinus =
+            primalSimpleMapStateAtFrozenState(namePrefix + "Minus");
+
+        restoreState();
+        return mapStateDifference(mapPlus, mapMinus, eps);
+    };
+
+    auto countMomentumSignCrossings =
+        [&](const SimpleMapState& direction, const scalar eps)
+    {
+        label nCross = 0;
+
+        forAll(phiBaseInternal, facei)
+        {
+            const scalar base = phiBaseInternal[facei];
+            const scalar plus = base + eps*direction.phiInternal[facei];
+            const scalar minus = base - eps*direction.phiInternal[facei];
+            if
+            (
+                (plus > scalar(0) && minus < scalar(0))
+             || (plus < scalar(0) && minus > scalar(0))
+            )
+            {
+                ++nCross;
+            }
+        }
+
+        forAll(phiBaseBoundary, patchi)
+        {
+            forAll(phiBaseBoundary[patchi], facei)
+            {
+                const scalar base = phiBaseBoundary[patchi][facei];
+                const scalar plus =
+                    base + eps*direction.phiBoundary[patchi][facei];
+                const scalar minus =
+                    base - eps*direction.phiBoundary[patchi][facei];
+                if
+                (
+                    (plus > scalar(0) && minus < scalar(0))
+                 || (plus < scalar(0) && minus > scalar(0))
+                )
+                {
+                    ++nCross;
+                }
+            }
+        }
+
+        reduce(nCross, sumOp<label>());
+        return nCross;
+    };
+
+    SimpleMapState baseState(mesh_);
+    baseState.U = UBaseInternal;
+    baseState.p = pBaseInternal;
+    baseState.phiInternal = phiBaseInternal;
+    forAll(baseState.phiBoundary, patchi)
+    {
+        baseState.phiBoundary[patchi] = phiBaseBoundary[patchi];
+    }
+
+    SimpleMapState direction(mesh_);
+    forAll(direction.U, celli)
+    {
+        direction.U[celli] =
+            vector
+            (
+                scalar((257*celli + 191) % 337)/scalar(337) - scalar(0.5),
+                scalar((263*celli + 193) % 347)/scalar(347) - scalar(0.5),
+                scalar((269*celli + 197) % 349)/scalar(349) - scalar(0.5)
+            );
+        direction.p[celli] =
+            scalar((271*celli + 199) % 353)/scalar(353) - scalar(0.5);
+    }
+    projectStateDirection(direction);
+
+    forAll(direction.phiInternal, facei)
+    {
+        direction.phiInternal[facei] =
+            scalar((277*facei + 211) % 359)/scalar(359) - scalar(0.5);
+    }
+
+    forAll(direction.phiBoundary, patchi)
+    {
+        forAll(direction.phiBoundary[patchi], facei)
+        {
+            direction.phiBoundary[patchi][facei] =
+                scalar((281*(facei + 1) + 223*(patchi + 1)) % 367)
+               /scalar(367) - scalar(0.5);
+        }
+    }
+
+    SimpleMapState directionU(direction);
+    const scalar identityUPScale = scalar(10);
+    directionU.U *= identityUPScale;
+    directionU.p = Zero;
+    directionU.phiInternal = Zero;
+    forAll(directionU.phiBoundary, patchi)
+    {
+        directionU.phiBoundary[patchi] = Zero;
+    }
+
+    SimpleMapState directionP(direction);
+    directionP.U = vector::zero;
+    directionP.p *= identityUPScale;
+    directionP.phiInternal = Zero;
+    forAll(directionP.phiBoundary, patchi)
+    {
+        directionP.phiBoundary[patchi] = Zero;
+    }
+
+    SimpleMapState directionPhiISmooth(mesh_);
+    const scalar maxMagPhiBase = max(gMax(mag(phiBaseInternal)), scalar(1));
+    const scalar nearZeroPhiBase = scalar(1e-12)*maxMagPhiBase;
+    forAll(directionPhiISmooth.phiInternal, facei)
+    {
+        const scalar phif = phiBaseInternal[facei];
+        if (mag(phif) > nearZeroPhiBase)
+        {
+            const scalar rnd =
+                scalar((277*facei + 211) % 359)/scalar(359)
+              - scalar(0.5);
+            directionPhiISmooth.phiInternal[facei] = rnd*mag(phif);
+        }
+    }
+
+    SimpleMapState directionPhiBSmooth(mesh_);
+    forAll(directionPhiBSmooth.phiBoundary, patchi)
+    {
+        const scalar patchMaxPhi =
+            max(gMax(mag(phiBaseBoundary[patchi])), scalar(1));
+        const scalar nearZeroPatchPhi = scalar(1e-12)*patchMaxPhi;
+
+        forAll(directionPhiBSmooth.phiBoundary[patchi], facei)
+        {
+            const scalar phif = phiBaseBoundary[patchi][facei];
+            if (mag(phif) > nearZeroPatchPhi)
+            {
+                const scalar rnd =
+                    scalar((281*(facei + 1) + 223*(patchi + 1)) % 367)
+                   /scalar(367) - scalar(0.5);
+                directionPhiBSmooth.phiBoundary[patchi][facei] =
+                    rnd*mag(phif);
+            }
+        }
+    }
+
+    const scalar identitySmoothPhiScale = scalar(1000);
+    directionPhiISmooth.phiInternal *= identitySmoothPhiScale;
+    forAll(directionPhiBSmooth.phiBoundary, patchi)
+    {
+        directionPhiBSmooth.phiBoundary[patchi] *= identitySmoothPhiScale;
+    }
+
+    Info<< "ATC-T fixed-point adjoint solved identity smooth phi scale: "
+        << identitySmoothPhiScale
+        << " U/P scale " << identityUPScale
+        << ". Momentum sign crossings are still checked explicitly."
+        << endl;
+
+    SimpleMapState directionSmooth(directionU);
+    directionSmooth.phiInternal = directionPhiISmooth.phiInternal;
+    forAll(directionSmooth.phiBoundary, patchi)
+    {
+        directionSmooth.phiBoundary[patchi] =
+            directionPhiBSmooth.phiBoundary[patchi];
+    }
+
+    auto runSolvedIdentity =
+        [&]
+        (
+            const word& directionName,
+            const SimpleMapState& dir,
+            const scalar eps,
+            const label epsi
+        )
+    {
+        const label nCross = countMomentumSignCrossings(dir, eps);
+        if (nCross)
+        {
+            FatalErrorInFunction
+                << "Fixed-point adjoint identity direction "
+                << directionName << " eps " << eps
+                << " crosses " << nCross
+                << " momentum-flux signs." << exit(FatalError);
+        }
+
+        SimpleMapState Mx =
+            applyMx
+            (
+                baseState,
+                dir,
+                eps,
+                "ATCTFPSolvedAdjointIdentity" + directionName + Foam::name(epsi)
+            );
+        SimpleMapState AState(dir);
+        stateAxpy(AState, scalar(-1), Mx);
+        projectStateDirection(AState);
+
+        scalar lhsU = Zero;
+        scalar lhsP = Zero;
+        scalar lhsPhiI = Zero;
+        scalar lhsPhiB = Zero;
+        scalar rhsU = Zero;
+        scalar rhsP = Zero;
+        scalar rhsPhiI = Zero;
+        scalar rhsPhiB = Zero;
+        seedStateBlocks(rhs, dir, lhsU, lhsP, lhsPhiI, lhsPhiB);
+        seedStateBlocks(result.psi, AState, rhsU, rhsP, rhsPhiI, rhsPhiB);
+
+        const scalar lhs = lhsU + lhsP + lhsPhiI + lhsPhiB;
+        const scalar rhsVal = rhsU + rhsP + rhsPhiI + rhsPhiB;
+        const scalar signedGap = lhs - rhsVal;
+        const scalar absoluteGap = mag(signedGap);
+        const scalar symmetricRelativeGap =
+            absoluteGap/(mag(lhs) + mag(rhsVal) + VSMALL);
+        const scalar contractionL1Scale =
+            mag(lhsU) + mag(lhsP) + mag(lhsPhiI) + mag(lhsPhiB)
+          + mag(rhsU) + mag(rhsP) + mag(rhsPhiI) + mag(rhsPhiB)
+          + VSMALL;
+        const scalar gapOverL1 = absoluteGap/contractionL1Scale;
+        const bool accepted =
+            symmetricRelativeGap < scalar(1e-5)
+         || (absoluteGap < scalar(1e-7) && gapOverL1 < scalar(1e-6));
+
+        Info<< "ATC-T fixed-point adjoint solved identity: direction "
+            << directionName
+            << " eps " << eps
+            << " lhs " << lhs
+            << " rhs " << rhsVal
+            << " signedGap " << signedGap
+            << " absoluteGap " << absoluteGap
+            << " symmetricRelativeGap " << symmetricRelativeGap
+            << " gapOverL1 " << gapOverL1
+            << " nMomentumPhiSignCrossings " << nCross
+            << " accepted " << accepted
+            << endl;
+
+        if (!accepted)
+        {
+            FatalErrorInFunction
+                << "Fixed-point adjoint solved identity failed for direction "
+                << directionName << " eps " << eps
+                << ": lhs " << lhs << ", rhs " << rhsVal
+                << ", signedGap " << signedGap
+                << ", symmetricRelativeGap " << symmetricRelativeGap
+                << ", gapOverL1 " << gapOverL1
+                << exit(FatalError);
+        }
+    };
+
+    scalarList identityEps(2, Zero);
+    identityEps[0] = 3e-6;
+    identityEps[1] = 1e-6;
+
+    forAll(identityEps, epsi)
+    {
+        const scalar eps = identityEps[epsi];
+        runSolvedIdentity("UOnly", directionU, eps, epsi);
+        runSolvedIdentity("POnly", directionP, eps, epsi);
+        runSolvedIdentity
+        (
+            "PhiInternalSmoothOnly",
+            directionPhiISmooth,
+            eps,
+            epsi
+        );
+        runSolvedIdentity
+        (
+            "PhiBoundarySmoothOnly",
+            directionPhiBSmooth,
+            eps,
+            epsi
+        );
+        runSolvedIdentity("combinedSmooth", directionSmooth, eps, epsi);
+    }
+
+    restoreState();
+
+    auto makeSeed = [&](const label salt)
+    {
+        SimpleMapSeed seed(mesh_);
+
+        forAll(seed.barU, celli)
+        {
+            seed.barU[celli].x() =
+                scalar(((23*celli + 29*salt) % 1049) - 524)/scalar(547);
+            seed.barU[celli].y() =
+                scalar(((31*celli + 37*salt) % 1051) - 525)/scalar(557);
+            seed.barU[celli].z() =
+                scalar(((41*celli + 43*salt) % 1061) - 530)/scalar(563);
+            seed.barp[celli] =
+                scalar(((47*celli + 53*salt) % 1063) - 531)/scalar(569);
+        }
+
+        forAll(seed.barPhiInternal, facei)
+        {
+            seed.barPhiInternal[facei] =
+                scalar(((59*facei + 61*salt) % 1069) - 534)/scalar(571);
+        }
+
+        forAll(seed.barPhiBoundary, patchi)
+        {
+            forAll(seed.barPhiBoundary[patchi], facei)
+            {
+                seed.barPhiBoundary[patchi][facei] =
+                    scalar
+                    (
+                        (
+                            67*(facei + 1)
+                          + 71*(patchi + 1)
+                          + 73*salt
+                        ) % 1087 - 543
+                    )/scalar(577);
+            }
+        }
+
+        projectSimpleMapSeed(seed);
+        return seed;
+    };
+
+    for (label rhsI = 0; rhsI < 2; ++rhsI)
+    {
+        SimpleMapSeed randomRhs = makeSeed(701 + rhsI);
+        FixedPointAdjointResult randomResult =
+            solveFixedPointAdjointSystem(randomRhs, rAtUBase);
+
+        Info<< "ATC-T fixed-point adjoint random RHS solve: index "
+            << rhsI
+            << " converged " << randomResult.converged
+            << " iterations " << randomResult.iterations
+            << " finalRelativeResidual "
+            << randomResult.finalRelativeResidual
+            << endl;
+
+        if
+        (
+            !randomResult.converged
+         || randomResult.finalRelativeResidual > scalar(1e-8)
+        )
+        {
+            FatalErrorInFunction
+                << "Fixed-point adjoint random RHS solve failed for index "
+                << rhsI << exit(FatalError);
+        }
+    }
+
+    if (checkFixedPointAdjointRepeatability_)
+    {
+        FixedPointAdjointResult repeat =
+            solveFixedPointAdjointSystem(rhs, rAtUBase);
+
+        const scalar solutionDiff =
+            normSimpleMapSeed
+            (
+                repeat.psi,
+                UStateScale,
+                pStateScale,
+                phiStateScale
+            );
+        SimpleMapSeed diff(repeat.psi);
+        axpySimpleMapSeed(diff, scalar(-1), result.psi);
+
+        const scalar diffNorm =
+            normSimpleMapSeed(diff, UStateScale, pStateScale, phiStateScale);
+        const scalar relDiff =
+            diffNorm/max(solutionDiff, VSMALL);
+
+        scalar historyMaxDiff = Zero;
+        if (repeat.residualHistory.size() != result.residualHistory.size())
+        {
+            historyMaxDiff = GREAT;
+        }
+        else
+        {
+            forAll(repeat.residualHistory, i)
+            {
+                historyMaxDiff =
+                    max
+                    (
+                        historyMaxDiff,
+                        mag(repeat.residualHistory[i] - result.residualHistory[i])
+                    );
+            }
+        }
+
+        Info<< "ATC-T fixed-point adjoint repeatability: iterations "
+            << repeat.iterations
+            << " restarts " << repeat.restarts
+            << " solutionRelativeDiff " << relDiff
+            << " historyMaxDiff " << historyMaxDiff
+            << endl;
+
+        if
+        (
+            repeat.iterations != result.iterations
+         || repeat.restarts != result.restarts
+         || historyMaxDiff > scalar(1e-13)
+         || relDiff > scalar(1e-12)
+        )
+        {
+            FatalErrorInFunction
+                << "Fixed-point adjoint repeatability check failed."
+                << exit(FatalError);
+        }
+    }
+}
+
+
+void Foam::thermalAdjointSimple::checkFixedPointAdjointNeumannSeries
+(
+    const SimpleMapSeed& rhs,
+    const FixedPointAdjointResult& result,
+    const volScalarField& rAtUBase,
+    const scalar UStateScale,
+    const scalar pStateScale,
+    const scalar phiStateScale
+)
+{
+    SimpleMapSeed psiNeumann(mesh_);
+    zeroSimpleMapSeed(psiNeumann);
+    SimpleMapSeed term(rhs);
+    projectSimpleMapSeed(term);
+
+    const scalar rhsNorm =
+        normSimpleMapSeed(rhs, UStateScale, pStateScale, phiStateScale);
+    const scalar psiNorm =
+        normSimpleMapSeed
+        (
+            result.psi,
+            UStateScale,
+            pStateScale,
+            phiStateScale
+        );
+
+    for (label iter = 0; iter < fixedPointAdjointNeumannIters_; ++iter)
+    {
+        axpySimpleMapSeed(psiNeumann, scalar(1), term);
+        projectSimpleMapSeed(psiNeumann);
+
+        SimpleMapSeed diff(psiNeumann);
+        axpySimpleMapSeed(diff, scalar(-1), result.psi);
+
+        const scalar termRel =
+            normSimpleMapSeed(term, UStateScale, pStateScale, phiStateScale)
+           /max(rhsNorm, VSMALL);
+        const scalar psiRel =
+            normSimpleMapSeed(diff, UStateScale, pStateScale, phiStateScale)
+           /max(psiNorm, VSMALL);
+
+        Info<< "ATC-T fixed-point adjoint Neumann: iter "
+            << iter
+            << " termRel " << termRel
+            << " psiRelToGMRES " << psiRel
+            << endl;
+
+        term = reverseOneSimpleMapSeed(term, rAtUBase);
+        projectSimpleMapSeed(term);
+    }
+}
+
+
+void Foam::thermalAdjointSimple::writeFixedPointAdjointFields
+(
+    const SimpleMapSeed& psi
+) const
+{
+    checkSimpleMapSeedSizes(psi, "writeFixedPointAdjointFields");
+
+    volVectorField psiU
+    (
+        IOobject
+        (
+            "ATCTpsiUState",
+            mesh_.time().timeName(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::AUTO_WRITE
+        ),
+        primalVars_.U()
+    );
+    psiU.primitiveFieldRef() = psi.barU;
+    forAll(psiU.boundaryFieldRef(), patchi)
+    {
+        psiU.boundaryFieldRef()[patchi] == vector::zero;
+    }
+    psiU.write();
+
+    volScalarField psiP
+    (
+        IOobject
+        (
+            "ATCTpsiPState",
+            mesh_.time().timeName(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::AUTO_WRITE
+        ),
+        primalVars_.p()
+    );
+    psiP.primitiveFieldRef() = psi.barp;
+    forAll(psiP.boundaryFieldRef(), patchi)
+    {
+        psiP.boundaryFieldRef()[patchi] == Zero;
+    }
+    psiP.write();
+
+    surfaceScalarField psiPhi
+    (
+        IOobject
+        (
+            "ATCTpsiPhiState",
+            mesh_.time().timeName(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::AUTO_WRITE
+        ),
+        primalVars_.phi()
+    );
+    psiPhi.primitiveFieldRef() = psi.barPhiInternal;
+    forAll(psiPhi.boundaryFieldRef(), patchi)
+    {
+        psiPhi.boundaryFieldRef()[patchi] == psi.barPhiBoundary[patchi];
+    }
+    psiPhi.write();
+
+    Info<< "ATC-T fixed-point adjoint fields written: "
+        << psiU.name() << ", " << psiP.name() << ", " << psiPhi.name()
+        << ". These are algebraic fixed-point state adjoints under the "
+        << "validated discrete state pairing. ATCTpsiUState is not "
+        << "automatically the same normalisation as OpenFOAM's standard "
+        << "volume-field Ua." << endl;
+}
+
+
+void Foam::thermalAdjointSimple::runFixedPointAdjointSolve()
+{
+    if (!solveFixedPointAdjoint_)
+    {
+        return;
+    }
+
+    validateFixedPointAdjointScope();
+
+    Info<< "ATC-T fixed-point adjoint controls: restart "
+        << fixedPointAdjointRestart_
+        << " maxIters " << fixedPointAdjointMaxIters_
+        << " relTol " << fixedPointAdjointRelTol_
+        << " absTol " << fixedPointAdjointAbsTol_
+        << " breakdownTol " << fixedPointAdjointBreakdownTol_
+        << " neumannIters " << fixedPointAdjointNeumannIters_
+        << endl;
+
+    scalar UStateScale = Zero;
+    scalar pStateScale = Zero;
+    scalar phiStateScale = Zero;
+    fixedPointAdjointStateScales(UStateScale, pStateScale, phiStateScale);
+
+    Info<< "ATC-T fixed-point adjoint state scales: U "
+        << UStateScale
+        << " p " << pStateScale
+        << " phi " << phiStateScale
+        << endl;
+
+    tmp<volScalarField> tRAtUBase = fixedPointAdjointRAtUBase();
+    const volScalarField& rAtUBase = tRAtUBase();
+
+    SimpleMapSeed rhs = fixedPointObjectiveSeed();
+
+    if (checkFixedPointAdjointOperator_)
+    {
+        checkFixedPointAdjointOperator
+        (
+            rAtUBase,
+            UStateScale,
+            pStateScale,
+            phiStateScale
+        );
+    }
+
+    FixedPointAdjointResult result =
+        solveFixedPointAdjointSystem(rhs, rAtUBase);
+
+    if (!result.converged)
+    {
+        FatalErrorInFunction
+            << "Fixed-point adjoint GMRES did not converge within "
+            << fixedPointAdjointMaxIters_ << " iterations. Final relative "
+            << "residual: " << result.finalRelativeResidual
+            << exit(FatalError);
+    }
+
+    if (checkFixedPointAdjointSolve_)
+    {
+        checkFixedPointAdjointSolution
+        (
+            rhs,
+            result,
+            rAtUBase,
+            UStateScale,
+            pStateScale,
+            phiStateScale
+        );
+    }
+
+    if (checkFixedPointAdjointNeumann_)
+    {
+        checkFixedPointAdjointNeumannSeries
+        (
+            rhs,
+            result,
+            rAtUBase,
+            UStateScale,
+            pStateScale,
+            phiStateScale
+        );
+    }
+
+    if (writeFixedPointAdjointFields_)
+    {
+        writeFixedPointAdjointFields(result.psi);
+    }
+
+    Info<< "ATC-T fixed-point adjoint solve complete. betaMult is unchanged "
+        << "in this pass." << endl;
 }
 
 
@@ -20865,6 +23249,11 @@ void Foam::thermalAdjointSimple::checkFixedPointMapAdjointSensitivity
         return;
     }
 
+    Info<< "ATC-T fixed-point map adjoint check warning: this is a "
+        << "truncated Neumann/design diagnostic, not the fixed-point adjoint "
+        << "linear solve. Use solveFixedPointAdjoint for the converged "
+        << "matrix-free solution." << endl;
+
     const topOVariablesBase& vars =
         mesh_.lookupObject<topOVariablesBase>("topOVars");
     const topOZones& zones = vars.getTopOZones();
@@ -24619,6 +27008,18 @@ Foam::thermalAdjointSimple::thermalAdjointSimple
     fixedPointTangentFDEps_(1e-6),
     fixedPointTangentCells_({707, 708, 709}),
     checkFixedPointTangentAgainstFD_(false),
+    solveFixedPointAdjoint_(false),
+    checkFixedPointAdjointOperator_(false),
+    checkFixedPointAdjointSolve_(false),
+    checkFixedPointAdjointRepeatability_(false),
+    writeFixedPointAdjointFields_(true),
+    checkFixedPointAdjointNeumann_(false),
+    fixedPointAdjointRestart_(20),
+    fixedPointAdjointMaxIters_(200),
+    fixedPointAdjointNeumannIters_(50),
+    fixedPointAdjointRelTol_(1e-9),
+    fixedPointAdjointAbsTol_(1e-12),
+    fixedPointAdjointBreakdownTol_(1e-14),
     fixedPointValidationMaxIters_(200),
     fixedPointValidationRelTol_(1e-9),
     fixedPointValidationBetaEps_(1e-6),
@@ -24723,6 +27124,54 @@ Foam::thermalAdjointSimple::thermalAdjointSimple
             "checkFixedPointTangentAgainstFD",
             false
         );
+    solveFixedPointAdjoint_ =
+        thermalDict.getOrDefault<bool>("solveFixedPointAdjoint", false);
+    checkFixedPointAdjointOperator_ =
+        thermalDict.getOrDefault<bool>
+        (
+            "checkFixedPointAdjointOperator",
+            false
+        );
+    checkFixedPointAdjointSolve_ =
+        thermalDict.getOrDefault<bool>
+        (
+            "checkFixedPointAdjointSolve",
+            false
+        );
+    checkFixedPointAdjointRepeatability_ =
+        thermalDict.getOrDefault<bool>
+        (
+            "checkFixedPointAdjointRepeatability",
+            false
+        );
+    writeFixedPointAdjointFields_ =
+        thermalDict.getOrDefault<bool>
+        (
+            "writeFixedPointAdjointFields",
+            true
+        );
+    checkFixedPointAdjointNeumann_ =
+        thermalDict.getOrDefault<bool>
+        (
+            "checkFixedPointAdjointNeumann",
+            false
+        );
+    fixedPointAdjointRestart_ =
+        thermalDict.getOrDefault<label>("fixedPointAdjointRestart", 20);
+    fixedPointAdjointMaxIters_ =
+        thermalDict.getOrDefault<label>("fixedPointAdjointMaxIters", 200);
+    fixedPointAdjointNeumannIters_ =
+        thermalDict.getOrDefault<label>("fixedPointAdjointNeumannIters", 50);
+    fixedPointAdjointRelTol_ =
+        thermalDict.getOrDefault<scalar>("fixedPointAdjointRelTol", 1e-9);
+    fixedPointAdjointAbsTol_ =
+        thermalDict.getOrDefault<scalar>("fixedPointAdjointAbsTol", 1e-12);
+    fixedPointAdjointBreakdownTol_ =
+        thermalDict.getOrDefault<scalar>
+        (
+            "fixedPointAdjointBreakdownTol",
+            1e-14
+        );
     fixedPointValidationMaxIters_ =
         thermalDict.getOrDefault<label>
         (
@@ -24749,6 +27198,7 @@ Foam::thermalAdjointSimple::thermalAdjointSimple
         );
 
     validateExactThermalCouplingOptions();
+    validateFixedPointAdjointControls();
 
     TaPtr_.reset
     (
@@ -24905,6 +27355,66 @@ bool Foam::thermalAdjointSimple::readDict(const dictionary& dict)
                 "checkFixedPointTangentAgainstFD",
                 false
             );
+        solveFixedPointAdjoint_ =
+            thermalDict.getOrDefault<bool>("solveFixedPointAdjoint", false);
+        checkFixedPointAdjointOperator_ =
+            thermalDict.getOrDefault<bool>
+            (
+                "checkFixedPointAdjointOperator",
+                false
+            );
+        checkFixedPointAdjointSolve_ =
+            thermalDict.getOrDefault<bool>
+            (
+                "checkFixedPointAdjointSolve",
+                false
+            );
+        checkFixedPointAdjointRepeatability_ =
+            thermalDict.getOrDefault<bool>
+            (
+                "checkFixedPointAdjointRepeatability",
+                false
+            );
+        writeFixedPointAdjointFields_ =
+            thermalDict.getOrDefault<bool>
+            (
+                "writeFixedPointAdjointFields",
+                true
+            );
+        checkFixedPointAdjointNeumann_ =
+            thermalDict.getOrDefault<bool>
+            (
+                "checkFixedPointAdjointNeumann",
+                false
+            );
+        fixedPointAdjointRestart_ =
+            thermalDict.getOrDefault<label>("fixedPointAdjointRestart", 20);
+        fixedPointAdjointMaxIters_ =
+            thermalDict.getOrDefault<label>("fixedPointAdjointMaxIters", 200);
+        fixedPointAdjointNeumannIters_ =
+            thermalDict.getOrDefault<label>
+            (
+                "fixedPointAdjointNeumannIters",
+                50
+            );
+        fixedPointAdjointRelTol_ =
+            thermalDict.getOrDefault<scalar>
+            (
+                "fixedPointAdjointRelTol",
+                1e-9
+            );
+        fixedPointAdjointAbsTol_ =
+            thermalDict.getOrDefault<scalar>
+            (
+                "fixedPointAdjointAbsTol",
+                1e-12
+            );
+        fixedPointAdjointBreakdownTol_ =
+            thermalDict.getOrDefault<scalar>
+            (
+                "fixedPointAdjointBreakdownTol",
+                1e-14
+            );
         fixedPointValidationMaxIters_ =
             thermalDict.getOrDefault<label>
             (
@@ -24933,6 +27443,7 @@ bool Foam::thermalAdjointSimple::readDict(const dictionary& dict)
             );
 
         validateExactThermalCouplingOptions();
+        validateFixedPointAdjointControls();
 
         return true;
     }
@@ -24986,6 +27497,11 @@ void Foam::thermalAdjointSimple::topOSensMultiplier
     if (checkFullStateMapTranspose_)
     {
         checkFullStateMapTranspose();
+    }
+
+    if (solveFixedPointAdjoint_)
+    {
+        runFixedPointAdjointSolve();
     }
 
     const bool needExactFluxDiagnostic =
