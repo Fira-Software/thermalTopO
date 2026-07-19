@@ -20,6 +20,7 @@
 #include "inletOutletFvPatchFields.H"
 #include "fixedFluxExtrapolatedPressureFvPatchScalarField.H"
 #include "linear.H"
+#include "snGradScheme.H"
 #include "fvm.H"
 #include "fvc.H"
 #include "addToRunTimeSelectionTable.H"
@@ -979,6 +980,17 @@ void Foam::thermalAdjointSimple::validateFixedPointAdjointScope() const
             << exit(FatalError);
     }
 
+    if (solverControl_().nNonOrthCorr() != 0)
+    {
+        FatalErrorInFunction
+            << "solveFixedPointAdjoint requires "
+            << "nNonOrthogonalCorrectors 0. The validated one-step SIMPLE "
+            << "map contains one pressure equation solve and final flux "
+            << "update; every non-orthogonal pressure corrector would be an "
+            << "additional operation in M and M_x^T. Current value: "
+            << solverControl_().nNonOrthCorr() << exit(FatalError);
+    }
+
     if (Pstream::parRun())
     {
         FatalErrorInFunction
@@ -1006,6 +1018,11 @@ void Foam::thermalAdjointSimple::validateFixedPointAdjointScope() const
                 << "patch " << mesh_.boundary()[patchi].name() << "."
                 << exit(FatalError);
         }
+    }
+
+    if (useAnalyticFixedPointAdjointBeta_)
+    {
+        validateProductionFixedPointBetaScope();
     }
 }
 
@@ -1064,6 +1081,198 @@ void Foam::thermalAdjointSimple::validateFixedPointObjectiveScope() const
 
     Info<< "ATC-T fixed-point adjoint objective scope: exact reduced "
         << "thermal objective RHS only." << endl;
+}
+
+
+void Foam::thermalAdjointSimple::validateProductionFixedPointBetaScope() const
+{
+    if (!useAnalyticFixedPointAdjointBeta_)
+    {
+        return;
+    }
+
+    if (props_.hasTemperatureDependentThermalCoefficients())
+    {
+        FatalErrorInFunction
+            << "useAnalyticFixedPointAdjointBeta requires constant thermal "
+            << "properties in the current production scope. Runtime property "
+            << "flags: variableDFluid=" << Switch(props_.variableDFluid())
+            << ", variableDSolid=" << Switch(props_.variableDSolid())
+            << ", variableRhoCp=" << Switch(props_.variableRhoCp())
+            << ". The fixed-point flow reverse remains valid, but the "
+            << "current scalar transpose is only the frozen-property/Picard "
+            << "transpose. The full nonlinear thermal Jacobian would require "
+            << "derivatives of A_T(T) and b_T(T)."
+            << exit(FatalError);
+    }
+
+    fv::options& fvOptions(fv::options::New(mesh_));
+    const word& UName = primalVars_.U().name();
+    const word TName("T");
+
+    label nMomentumTopOSource = 0;
+    label nUnsupportedMomentum = 0;
+    label nThermalOptions = 0;
+
+    const PtrList<fv::option>& sources = fvOptions;
+    forAll(sources, sourcei)
+    {
+        const fv::option& source = sources[sourcei];
+
+        if (!source.active())
+        {
+            continue;
+        }
+
+        if (source.applyToField(UName) != -1)
+        {
+            if (source.type() == "topOSource")
+            {
+                ++nMomentumTopOSource;
+            }
+            else
+            {
+                ++nUnsupportedMomentum;
+                Info<< "ATC-T unsupported production momentum fvOption: "
+                    << source.name() << " type " << source.type()
+                    << " applies to " << UName << endl;
+            }
+        }
+
+        if (source.applyToField(TName) != -1)
+        {
+            ++nThermalOptions;
+            Info<< "ATC-T unsupported production thermal fvOption: "
+                << source.name() << " type " << source.type()
+                << " applies to " << TName << endl;
+        }
+    }
+
+    if (nUnsupportedMomentum)
+    {
+        FatalErrorInFunction
+            << "useAnalyticFixedPointAdjointBeta currently supports only the "
+            << "audited topOSource Brinkman momentum option on " << UName
+            << ". A different momentum fvOption could introduce beta or "
+            << "temperature dependence outside the validated M_beta^T psi "
+            << "chain." << exit(FatalError);
+    }
+
+    if (nMomentumTopOSource != 1)
+    {
+        FatalErrorInFunction
+            << "useAnalyticFixedPointAdjointBeta requires exactly one active "
+            << "topOSource applying to " << UName << ". Found "
+            << nMomentumTopOSource << "." << exit(FatalError);
+    }
+
+    if (nThermalOptions)
+    {
+        FatalErrorInFunction
+            << "useAnalyticFixedPointAdjointBeta currently supports no active "
+            << "thermal fvOptions on T. A scalar source can add terms to "
+            << "A_T(T) or b_T(T); temperature-dependent source derivatives "
+            << "are outside the current exact production scope."
+            << exit(FatalError);
+    }
+
+    Info<< "ATC-T production fixed-point beta scope: CONSTANT_PROPERTY_EXACT; "
+        << "one active topOSource momentum option on " << UName
+        << "; no active thermal fvOptions on T. The supported dependency "
+        << "graph is beta -> (U,p,phi) -> T -> J, with no T-dependent "
+        << "return path into the SIMPLE flow map." << endl;
+}
+
+
+void Foam::thermalAdjointSimple::validateThermalDiffusionCorrectionScope() const
+{
+    if (!useAnalyticFixedPointAdjointBeta_)
+    {
+        return;
+    }
+
+    const volScalarField& T = TRef();
+
+    tmp<fv::snGradScheme<scalar>> tSnGradScheme =
+        fv::snGradScheme<scalar>::New
+        (
+            mesh_,
+            mesh_.snGradScheme("snGrad(" + T.name() + ')')
+        );
+
+    const bool corrected = tSnGradScheme().corrected();
+    tmp<surfaceScalarField> tFullSnGrad = tSnGradScheme().snGrad(T);
+    const surfaceScalarField& fullSnGrad = tFullSnGrad();
+
+    scalar fullL1 = gSum(mag(fullSnGrad.primitiveField()));
+    scalar corrL1 = Zero;
+    scalar corrMax = Zero;
+    label maxPatch = -1;
+    label maxFace = -1;
+
+    forAll(fullSnGrad.boundaryField(), patchi)
+    {
+        fullL1 += gSum(mag(fullSnGrad.boundaryField()[patchi]));
+    }
+
+    if (corrected)
+    {
+        tmp<surfaceScalarField> tCorrection = tSnGradScheme().correction(T);
+        const surfaceScalarField& correction = tCorrection();
+
+        corrL1 = gSum(mag(correction.primitiveField()));
+        forAll(correction.primitiveField(), facei)
+        {
+            corrMax = max(corrMax, mag(correction[facei]));
+        }
+
+        forAll(correction.boundaryField(), patchi)
+        {
+            const fvsPatchScalarField& corrp =
+                correction.boundaryField()[patchi];
+
+            corrL1 += gSum(mag(corrp));
+            forAll(corrp, facei)
+            {
+                const scalar magCorr = mag(corrp[facei]);
+                if (magCorr > corrMax)
+                {
+                    corrMax = magCorr;
+                    maxPatch = patchi;
+                    maxFace = facei;
+                }
+            }
+        }
+    }
+
+    reduce(corrMax, maxOp<scalar>());
+
+    const scalar corrTol = scalar(1e-12)*max(fullL1, scalar(1));
+
+    Info<< "ATC-T production thermal diffusion scope: snGrad(T) scheme "
+        << tSnGradScheme().type()
+        << " corrected " << Switch(corrected)
+        << " fullSnGradL1 " << fullL1
+        << " explicitCorrectionL1 " << corrL1
+        << " explicitCorrectionMax " << corrMax
+        << " correctionTolerance " << corrTol
+        << " maxPatch " << maxPatch
+        << " maxFace " << maxFace
+        << endl;
+
+    if (corrected && corrL1 > corrTol)
+    {
+        FatalErrorInFunction
+            << "useAnalyticFixedPointAdjointBeta found a nonzero explicit "
+            << "thermal non-orthogonal snGrad correction. The current direct "
+            << "conductivity formula reverses the two-point orthogonal "
+            << "thermal diffusion coefficient only; a corrected "
+            << "non-orthogonal Laplacian requires reversing the explicit "
+            << "correction flux and its gradient reconstruction. "
+            << "explicitCorrectionL1 = " << corrL1
+            << ", tolerance = " << corrTol
+            << exit(FatalError);
+    }
 }
 
 
@@ -3390,6 +3599,8 @@ Foam::thermalAdjointSimple::reverseAdjustPhiExact
 
         forAll(phip, facei)
         {
+            // adjustPhi.C classifies negative boundary flux as inflow before
+            // patch adjustability is considered. phi == 0 is the branch point.
             if (phip[facei] < scalar(0))
             {
                 massIn -= phip[facei];
@@ -3447,6 +3658,7 @@ Foam::thermalAdjointSimple::reverseAdjustPhiExact
 
         forAll(phiPatch, facei)
         {
+            // Only positive adjustable outflow is scaled by massCorr.
             if (phiPatch[facei] > scalar(0))
             {
                 barMassCorr += seedPatch[facei]*phiPatch[facei];
@@ -33789,6 +34001,11 @@ void Foam::thermalAdjointSimple::topOSensMultiplier
         {
             checkFlowBlockTranspose(tSource());
         }
+    }
+
+    if (useAnalyticFixedPointAdjointBeta_)
+    {
+        validateThermalDiffusionCorrectionScope();
     }
 
     // Conductivity-interpolation contribution:

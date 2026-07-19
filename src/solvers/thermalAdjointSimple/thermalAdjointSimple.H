@@ -711,6 +711,12 @@ protected:
         //- Guard the fixed-point adjoint RHS to reduced thermal objectives
         void validateFixedPointObjectiveScope() const;
 
+        //- Guard production fixed-point beta sensitivity to its exact scope
+        void validateProductionFixedPointBetaScope() const;
+
+        //- Guard direct conductivity sensitivity against non-orthogonal terms
+        void validateThermalDiffusionCorrectionScope() const;
+
         //- Exact thermal sensitivity with respect to the pressure-corrected
         //- primal face flux
         tmp<surfaceScalarField> thermalFluxSensitivity() const;

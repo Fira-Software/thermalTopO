@@ -181,7 +181,10 @@ public:
         bool variableRhoCp() const noexcept { return bool(rhoPtr_); }
 
         //- True if the solid diffusivity is tabulated
-        bool variableDSolid() const noexcept { return bool(DSolidPtr_); }
+        bool variableDSolid() const noexcept;
+
+        //- True if any thermal coefficient is temperature-dependent
+        bool hasTemperatureDependentThermalCoefficients() const noexcept;
 
         //- True if several solid materials are labelled in the domain
         bool multiMaterial() const noexcept { return multiMaterial_; }

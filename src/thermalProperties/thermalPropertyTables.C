@@ -118,6 +118,32 @@ Foam::scalar Foam::thermalPropertyTables::materialDSolid
 
 // * * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * //
 
+bool Foam::thermalPropertyTables::variableDSolid() const noexcept
+{
+    if (DSolidPtr_)
+    {
+        return true;
+    }
+
+    forAll(materialTable_, mati)
+    {
+        if (materialTable_.set(mati))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+bool Foam::thermalPropertyTables::hasTemperatureDependentThermalCoefficients()
+    const noexcept
+{
+    return variableDFluid() || variableDSolid() || variableRhoCp();
+}
+
+
 void Foam::thermalPropertyTables::read
 (
     const dictionary& thermalDict,
