@@ -779,7 +779,8 @@ void Foam::thermalAdjointSimple::validateExactThermalCouplingOptions() const
      || checkFixedPointAdjointBetaSensitivity_
      || computeAnalyticFixedPointAdjointBeta_
      || checkAnalyticFixedPointAdjointBeta_
-     || writeAnalyticFixedPointAdjointBeta_;
+     || writeAnalyticFixedPointAdjointBeta_
+     || useAnalyticFixedPointAdjointBeta_;
 
     if (needsExactScalar && !exactScalarThermalTranspose_)
     {
@@ -886,6 +887,45 @@ void Foam::thermalAdjointSimple::validateFixedPointAdjointControls() const
         FatalErrorInFunction
             << "computeAnalyticFixedPointAdjointBeta requires "
             << "solveFixedPointAdjoint true." << exit(FatalError);
+    }
+
+    if (useAnalyticFixedPointAdjointBeta_)
+    {
+        if (!solveFixedPointAdjoint_)
+        {
+            FatalErrorInFunction
+                << "useAnalyticFixedPointAdjointBeta requires "
+                << "solveFixedPointAdjoint true." << exit(FatalError);
+        }
+
+        if (!computeAnalyticFixedPointAdjointBeta_)
+        {
+            FatalErrorInFunction
+                << "useAnalyticFixedPointAdjointBeta requires "
+                << "computeAnalyticFixedPointAdjointBeta true."
+                << exit(FatalError);
+        }
+
+        if (residualFDTopOSens_ && replaceUpstreamMomentumSens_)
+        {
+            FatalErrorInFunction
+                << "useAnalyticFixedPointAdjointBeta replaces the stock "
+                << "Brinkman momentum sensitivity with M_beta^T psi. It "
+                << "cannot be combined with residualFDTopOSens and "
+                << "replaceUpstreamMomentumSens because that would create "
+                << "two independent momentum sensitivity replacements."
+                << exit(FatalError);
+        }
+
+        if (projectionCoeffFDTopOSens_ && addProjectionCoeffFDSens_)
+        {
+            FatalErrorInFunction
+                << "useAnalyticFixedPointAdjointBeta replaces the validated "
+                << "fixed-point flow sensitivity. It cannot be combined with "
+                << "projectionCoeffFDTopOSens and addProjectionCoeffFDSens "
+                << "because that would add a second momentum/projection beta "
+                << "term to betaMult." << exit(FatalError);
+        }
     }
 
     if (checkAnalyticFixedPointAdjointBeta_)
@@ -6517,8 +6557,17 @@ Foam::thermalAdjointSimple::runFixedPointAdjointSolve()
         writeFixedPointAdjointFields(result.psi);
     }
 
-    Info<< "ATC-T fixed-point adjoint solve complete. betaMult is unchanged "
-        << "in this pass." << endl;
+    if (useAnalyticFixedPointAdjointBeta_)
+    {
+        Info<< "ATC-T fixed-point adjoint solve complete. Production "
+            << "betaMult integration will replace the stock Brinkman "
+            << "sensitivity after the analytic beta field is built." << endl;
+    }
+    else
+    {
+        Info<< "ATC-T fixed-point adjoint solve complete. betaMult is "
+            << "unchanged by the fixed-point solve." << endl;
+    }
 
     return result;
 }
@@ -6665,17 +6714,24 @@ Foam::thermalAdjointSimple::analyticFixedPointAdjointBeta
             nullptr,
             &betaTrace
         );
-    SimpleMapSeed untraced = reverseOneSimpleMapSeed(psi, rAtUBase);
-    const scalar traceSeedDiff = maxDifferenceSimpleMapSeed(traced, untraced);
+    static_cast<void>(traced);
 
-    Info<< "ATC-T analytic fixed-point beta trace no-change maxDiff "
-        << traceSeedDiff << endl;
-
-    if (traceSeedDiff > scalar(1e-14))
+    if (checkAnalyticFixedPointAdjointBeta_)
     {
-        FatalErrorInFunction
-            << "Adding the analytic beta trace changed reverseOneSimpleMapSeed."
-            << " maxDifference = " << traceSeedDiff << exit(FatalError);
+        SimpleMapSeed untraced = reverseOneSimpleMapSeed(psi, rAtUBase);
+        const scalar traceSeedDiff =
+            maxDifferenceSimpleMapSeed(traced, untraced);
+
+        Info<< "ATC-T analytic fixed-point beta trace no-change maxDiff "
+            << traceSeedDiff << endl;
+
+        if (traceSeedDiff > scalar(1e-14))
+        {
+            FatalErrorInFunction
+                << "Adding the analytic beta trace changed "
+                << "reverseOneSimpleMapSeed. maxDifference = "
+                << traceSeedDiff << exit(FatalError);
+        }
     }
 
     scalar alphaU = scalar(1);
@@ -6827,7 +6883,11 @@ Foam::thermalAdjointSimple::analyticFixedPointAdjointBeta
         else if (cellRelaxClass == structuralLowerBoundTie)
         {
             isStructuralLowerBoundTie[celli] = true;
-            if (nStructuralLowerBoundTieCells < 20)
+            if
+            (
+                checkAnalyticFixedPointAdjointBeta_
+             && nStructuralLowerBoundTieCells < 20
+            )
             {
                 Info<< "ATC-T analytic fixed-point beta structural "
                     << "lower-bound relaxation tie: cell " << celli
@@ -7155,103 +7215,107 @@ Foam::thermalAdjointSimple::analyticFixedPointAdjointBeta
         return state;
     };
 
-    restoreBetaProbe();
-    BetaRelaxProbeState baseRelaxProbe = assembleRelaxProbe();
-    restoreBetaProbe();
+    BetaRelaxProbeState baseRelaxProbe(mesh_);
 
-    DynamicList<label> structuralProbeReportCells;
-    auto addStructuralProbeReportCell = [&](const label celli)
+    if (checkAnalyticFixedPointAdjointBeta_)
     {
-        if
-        (
-            celli >= 0
-         && celli < mesh_.nCells()
-         && isDesign.test(celli)
-         && isStructuralLowerBoundTie[celli]
-        )
-        {
-            forAll(structuralProbeReportCells, i)
-            {
-                if (structuralProbeReportCells[i] == celli)
-                {
-                    return;
-                }
-            }
-            structuralProbeReportCells.append(celli);
-        }
-    };
+        restoreBetaProbe();
+        baseRelaxProbe = assembleRelaxProbe();
+        restoreBetaProbe();
 
-    for (label celli = 61; celli <= 80; ++celli)
-    {
-        addStructuralProbeReportCell(celli);
-    }
-    addStructuralProbeReportCell(708);
-    addStructuralProbeReportCell(709);
-
-    for (label pick = 0; pick < 5; ++pick)
-    {
-        label bestCell = -1;
-        scalar bestMag = -1;
-        forAll(flowBetaMult, celli)
+        DynamicList<label> structuralProbeReportCells;
+        auto addStructuralProbeReportCell = [&](const label celli)
         {
             if
             (
-                !isStructuralLowerBoundTie[celli]
-             || !isDesign.test(celli)
-            )
-            {
-                continue;
-            }
-
-            const scalar candidate = mag(flowBetaMult[celli]);
-            bool alreadySelected = false;
-            forAll(structuralProbeReportCells, i)
-            {
-                if (structuralProbeReportCells[i] == celli)
-                {
-                    alreadySelected = true;
-                    break;
-                }
-            }
-            if (!alreadySelected && candidate > bestMag)
-            {
-                bestMag = candidate;
-                bestCell = celli;
-            }
-        }
-        addStructuralProbeReportCell(bestCell);
-    }
-
-    for (label pick = 0; pick < 5; ++pick)
-    {
-        for (label attempt = 0; attempt < mesh_.nCells(); ++attempt)
-        {
-            const label celli =
-                (
-                    label(769)*(pick + 1)
-                  + label(43)*attempt
-                  + label(197)
-                ) % mesh_.nCells();
-
-            if
-            (
-                isDesign.test(celli)
+                celli >= 0
+             && celli < mesh_.nCells()
+             && isDesign.test(celli)
              && isStructuralLowerBoundTie[celli]
             )
             {
-                addStructuralProbeReportCell(celli);
-                break;
+                forAll(structuralProbeReportCells, i)
+                {
+                    if (structuralProbeReportCells[i] == celli)
+                    {
+                        return;
+                    }
+                }
+                structuralProbeReportCells.append(celli);
+            }
+        };
+
+        for (label celli = 61; celli <= 80; ++celli)
+        {
+            addStructuralProbeReportCell(celli);
+        }
+        addStructuralProbeReportCell(708);
+        addStructuralProbeReportCell(709);
+
+        for (label pick = 0; pick < 5; ++pick)
+        {
+            label bestCell = -1;
+            scalar bestMag = -1;
+            forAll(flowBetaMult, celli)
+            {
+                if
+                (
+                    !isStructuralLowerBoundTie[celli]
+                 || !isDesign.test(celli)
+                )
+                {
+                    continue;
+                }
+
+                const scalar candidate = mag(flowBetaMult[celli]);
+                bool alreadySelected = false;
+                forAll(structuralProbeReportCells, i)
+                {
+                    if (structuralProbeReportCells[i] == celli)
+                    {
+                        alreadySelected = true;
+                        break;
+                    }
+                }
+                if (!alreadySelected && candidate > bestMag)
+                {
+                    bestMag = candidate;
+                    bestCell = celli;
+                }
+            }
+            addStructuralProbeReportCell(bestCell);
+        }
+
+        for (label pick = 0; pick < 5; ++pick)
+        {
+            for (label attempt = 0; attempt < mesh_.nCells(); ++attempt)
+            {
+                const label celli =
+                    (
+                        label(769)*(pick + 1)
+                      + label(43)*attempt
+                      + label(197)
+                    ) % mesh_.nCells();
+
+                if
+                (
+                    isDesign.test(celli)
+                 && isStructuralLowerBoundTie[celli]
+                )
+                {
+                    addStructuralProbeReportCell(celli);
+                    break;
+                }
             }
         }
-    }
 
-    if (nStructuralLowerBoundTieCells)
-    {
-        Info<< "ATC-T analytic fixed-point beta structural-tie probe "
-            << "columns: h cell beta baseBranch hBranch twoHBranch "
-            << "rawD0 rawDh rawD2h dRawD dSumOff dFinalD "
-            << "dFinalDExpected sourceErrMag dFinalH1 daDbeta"
-            << endl;
+        if (nStructuralLowerBoundTieCells)
+        {
+            Info<< "ATC-T analytic fixed-point beta structural-tie probe "
+                << "columns: h cell beta baseBranch hBranch twoHBranch "
+                << "rawD0 rawDh rawD2h dRawD dSumOff dFinalD "
+                << "dFinalDExpected sourceErrMag dFinalH1 daDbeta"
+                << endl;
 
         scalarList structuralProbeH(2, Zero);
         structuralProbeH[0] = scalar(1e-5);
@@ -7492,6 +7556,22 @@ Foam::thermalAdjointSimple::analyticFixedPointAdjointBeta
             }
         }
 
+        Info<< "ATC-T analytic fixed-point beta derivative semantics: "
+            << "strict raw-diagonal cells are classical derivatives; "
+            << "structural lower-bound relaxation ties use the feasible "
+            << "right derivative with respect to increasing Brinkman/source "
+            << "coefficient, not a two-sided classical derivative."
+            << endl;
+    }
+
+    }
+
+    if
+    (
+        nStructuralLowerBoundTieCells
+     && !checkAnalyticFixedPointAdjointBeta_
+    )
+    {
         Info<< "ATC-T analytic fixed-point beta derivative semantics: "
             << "strict raw-diagonal cells are classical derivatives; "
             << "structural lower-bound relaxation ties use the feasible "
@@ -32951,6 +33031,7 @@ Foam::thermalAdjointSimple::thermalAdjointSimple
     computeAnalyticFixedPointAdjointBeta_(false),
     checkAnalyticFixedPointAdjointBeta_(false),
     writeAnalyticFixedPointAdjointBeta_(false),
+    useAnalyticFixedPointAdjointBeta_(false),
     fixedPointAdjointRestart_(20),
     fixedPointAdjointMaxIters_(200),
     fixedPointAdjointNeumannIters_(50),
@@ -33122,6 +33203,12 @@ Foam::thermalAdjointSimple::thermalAdjointSimple
         thermalDict.getOrDefault<bool>
         (
             "writeAnalyticFixedPointAdjointBeta",
+            false
+        );
+    useAnalyticFixedPointAdjointBeta_ =
+        thermalDict.getOrDefault<bool>
+        (
+            "useAnalyticFixedPointAdjointBeta",
             false
         );
     fixedPointAdjointRestart_ =
@@ -33391,6 +33478,12 @@ bool Foam::thermalAdjointSimple::readDict(const dictionary& dict)
                 "writeAnalyticFixedPointAdjointBeta",
                 false
             );
+        useAnalyticFixedPointAdjointBeta_ =
+            thermalDict.getOrDefault<bool>
+            (
+                "useAnalyticFixedPointAdjointBeta",
+                false
+            );
         fixedPointAdjointRestart_ =
             thermalDict.getOrDefault<label>("fixedPointAdjointRestart", 20);
         fixedPointAdjointMaxIters_ =
@@ -33483,6 +33576,65 @@ void Foam::thermalAdjointSimple::topOSensMultiplier
 
     const scalarField upstreamContribution(betaMult - betaBefore);
 
+    auto fieldL1 = [](const scalarField& fld)
+    {
+        scalar val = Zero;
+        forAll(fld, i)
+        {
+            val += mag(fld[i]);
+        }
+        return returnReduce(val, sumOp<scalar>());
+    };
+
+    auto fieldL2 = [](const scalarField& fld)
+    {
+        scalar val = Zero;
+        forAll(fld, i)
+        {
+            val += sqr(fld[i]);
+        }
+        return sqrt(max(returnReduce(val, sumOp<scalar>()), Zero));
+    };
+
+    auto fieldDot = [](const scalarField& a, const scalarField& b)
+    {
+        scalar val = Zero;
+        forAll(a, i)
+        {
+            val += a[i]*b[i];
+        }
+        return returnReduce(val, sumOp<scalar>());
+    };
+
+    auto maxAbsFieldDiff =
+        [](const scalarField& a, const scalarField& b, label& maxCell)
+    {
+        scalar maxDiff = Zero;
+        maxCell = -1;
+        forAll(a, i)
+        {
+            const scalar diff = mag(a[i] - b[i]);
+            if (diff > maxDiff)
+            {
+                maxDiff = diff;
+                maxCell = i;
+            }
+        }
+
+        reduce(maxDiff, maxOp<scalar>());
+        return maxDiff;
+    };
+
+    auto printFieldStats = [&](const word& label, const scalarField& fld)
+    {
+        Info<< "ATC-T production beta sensitivity stats: " << label
+            << " min " << gMin(fld)
+            << " max " << gMax(fld)
+            << " L1 " << fieldL1(fld)
+            << " L2 " << fieldL2(fld)
+            << endl;
+    };
+
     if (residualFDTopOSens_ && replaceUpstreamMomentumSens_)
     {
         betaMult = betaBefore;
@@ -33511,6 +33663,8 @@ void Foam::thermalAdjointSimple::topOSensMultiplier
 
     FixedPointAdjointResult fixedPointResult(mesh_);
     bool haveFixedPointResult = false;
+    tmp<volScalarField> tAnalyticFlow;
+    bool haveAnalyticFlow = false;
 
     if (solveFixedPointAdjoint_)
     {
@@ -33528,18 +33682,90 @@ void Foam::thermalAdjointSimple::topOSensMultiplier
                 << exit(FatalError);
         }
 
-        tmp<volScalarField> tAnalyticFlow =
+        tAnalyticFlow =
             analyticFixedPointAdjointBeta
             (
                 fixedPointResult.psi,
                 designVariablesName,
                 dt
             );
+        haveAnalyticFlow = true;
 
-        Info<< "ATC-T analytic fixed-point beta field "
-            << tAnalyticFlow().name()
-            << " computed. Diagnostic only; betaMult is unchanged."
+        if (!useAnalyticFixedPointAdjointBeta_)
+        {
+            Info<< "ATC-T analytic fixed-point beta field "
+                << tAnalyticFlow().name()
+                << " computed. Diagnostic only; betaMult is unchanged."
+                << endl;
+        }
+    }
+
+    if (useAnalyticFixedPointAdjointBeta_)
+    {
+        if (!haveFixedPointResult || !fixedPointResult.converged)
+        {
+            FatalErrorInFunction
+                << "useAnalyticFixedPointAdjointBeta requires a converged "
+                << "fixed-point adjoint result." << exit(FatalError);
+        }
+
+        if (!haveAnalyticFlow)
+        {
+            FatalErrorInFunction
+                << "useAnalyticFixedPointAdjointBeta requires one retained "
+                << "analytic fixed-point beta flow field." << exit(FatalError);
+        }
+
+        const scalarField& analyticFlow =
+            tAnalyticFlow().primitiveField();
+
+        betaMult = betaBefore;
+        betaMult += analyticFlow;
+
+        scalarField replacement(betaMult - betaBefore);
+        label replacementMaxCell = -1;
+        const scalar replacementMaxDiff =
+            maxAbsFieldDiff(replacement, analyticFlow, replacementMaxCell);
+
+        Info<< "ATC-T production fixed-point beta sensitivity is active: "
+            << "stock Brinkman sensitivity replaced by M_beta^T psi; "
+            << "direct conductivity J_beta retained. At structural "
+            << "lower-bound beta cells the value is the feasible right "
+            << "derivative at beta=0." << endl;
+
+        const scalar upstreamL2 = fieldL2(upstreamContribution);
+        const scalar analyticL2 = fieldL2(analyticFlow);
+        const scalar stockAnalyticDot =
+            fieldDot(upstreamContribution, analyticFlow);
+        const scalar cosine =
+            stockAnalyticDot/max(upstreamL2*analyticL2, VSMALL);
+        scalarField stockMinusAnalytic(upstreamContribution - analyticFlow);
+        label stockMaxCell = -1;
+        const scalar stockMaxDiff =
+            maxAbsFieldDiff(upstreamContribution, analyticFlow, stockMaxCell);
+
+        Info<< "ATC-T production fixed-point beta flow replacement: "
+            << "maxAbsReplacementDiff " << replacementMaxDiff
+            << " replacementDiffCell " << replacementMaxCell
+            << " stockL1 " << fieldL1(upstreamContribution)
+            << " stockL2 " << upstreamL2
+            << " analyticL1 " << fieldL1(analyticFlow)
+            << " analyticL2 " << analyticL2
+            << " dot " << stockAnalyticDot
+            << " cosine " << cosine
+            << " relativeL2Difference "
+            << fieldL2(stockMinusAnalytic)/max(upstreamL2, VSMALL)
+            << " maxAbsDifference " << stockMaxDiff
+            << " maxDiffCell " << stockMaxCell
             << endl;
+
+        if (replacementMaxDiff > scalar(1e-13))
+        {
+            FatalErrorInFunction
+                << "Production fixed-point beta replacement was not exact. "
+                << "maxAbsDiff = " << replacementMaxDiff
+                << " at cell " << replacementMaxCell << exit(FatalError);
+        }
     }
 
     const bool needExactFluxDiagnostic =
@@ -33762,6 +33988,53 @@ void Foam::thermalAdjointSimple::topOSensMultiplier
     (
         betaMult - betaBeforeConductivity
     );
+
+    if (useAnalyticFixedPointAdjointBeta_)
+    {
+        const scalarField& analyticFlow =
+            tAnalyticFlow().primitiveField();
+        scalarField expectedTotal(betaBefore);
+        expectedTotal += analyticFlow;
+        expectedTotal += conductivityContribution;
+
+        label totalMaxCell = -1;
+        const scalar totalMaxDiff =
+            maxAbsFieldDiff(betaMult, expectedTotal, totalMaxCell);
+
+        printFieldStats("analyticFlow", analyticFlow);
+        printFieldStats("conductivity", conductivityContribution);
+        printFieldStats("total", betaMult - betaBefore);
+
+        Info<< "ATC-T production fixed-point beta total assembly: "
+            << "maxAbsDiff " << totalMaxDiff
+            << " maxDiffCell " << totalMaxCell
+            << endl;
+
+        if (totalMaxDiff > scalar(1e-13))
+        {
+            FatalErrorInFunction
+                << "Production fixed-point beta total assembly mismatch. "
+                << "maxAbsDiff = " << totalMaxDiff
+                << " at cell " << totalMaxCell << exit(FatalError);
+        }
+
+        Info<< "ATC-T production fixed-point beta samples: "
+            << "cell stockUpstream analyticFlow conductivity productionTotal"
+            << endl;
+        for (const label celli : labelList({707, 708, 709}))
+        {
+            if (celli >= 0 && celli < mesh_.nCells())
+            {
+                Info<< "ATC-T production fixed-point beta sample: "
+                    << celli << " "
+                    << upstreamContribution[celli] << " "
+                    << analyticFlow[celli] << " "
+                    << conductivityContribution[celli] << " "
+                    << (betaMult[celli] - betaBefore[celli])
+                    << endl;
+            }
+        }
+    }
 
     if (checkFixedPointAdjointBetaSensitivity_)
     {

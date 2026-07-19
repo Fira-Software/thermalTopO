@@ -238,6 +238,10 @@ protected:
         //- Write analytic fixed-point flow sensitivity diagnostic fields
         bool writeAnalyticFixedPointAdjointBeta_;
 
+        //- Production: replace stock Brinkman beta sensitivity with the
+        //- validated fixed-point M_beta^T psi flow sensitivity
+        bool useAnalyticFixedPointAdjointBeta_;
+
         //- Restart length for fixed-point adjoint GMRES
         label fixedPointAdjointRestart_;
 
