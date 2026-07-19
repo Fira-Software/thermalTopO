@@ -223,6 +223,12 @@ protected:
         //- Compare GMRES against the truncated Neumann sequence
         bool checkFixedPointAdjointNeumann_;
 
+        //- Diagnostic only: compare J_beta + psi^T M_beta on selected cells
+        bool checkFixedPointAdjointBetaSensitivity_;
+
+        //- Write sparse selected-cell fixed-point beta sensitivity samples
+        bool writeFixedPointAdjointBetaSamples_;
+
         //- Restart length for fixed-point adjoint GMRES
         label fixedPointAdjointRestart_;
 
@@ -240,6 +246,9 @@ protected:
 
         //- Arnoldi breakdown tolerance for fixed-point adjoint GMRES
         scalar fixedPointAdjointBreakdownTol_;
+
+        //- Physical-beta epsilons for fixed-point adjoint beta FD samples
+        scalarList fixedPointAdjointBetaFDEps_;
 
         //- Maximum iterations for converged map FD validation
         label fixedPointValidationMaxIters_;
@@ -893,7 +902,16 @@ protected:
         ) const;
 
         //- Top-level fixed-point adjoint driver
-        void runFixedPointAdjointSolve();
+        FixedPointAdjointResult runFixedPointAdjointSolve();
+
+        //- Diagnostic selected-cell contraction J_beta + psi^T M_beta
+        void checkFixedPointAdjointBetaSensitivity
+        (
+            const SimpleMapSeed& psi,
+            const scalarField& conductivityContribution,
+            const word& designVariablesName,
+            scalar dt
+        );
 
         //- One velocity-only reverse pass of the frozen SIMPLE map
         tmp<vectorField> reverseSimpleMapVelocitySeed

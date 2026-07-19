@@ -775,7 +775,8 @@ void Foam::thermalAdjointSimple::validateExactThermalCouplingOptions() const
      || checkFixedPointAdjointOperator_
      || checkFixedPointAdjointSolve_
      || checkFixedPointAdjointRepeatability_
-     || checkFixedPointAdjointNeumann_;
+     || checkFixedPointAdjointNeumann_
+     || checkFixedPointAdjointBetaSensitivity_;
 
     if (needsExactScalar && !exactScalarThermalTranspose_)
     {
@@ -837,6 +838,44 @@ void Foam::thermalAdjointSimple::validateFixedPointAdjointControls() const
         FatalErrorInFunction
             << "fixedPointAdjointBreakdownTol must be positive. Current value: "
             << fixedPointAdjointBreakdownTol_ << exit(FatalError);
+    }
+
+    if (checkFixedPointAdjointBetaSensitivity_)
+    {
+        if (!solveFixedPointAdjoint_)
+        {
+            FatalErrorInFunction
+                << "checkFixedPointAdjointBetaSensitivity requires "
+                << "solveFixedPointAdjoint true." << exit(FatalError);
+        }
+
+        if (!checkFixedPointAdjointSolve_)
+        {
+            FatalErrorInFunction
+                << "checkFixedPointAdjointBetaSensitivity requires "
+                << "checkFixedPointAdjointSolve true for the acceptance run."
+                << exit(FatalError);
+        }
+
+        if (fixedPointAdjointBetaFDEps_.empty())
+        {
+            FatalErrorInFunction
+                << "fixedPointAdjointBetaFDEps must not be empty when "
+                << "checkFixedPointAdjointBetaSensitivity is enabled."
+                << exit(FatalError);
+        }
+
+        forAll(fixedPointAdjointBetaFDEps_, epsi)
+        {
+            if (fixedPointAdjointBetaFDEps_[epsi] <= scalar(0))
+            {
+                FatalErrorInFunction
+                    << "fixedPointAdjointBetaFDEps contains a non-positive "
+                    << "value at index " << epsi << ": "
+                    << fixedPointAdjointBetaFDEps_[epsi]
+                    << exit(FatalError);
+            }
+        }
     }
 }
 
@@ -6255,11 +6294,14 @@ void Foam::thermalAdjointSimple::writeFixedPointAdjointFields
 }
 
 
-void Foam::thermalAdjointSimple::runFixedPointAdjointSolve()
+Foam::thermalAdjointSimple::FixedPointAdjointResult
+Foam::thermalAdjointSimple::runFixedPointAdjointSolve()
 {
     if (!solveFixedPointAdjoint_)
     {
-        return;
+        FixedPointAdjointResult result(mesh_);
+        zeroSimpleMapSeed(result.psi);
+        return result;
     }
 
     validateFixedPointAdjointScope();
@@ -6345,6 +6387,829 @@ void Foam::thermalAdjointSimple::runFixedPointAdjointSolve()
 
     Info<< "ATC-T fixed-point adjoint solve complete. betaMult is unchanged "
         << "in this pass." << endl;
+
+    return result;
+}
+
+
+void Foam::thermalAdjointSimple::checkFixedPointAdjointBetaSensitivity
+(
+    const SimpleMapSeed& psi,
+    const scalarField& conductivityContribution,
+    const word& designVariablesName,
+    const scalar dt
+)
+{
+    if (!checkFixedPointAdjointBetaSensitivity_)
+    {
+        return;
+    }
+
+    if (mag(dt) <= VSMALL)
+    {
+        FatalErrorInFunction
+            << "checkFixedPointAdjointBetaSensitivity requires non-zero dt."
+            << exit(FatalError);
+    }
+
+    checkSimpleMapSeedSizes(psi, "checkFixedPointAdjointBetaSensitivity psi");
+
+    if (conductivityContribution.size() != mesh_.nCells())
+    {
+        FatalErrorInFunction
+            << "conductivityContribution size mismatch: "
+            << conductivityContribution.size() << " vs " << mesh_.nCells()
+            << exit(FatalError);
+    }
+
+    if (!mesh_.foundObject<topOVariablesBase>("topOVars"))
+    {
+        FatalErrorInFunction
+            << "ATC-T fixed-point adjoint beta check requires topOVars."
+            << exit(FatalError);
+    }
+
+    const topOVariablesBase& vars =
+        mesh_.lookupObject<topOVariablesBase>("topOVars");
+    const topOZones& zones = vars.getTopOZones();
+    volScalarField& beta = const_cast<volScalarField&>(vars.beta());
+
+    volVectorField& U = primalVars_.U();
+    volScalarField& p = const_cast<volScalarField&>(primalVars_.p());
+    surfaceScalarField& phi = primalVars_.phi();
+    volScalarField& T = const_cast<volScalarField&>(TRef());
+    const scalarField& V = mesh_.V();
+
+    bitSet isDesign(mesh_.nCells(), false);
+    if (zones.adjointPorousZoneIDs().empty())
+    {
+        isDesign.fill(true);
+    }
+    else
+    {
+        for (const label zoneID : zones.adjointPorousZoneIDs())
+        {
+            for (const label celli : mesh_.cellZones()[zoneID])
+            {
+                isDesign.set(celli);
+            }
+        }
+    }
+
+    auto unsetZone = [&](const label zoneID)
+    {
+        if (zoneID != -1)
+        {
+            for (const label celli : mesh_.cellZones()[zoneID])
+            {
+                isDesign.unset(celli);
+            }
+        }
+    };
+
+    for (const label zoneID : zones.fixedPorousZoneIDs())
+    {
+        unsetZone(zoneID);
+    }
+    for (const label zoneID : zones.fixedZeroPorousZoneIDs())
+    {
+        unsetZone(zoneID);
+    }
+    for (const label celli : zones.IOCells())
+    {
+        isDesign.unset(celli);
+    }
+
+    labelList reportCells(fixedPointTangentCells_.size(), -1);
+    label nReport = 0;
+    forAll(fixedPointTangentCells_, i)
+    {
+        const label celli = fixedPointTangentCells_[i];
+        if (celli < 0 || celli >= mesh_.nCells())
+        {
+            Info<< "ATC-T fixed-point adjoint beta ignored cell " << celli
+                << ": outside mesh." << endl;
+            continue;
+        }
+
+        if (!isDesign.test(celli))
+        {
+            Info<< "ATC-T fixed-point adjoint beta ignored cell " << celli
+                << ": outside active design set." << endl;
+            continue;
+        }
+
+        reportCells[nReport++] = celli;
+    }
+
+    if (nReport == 0)
+    {
+        Info<< "ATC-T fixed-point adjoint beta check: no requested cells in "
+            << "the active design set. Diagnostic only; betaMult is unchanged."
+            << endl;
+        return;
+    }
+
+    const volVectorField UBase
+    (
+        IOobject
+        (
+            "ATCTFPBetaUBase",
+            mesh_.time().timeName(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE
+        ),
+        U
+    );
+    const volScalarField pBase
+    (
+        IOobject
+        (
+            "ATCTFPBetapBase",
+            mesh_.time().timeName(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE
+        ),
+        p
+    );
+    const surfaceScalarField phiBase
+    (
+        IOobject
+        (
+            "ATCTFPBetaPhiBase",
+            mesh_.time().timeName(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE
+        ),
+        phi
+    );
+    const volScalarField betaBase
+    (
+        IOobject
+        (
+            "ATCTFPBetaBetaBase",
+            mesh_.time().timeName(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE
+        ),
+        beta
+    );
+    const volScalarField TBase
+    (
+        IOobject
+        (
+            "ATCTFPBetaTBase",
+            mesh_.time().timeName(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE
+        ),
+        T
+    );
+
+    const bool pressureNeedsReference = p.needReference();
+    const label pRefCell = solverControl_().pRefCell();
+
+    auto removeMean = [](scalarField& fld)
+    {
+        const label n = returnReduce(fld.size(), sumOp<label>());
+        if (n > 0)
+        {
+            fld -= gSum(fld)/scalar(n);
+        }
+    };
+
+    auto projectPressureDirection = [&](scalarField& fld)
+    {
+        if (!pressureNeedsReference)
+        {
+            return;
+        }
+
+        if (pRefCell >= 0 && pRefCell < mesh_.nCells())
+        {
+            fld[pRefCell] = Zero;
+        }
+        else
+        {
+            removeMean(fld);
+        }
+    };
+
+    const typename pTraits<vector>::labelType validVectorComponents
+    (
+        mesh_.validComponents<vector>()
+    );
+    auto projectValidVectorComponents = [&](vectorField& vf)
+    {
+        forAll(vf, celli)
+        {
+            for (direction cmpt = 0; cmpt < vector::nComponents; ++cmpt)
+            {
+                if (component(validVectorComponents, cmpt) == -1)
+                {
+                    vf[celli][cmpt] = Zero;
+                }
+            }
+        }
+    };
+
+    auto projectMapStateDirection = [&](SimpleMapState& state)
+    {
+        projectValidVectorComponents(state.U);
+        projectPressureDirection(state.p);
+    };
+
+    auto enforcePressureBoundaryState = [&]()
+    {
+        bool hasUpdateablePressureSnGrad = false;
+        forAll(p.boundaryField(), patchi)
+        {
+            if
+            (
+                mesh_.boundary()[patchi].type() == "empty"
+             || mesh_.boundary()[patchi].coupled()
+            )
+            {
+                continue;
+            }
+
+            if
+            (
+                isA<updateablePatchTypes::updateableSnGrad>
+                (
+                    p.boundaryField()[patchi]
+                )
+            )
+            {
+                hasUpdateablePressureSnGrad = true;
+            }
+        }
+
+        forAll(p.boundaryFieldRef(), patchi)
+        {
+            p.boundaryFieldRef()[patchi] == pBase.boundaryField()[patchi];
+        }
+
+        if (!hasUpdateablePressureSnGrad)
+        {
+            p.correctBoundaryConditions();
+        }
+    };
+
+    auto restoreFlowState = [&]()
+    {
+        U.primitiveFieldRef() = UBase.primitiveField();
+        forAll(U.boundaryFieldRef(), patchi)
+        {
+            U.boundaryFieldRef()[patchi] == UBase.boundaryField()[patchi];
+        }
+        U.correctBoundaryConditions();
+
+        p.primitiveFieldRef() = pBase.primitiveField();
+        forAll(p.boundaryFieldRef(), patchi)
+        {
+            p.boundaryFieldRef()[patchi] == pBase.boundaryField()[patchi];
+        }
+        enforcePressureBoundaryState();
+
+        phi.primitiveFieldRef() = phiBase.primitiveField();
+        forAll(phi.boundaryFieldRef(), patchi)
+        {
+            phi.boundaryFieldRef()[patchi] == phiBase.boundaryField()[patchi];
+        }
+    };
+
+    auto restoreBeta = [&]()
+    {
+        beta.primitiveFieldRef() = betaBase.primitiveField();
+        forAll(beta.boundaryFieldRef(), patchi)
+        {
+            beta.boundaryFieldRef()[patchi] == betaBase.boundaryField()[patchi];
+        }
+        beta.correctBoundaryConditions();
+    };
+
+    auto restoreTemperature = [&]()
+    {
+        T.primitiveFieldRef() = TBase.primitiveField();
+        forAll(T.boundaryFieldRef(), patchi)
+        {
+            T.boundaryFieldRef()[patchi] == TBase.boundaryField()[patchi];
+        }
+        T.correctBoundaryConditions();
+    };
+
+    auto restoreAll = [&]()
+    {
+        restoreFlowState();
+        restoreBeta();
+        restoreTemperature();
+    };
+
+    auto mapStateDifference =
+        [&](const SimpleMapState& plus, const SimpleMapState& minus, const scalar eps)
+    {
+        SimpleMapState diff(mesh_);
+
+        forAll(diff.U, celli)
+        {
+            diff.U[celli] = (plus.U[celli] - minus.U[celli])/(2*eps);
+            diff.p[celli] = (plus.p[celli] - minus.p[celli])/(2*eps);
+        }
+        forAll(diff.phiInternal, facei)
+        {
+            diff.phiInternal[facei] =
+                (plus.phiInternal[facei] - minus.phiInternal[facei])
+               /(2*eps);
+        }
+        forAll(diff.phiBoundary, patchi)
+        {
+            forAll(diff.phiBoundary[patchi], facei)
+            {
+                diff.phiBoundary[patchi][facei] =
+                    (
+                        plus.phiBoundary[patchi][facei]
+                      - minus.phiBoundary[patchi][facei]
+                    )
+                   /(2*eps);
+            }
+        }
+
+        projectMapStateDirection(diff);
+        return diff;
+    };
+
+    auto contractPsiWithState =
+        [&]
+        (
+            const SimpleMapState& state,
+            scalar& uPart,
+            scalar& pPart,
+            scalar& phiInternalPart,
+            scalar& phiBoundaryPart
+        )
+    {
+        uPart = Zero;
+        pPart = Zero;
+        phiInternalPart = Zero;
+        phiBoundaryPart = Zero;
+
+        forAll(psi.barU, celli)
+        {
+            uPart += psi.barU[celli] & state.U[celli];
+            pPart += psi.barp[celli]*state.p[celli];
+        }
+        forAll(psi.barPhiInternal, facei)
+        {
+            phiInternalPart +=
+                psi.barPhiInternal[facei]*state.phiInternal[facei];
+        }
+        forAll(psi.barPhiBoundary, patchi)
+        {
+            forAll(psi.barPhiBoundary[patchi], facei)
+            {
+                phiBoundaryPart +=
+                    psi.barPhiBoundary[patchi][facei]
+                   *state.phiBoundary[patchi][facei];
+            }
+        }
+
+        reduce(uPart, sumOp<scalar>());
+        reduce(pPart, sumOp<scalar>());
+        reduce(phiInternalPart, sumOp<scalar>());
+        reduce(phiBoundaryPart, sumOp<scalar>());
+    };
+
+    scalarField flowSample(mesh_.nCells(), Zero);
+    scalarField directSample(mesh_.nCells(), Zero);
+    scalarField totalSample(mesh_.nCells(), Zero);
+
+    Info<< "ATC-T fixed-point adjoint beta controls: epsList "
+        << fixedPointAdjointBetaFDEps_
+        << " selectedCells " << fixedPointTangentCells_
+        << " designVariables " << designVariablesName
+        << " dt " << dt
+        << endl;
+
+    Info<< "ATC-T fixed-point adjoint beta samples: "
+        << "cell beta requestedEps actualEps "
+        << "flowUIntegrated flowPIntegrated flowPhiInternalIntegrated "
+        << "flowPhiBoundaryIntegrated flowIntegrated "
+        << "flowPerVolume flowBetaMult directBetaMult totalBetaMult "
+        << "totalRawPerVolume flowPerVolumeOverDt flowBetaMultOverDt "
+        << "directBetaMultOverDt totalBetaMultOverDt"
+        << endl;
+
+    for (label reporti = 0; reporti < nReport; ++reporti)
+    {
+        const label cellj = reportCells[reporti];
+        const scalar oldBeta = betaBase.primitiveField()[cellj];
+
+        scalarList flowIntegratedValues
+        (
+            fixedPointAdjointBetaFDEps_.size(),
+            Zero
+        );
+        scalarList totalRawValues
+        (
+            fixedPointAdjointBetaFDEps_.size(),
+            Zero
+        );
+        scalarList flowBetaMultValues
+        (
+            fixedPointAdjointBetaFDEps_.size(),
+            Zero
+        );
+        scalarList totalBetaMultValues
+        (
+            fixedPointAdjointBetaFDEps_.size(),
+            Zero
+        );
+        boolList validEps(fixedPointAdjointBetaFDEps_.size(), false);
+
+        forAll(fixedPointAdjointBetaFDEps_, epsi)
+        {
+            const scalar requestedEps = fixedPointAdjointBetaFDEps_[epsi];
+            const scalar room = min(oldBeta, scalar(1) - oldBeta);
+            const scalar eps =
+                min(requestedEps, scalar(0.25)*max(room, SMALL));
+
+            if (eps <= SMALL)
+            {
+                Info<< "ATC-T fixed-point adjoint beta skipped cell "
+                    << cellj
+                    << " beta " << oldBeta
+                    << " requestedEps " << requestedEps
+                    << " actualEps " << eps
+                    << endl;
+                continue;
+            }
+
+            restoreAll();
+            beta.primitiveFieldRef()[cellj] = oldBeta + eps;
+            beta.correctBoundaryConditions();
+            SimpleMapState statePlus =
+                primalSimpleMapStateAtFrozenState
+                (
+                    "ATCTFPBetaPlus_cell" + Foam::name(cellj)
+                  + "_eps" + Foam::name(epsi)
+                );
+
+            restoreAll();
+            beta.primitiveFieldRef()[cellj] = oldBeta - eps;
+            beta.correctBoundaryConditions();
+            SimpleMapState stateMinus =
+                primalSimpleMapStateAtFrozenState
+                (
+                    "ATCTFPBetaMinus_cell" + Foam::name(cellj)
+                  + "_eps" + Foam::name(epsi)
+                );
+
+            restoreAll();
+
+            SimpleMapState dM = mapStateDifference(statePlus, stateMinus, eps);
+
+            scalar flowU = Zero;
+            scalar flowP = Zero;
+            scalar flowPhiInternal = Zero;
+            scalar flowPhiBoundary = Zero;
+            contractPsiWithState
+            (
+                dM,
+                flowU,
+                flowP,
+                flowPhiInternal,
+                flowPhiBoundary
+            );
+
+            const scalar flowIntegrated =
+                flowU + flowP + flowPhiInternal + flowPhiBoundary;
+            const scalar flowPerVolume = flowIntegrated/V[cellj];
+            const scalar flowBetaMult = flowPerVolume*dt;
+            const scalar directBetaMult = conductivityContribution[cellj];
+            const scalar totalBetaMult = flowBetaMult + directBetaMult;
+            const scalar totalRawPerVolume = totalBetaMult/dt;
+
+            flowIntegratedValues[epsi] = flowIntegrated;
+            totalRawValues[epsi] = totalRawPerVolume;
+            flowBetaMultValues[epsi] = flowBetaMult;
+            totalBetaMultValues[epsi] = totalBetaMult;
+            validEps[epsi] = true;
+
+            Info<< "ATC-T fixed-point adjoint beta sample: "
+                << cellj << " "
+                << oldBeta << " "
+                << requestedEps << " "
+                << eps << " "
+                << flowU << " "
+                << flowP << " "
+                << flowPhiInternal << " "
+                << flowPhiBoundary << " "
+                << flowIntegrated << " "
+                << flowPerVolume << " "
+                << flowBetaMult << " "
+                << directBetaMult << " "
+                << totalBetaMult << " "
+                << totalRawPerVolume << " "
+                << flowPerVolume/dt << " "
+                << flowBetaMult/dt << " "
+                << directBetaMult/dt << " "
+                << totalBetaMult/dt
+                << endl;
+        }
+
+        label plateauA = -1;
+        label plateauB = -1;
+        for (label epsi = 0; epsi + 1 < min(label(3), fixedPointAdjointBetaFDEps_.size()); ++epsi)
+        {
+            if (!validEps[epsi] || !validEps[epsi + 1])
+            {
+                continue;
+            }
+
+            const scalar flowGap =
+                mag(flowIntegratedValues[epsi] - flowIntegratedValues[epsi + 1]);
+            const scalar flowSym =
+                flowGap
+               /(
+                    mag(flowIntegratedValues[epsi])
+                  + mag(flowIntegratedValues[epsi + 1])
+                  + VSMALL
+                );
+            const scalar flowAbsGate =
+                scalar(1e-7)
+               *max(scalar(1), mag(flowIntegratedValues[epsi]));
+
+            const scalar totalGap =
+                mag(totalRawValues[epsi] - totalRawValues[epsi + 1]);
+            const scalar totalSym =
+                totalGap
+               /(
+                    mag(totalRawValues[epsi])
+                  + mag(totalRawValues[epsi + 1])
+                  + VSMALL
+                );
+            const scalar totalAbsGate =
+                scalar(1e-7)*max(scalar(1), mag(totalRawValues[epsi]));
+
+            const bool stable =
+                (
+                    flowSym < scalar(1e-5)
+                 || flowGap < flowAbsGate
+                )
+             && (
+                    totalSym < scalar(1e-5)
+                 || totalGap < totalAbsGate
+                );
+
+            Info<< "ATC-T fixed-point adjoint beta plateau check: cell "
+                << cellj
+                << " epsA " << fixedPointAdjointBetaFDEps_[epsi]
+                << " epsB " << fixedPointAdjointBetaFDEps_[epsi + 1]
+                << " flowSym " << flowSym
+                << " flowAbsGap " << flowGap
+                << " totalSym " << totalSym
+                << " totalAbsGap " << totalGap
+                << " stable " << stable
+                << endl;
+
+            if (stable && plateauA == -1)
+            {
+                plateauA = epsi;
+                plateauB = epsi + 1;
+            }
+        }
+
+        if (plateauA == -1)
+        {
+            FatalErrorInFunction
+                << "No stable fixed-point adjoint beta plateau for cell "
+                << cellj << ". Diagnostic only; betaMult is unchanged."
+                << exit(FatalError);
+        }
+
+        const scalar plateauFlowIntegrated =
+            scalar(0.5)
+           *(flowIntegratedValues[plateauA] + flowIntegratedValues[plateauB]);
+        const scalar plateauTotalRaw =
+            scalar(0.5)*(totalRawValues[plateauA] + totalRawValues[plateauB]);
+        const scalar plateauFlowBetaMult =
+            scalar(0.5)
+           *(flowBetaMultValues[plateauA] + flowBetaMultValues[plateauB]);
+        const scalar plateauTotalBetaMult =
+            scalar(0.5)
+           *(totalBetaMultValues[plateauA] + totalBetaMultValues[plateauB]);
+
+        flowSample[cellj] = plateauFlowBetaMult;
+        directSample[cellj] = conductivityContribution[cellj];
+        totalSample[cellj] = plateauTotalBetaMult;
+
+        Info<< "ATC-T fixed-point adjoint beta plateau selected: cell "
+            << cellj
+            << " epsA " << fixedPointAdjointBetaFDEps_[plateauA]
+            << " epsB " << fixedPointAdjointBetaFDEps_[plateauB]
+            << " flowIntegrated " << plateauFlowIntegrated
+            << " flowBetaMult " << plateauFlowBetaMult
+            << " directBetaMult " << conductivityContribution[cellj]
+            << " totalBetaMult " << plateauTotalBetaMult
+            << " totalRawPerVolume " << plateauTotalRaw
+            << " flowBetaMultOverDt " << plateauFlowBetaMult/dt
+            << " directBetaMultOverDt " << conductivityContribution[cellj]/dt
+            << " totalBetaMultOverDt " << plateauTotalBetaMult/dt
+            << endl;
+    }
+
+    if (writeFixedPointAdjointBetaSamples_)
+    {
+        volScalarField flowField
+        (
+            IOobject
+            (
+                "ATCTfixedPointAdjointBetaFlowSamples",
+                mesh_.time().timeName(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::AUTO_WRITE
+            ),
+            beta
+        );
+        volScalarField directField
+        (
+            IOobject
+            (
+                "ATCTfixedPointAdjointBetaDirectSamples",
+                mesh_.time().timeName(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::AUTO_WRITE
+            ),
+            beta
+        );
+        volScalarField totalField
+        (
+            IOobject
+            (
+                "ATCTfixedPointAdjointBetaTotalSamples",
+                mesh_.time().timeName(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::AUTO_WRITE
+            ),
+            beta
+        );
+
+        flowField.primitiveFieldRef() = flowSample;
+        directField.primitiveFieldRef() = directSample;
+        totalField.primitiveFieldRef() = totalSample;
+
+        forAll(flowField.boundaryFieldRef(), patchi)
+        {
+            flowField.boundaryFieldRef()[patchi] == Zero;
+            directField.boundaryFieldRef()[patchi] == Zero;
+            totalField.boundaryFieldRef()[patchi] == Zero;
+        }
+
+        flowField.write();
+        directField.write();
+        totalField.write();
+
+        Info<< "ATC-T fixed-point adjoint beta sparse sample fields written: "
+            << flowField.name() << ", " << directField.name()
+            << ", " << totalField.name()
+            << ". These are diagnostic selected-cell betaMult-style samples, "
+            << "not production sensitivity fields." << endl;
+    }
+
+    restoreAll();
+
+    scalar maxScaledDiff = Zero;
+    word maxField("none");
+    label maxPatch = -1;
+    label maxIndex = -1;
+
+    auto updateMax = [&](const scalar value, const scalar scale, const word& fieldName, const label patchi, const label index)
+    {
+        const scalar scaled = mag(value)/max(scale, SMALL);
+        if (scaled > maxScaledDiff)
+        {
+            maxScaledDiff = scaled;
+            maxField = fieldName;
+            maxPatch = patchi;
+            maxIndex = index;
+        }
+    };
+
+    const scalar UScale = max(gMax(mag(UBase.primitiveField())), SMALL);
+    const scalar pScale = max(gMax(mag(pBase.primitiveField())), SMALL);
+    const scalar phiScale = max(gMax(mag(phiBase.primitiveField())), SMALL);
+    const scalar betaScale = max(gMax(mag(betaBase.primitiveField())), SMALL);
+    const scalar TScale = max(gMax(mag(TBase.primitiveField())), SMALL);
+
+    forAll(U.primitiveField(), celli)
+    {
+        updateMax
+        (
+            mag(U[celli] - UBase[celli]),
+            UScale,
+            "U",
+            -1,
+            celli
+        );
+        updateMax
+        (
+            p[celli] - pBase[celli],
+            pScale,
+            "p",
+            -1,
+            celli
+        );
+        updateMax
+        (
+            beta[celli] - betaBase[celli],
+            betaScale,
+            "beta",
+            -1,
+            celli
+        );
+        updateMax
+        (
+            T[celli] - TBase[celli],
+            TScale,
+            "T",
+            -1,
+            celli
+        );
+    }
+    forAll(phi.primitiveField(), facei)
+    {
+        updateMax
+        (
+            phi[facei] - phiBase[facei],
+            phiScale,
+            "phi",
+            -1,
+            facei
+        );
+    }
+    forAll(mesh_.boundary(), patchi)
+    {
+        const vectorField& Ub = U.boundaryField()[patchi];
+        const vectorField& Ubb = UBase.boundaryField()[patchi];
+        const scalarField& pb = p.boundaryField()[patchi];
+        const scalarField& pbb = pBase.boundaryField()[patchi];
+        const scalarField& phib = phi.boundaryField()[patchi];
+        const scalarField& phibb = phiBase.boundaryField()[patchi];
+        const scalarField& betab = beta.boundaryField()[patchi];
+        const scalarField& betabb = betaBase.boundaryField()[patchi];
+        const scalarField& Tb = T.boundaryField()[patchi];
+        const scalarField& Tbb = TBase.boundaryField()[patchi];
+
+        forAll(Ub, facei)
+        {
+            updateMax(mag(Ub[facei] - Ubb[facei]), UScale, "U", patchi, facei);
+            updateMax(pb[facei] - pbb[facei], pScale, "p", patchi, facei);
+            updateMax
+            (
+                phib[facei] - phibb[facei],
+                phiScale,
+                "phi",
+                patchi,
+                facei
+            );
+            updateMax
+            (
+                betab[facei] - betabb[facei],
+                betaScale,
+                "beta",
+                patchi,
+                facei
+            );
+            updateMax(Tb[facei] - Tbb[facei], TScale, "T", patchi, facei);
+        }
+    }
+
+    Info<< "ATC-T fixed-point adjoint beta state restoration: maxScaledDiff "
+        << maxScaledDiff
+        << " field " << maxField
+        << " patch " << maxPatch
+        << " index " << maxIndex
+        << endl;
+
+    if (maxScaledDiff > scalar(1e-13))
+    {
+        FatalErrorInFunction
+            << "Fixed-point adjoint beta diagnostic failed state restoration: "
+            << "maxScaledDiff " << maxScaledDiff
+            << " field " << maxField
+            << " patch " << maxPatch
+            << " index " << maxIndex
+            << exit(FatalError);
+    }
 }
 
 
@@ -27014,12 +27879,15 @@ Foam::thermalAdjointSimple::thermalAdjointSimple
     checkFixedPointAdjointRepeatability_(false),
     writeFixedPointAdjointFields_(true),
     checkFixedPointAdjointNeumann_(false),
+    checkFixedPointAdjointBetaSensitivity_(false),
+    writeFixedPointAdjointBetaSamples_(false),
     fixedPointAdjointRestart_(20),
     fixedPointAdjointMaxIters_(200),
     fixedPointAdjointNeumannIters_(50),
     fixedPointAdjointRelTol_(1e-9),
     fixedPointAdjointAbsTol_(1e-12),
     fixedPointAdjointBreakdownTol_(1e-14),
+    fixedPointAdjointBetaFDEps_({1e-5, 3e-6, 1e-6, 3e-7}),
     fixedPointValidationMaxIters_(200),
     fixedPointValidationRelTol_(1e-9),
     fixedPointValidationBetaEps_(1e-6),
@@ -27156,6 +28024,18 @@ Foam::thermalAdjointSimple::thermalAdjointSimple
             "checkFixedPointAdjointNeumann",
             false
         );
+    checkFixedPointAdjointBetaSensitivity_ =
+        thermalDict.getOrDefault<bool>
+        (
+            "checkFixedPointAdjointBetaSensitivity",
+            false
+        );
+    writeFixedPointAdjointBetaSamples_ =
+        thermalDict.getOrDefault<bool>
+        (
+            "writeFixedPointAdjointBetaSamples",
+            false
+        );
     fixedPointAdjointRestart_ =
         thermalDict.getOrDefault<label>("fixedPointAdjointRestart", 20);
     fixedPointAdjointMaxIters_ =
@@ -27171,6 +28051,12 @@ Foam::thermalAdjointSimple::thermalAdjointSimple
         (
             "fixedPointAdjointBreakdownTol",
             1e-14
+        );
+    fixedPointAdjointBetaFDEps_ =
+        thermalDict.getOrDefault<scalarList>
+        (
+            "fixedPointAdjointBetaFDEps",
+            scalarList({1e-5, 3e-6, 1e-6, 3e-7})
         );
     fixedPointValidationMaxIters_ =
         thermalDict.getOrDefault<label>
@@ -27387,6 +28273,18 @@ bool Foam::thermalAdjointSimple::readDict(const dictionary& dict)
                 "checkFixedPointAdjointNeumann",
                 false
             );
+        checkFixedPointAdjointBetaSensitivity_ =
+            thermalDict.getOrDefault<bool>
+            (
+                "checkFixedPointAdjointBetaSensitivity",
+                false
+            );
+        writeFixedPointAdjointBetaSamples_ =
+            thermalDict.getOrDefault<bool>
+            (
+                "writeFixedPointAdjointBetaSamples",
+                false
+            );
         fixedPointAdjointRestart_ =
             thermalDict.getOrDefault<label>("fixedPointAdjointRestart", 20);
         fixedPointAdjointMaxIters_ =
@@ -27414,6 +28312,12 @@ bool Foam::thermalAdjointSimple::readDict(const dictionary& dict)
             (
                 "fixedPointAdjointBreakdownTol",
                 1e-14
+            );
+        fixedPointAdjointBetaFDEps_ =
+            thermalDict.getOrDefault<scalarList>
+            (
+                "fixedPointAdjointBetaFDEps",
+                scalarList({1e-5, 3e-6, 1e-6, 3e-7})
             );
         fixedPointValidationMaxIters_ =
             thermalDict.getOrDefault<label>
@@ -27499,9 +28403,13 @@ void Foam::thermalAdjointSimple::topOSensMultiplier
         checkFullStateMapTranspose();
     }
 
+    FixedPointAdjointResult fixedPointResult(mesh_);
+    bool haveFixedPointResult = false;
+
     if (solveFixedPointAdjoint_)
     {
-        runFixedPointAdjointSolve();
+        fixedPointResult = runFixedPointAdjointSolve();
+        haveFixedPointResult = true;
     }
 
     const bool needExactFluxDiagnostic =
@@ -27565,6 +28473,8 @@ void Foam::thermalAdjointSimple::topOSensMultiplier
     // the filter/projection/fixed-zone chain, and switching to the face-based
     // form left its adjoint/FD discrepancy unchanged. See that example's
     // README for the open issue.
+    const scalarField betaBeforeConductivity(betaMult);
+
     if (mesh_.foundObject<topOVariablesBase>("topOVars"))
     {
         const volScalarField& T = TRef();
@@ -27716,6 +28626,30 @@ void Foam::thermalAdjointSimple::topOSensMultiplier
         applyMask(thermSens);
 
         betaMult += thermSens;
+    }
+
+    const scalarField conductivityContribution
+    (
+        betaMult - betaBeforeConductivity
+    );
+
+    if (checkFixedPointAdjointBetaSensitivity_)
+    {
+        if (!haveFixedPointResult || !fixedPointResult.converged)
+        {
+            FatalErrorInFunction
+                << "checkFixedPointAdjointBetaSensitivity requires a "
+                << "converged fixed-point adjoint result in the same "
+                << "topOSensMultiplier call." << exit(FatalError);
+        }
+
+        checkFixedPointAdjointBetaSensitivity
+        (
+            fixedPointResult.psi,
+            conductivityContribution,
+            designVariablesName,
+            dt
+        );
     }
 }
 
