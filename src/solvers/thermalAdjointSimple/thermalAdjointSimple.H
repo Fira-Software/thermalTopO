@@ -294,6 +294,25 @@ protected:
             }
         };
 
+        //- Split pressure coefficient seed on the cell and boundary rAtU values
+        struct PressureRAtUReverseSeed
+        {
+            scalarField internal;
+            List<scalarField> boundary;
+
+            explicit PressureRAtUReverseSeed(const fvMesh& mesh)
+            :
+                internal(mesh.nCells(), Zero),
+                boundary(mesh.boundary().size())
+            {
+                forAll(boundary, patchi)
+                {
+                    boundary[patchi].setSize(mesh.boundary()[patchi].size());
+                    boundary[patchi] = Zero;
+                }
+            }
+        };
+
         //- Integrated seed on a volVectorField's explicit value space
         struct VolVectorValueSeed
         {
@@ -652,7 +671,7 @@ protected:
         ) const;
 
         //- Reverse the fixed-pressure pEqn.flux coefficient dependence on rAtU
-        scalarField reversePressureRAtUExact
+        PressureRAtUReverseSeed reversePressureRAtUExact
         (
             const volScalarField& rAtUBase,
             const volScalarField& pSolveBase,

@@ -2350,7 +2350,7 @@ Foam::thermalAdjointSimple::reverseExtraFinalDiagonalToPhi
 }
 
 
-Foam::scalarField
+Foam::thermalAdjointSimple::PressureRAtUReverseSeed
 Foam::thermalAdjointSimple::reversePressureRAtUExact
 (
     const volScalarField& rAtUBase,
@@ -2443,7 +2443,7 @@ Foam::thermalAdjointSimple::reversePressureRAtUExact
         unitEqn.flux()
     );
 
-    scalarField barrAtU(mesh_.nCells(), Zero);
+    PressureRAtUReverseSeed seed(mesh_);
     const labelUList& own = mesh_.owner();
     const labelUList& nei = mesh_.neighbour();
     const surfaceScalarField& w = mesh_.weights();
@@ -2455,8 +2455,8 @@ Foam::thermalAdjointSimple::reversePressureRAtUExact
         const scalar barGamma =
            -barF2.primitiveField()[facei]*unitFlux.primitiveField()[facei];
 
-        barrAtU[P] += w[facei]*barGamma;
-        barrAtU[N] += (scalar(1) - w[facei])*barGamma;
+        seed.internal[P] += w[facei]*barGamma;
+        seed.internal[N] += (scalar(1) - w[facei])*barGamma;
     }
 
     forAll(mesh_.boundary(), patchi)
@@ -2466,13 +2466,19 @@ Foam::thermalAdjointSimple::reversePressureRAtUExact
             continue;
         }
 
-        // In the validated active branch, the surface-coefficient field built
-        // by linearInterpolate(rAtU) has zero boundary tangent with respect to
-        // the stored cell-centred rAtU state.  Boundary barGamma is therefore
-        // deliberately not mapped to owner cells here.
+        const fvsPatchScalarField& barF2p =
+            barF2.boundaryField()[patchi];
+        const fvsPatchScalarField& unitFluxp =
+            unitFlux.boundaryField()[patchi];
+
+        forAll(seed.boundary[patchi], facei)
+        {
+            seed.boundary[patchi][facei] =
+               -barF2p[facei]*unitFluxp[facei];
+        }
     }
 
-    return barrAtU;
+    return seed;
 }
 
 
@@ -3145,6 +3151,7 @@ Foam::thermalAdjointSimple::reverseOneSimpleMapSeedImpl
     fvOptions.constrain(UEqn);
 
     volScalarField rAU(1.0/UEqn.A());
+    volScalarField H1Coeff(UEqn.H1());
     tmp<volScalarField> trAtU(rAU);
 
     volScalarField pForFinalCorrection
@@ -3193,7 +3200,7 @@ Foam::thermalAdjointSimple::reverseOneSimpleMapSeedImpl
 
     if (solverControl_().consistent())
     {
-        trAtU = 1.0/(1.0/rAU - UEqn.H1());
+        trAtU = 1.0/(1.0/rAU - H1Coeff);
         phiForPressure +=
             fvc::interpolate(trAtU() - rAU)
            *fvc::snGrad(pForFinalCorrection)
@@ -3469,17 +3476,117 @@ Foam::thermalAdjointSimple::reverseOneSimpleMapSeedImpl
     pCoeffSolver.set("tolerance", scalar(1e-12));
     pCoeffEqn.solve(pCoeffSolver);
 
-    scalarField pressureBarrAtU =
+    PressureRAtUReverseSeed pressureRAtUSeed =
         reversePressureRAtUExact
         (
             rAtUMap,
             pSolveForPressureCoeff,
             predictorFSeedAfterAdjust
         );
-    barrAtU += pressureBarrAtU;
+    barrAtU += pressureRAtUSeed.internal;
+
+    bool hasPressureBoundaryRAtUSeed = false;
+    forAll(pressureRAtUSeed.boundary, patchi)
+    {
+        if (gSum(mag(pressureRAtUSeed.boundary[patchi])) > SMALL)
+        {
+            hasPressureBoundaryRAtUSeed = true;
+            break;
+        }
+    }
+    reduce(hasPressureBoundaryRAtUSeed, orOp<bool>());
+
+    if (hasPressureBoundaryRAtUSeed && !solverControl_().consistent())
+    {
+        FatalErrorInFunction
+            << "Pressure boundary rAtU coefficient reverse is validated "
+            << "only for the consistent SIMPLE rAtU expression."
+            << exit(FatalError);
+    }
+
+    // The pressure Laplacian uses the actual boundary values of the
+    // calculated rAtU expression. These values vary in the discrete forward
+    // expression and cannot be recovered by calling correctBoundaryConditions()
+    // on an internal-only copied perturbation, so carry them separately.
+    if (hasPressureBoundaryRAtUSeed)
+    {
+        forAll(mesh_.boundary(), patchi)
+        {
+            const fvPatch& patch = mesh_.boundary()[patchi];
+            if (patch.type() == "empty")
+            {
+                continue;
+            }
+            if (patch.coupled())
+            {
+                FatalErrorInFunction
+                    << "Pressure boundary rAtU reverse supports only "
+                    << "non-coupled patches. Patch " << patch.name()
+                    << " is coupled." << exit(FatalError);
+            }
+
+            const scalarField& barRAtUp =
+                pressureRAtUSeed.boundary[patchi];
+            const scalar patchSeedL1 = gSum(mag(barRAtUp));
+            if (patchSeedL1 <= SMALL)
+            {
+                continue;
+            }
+
+            const fvPatchScalarField& rAUp =
+                rAU.boundaryField()[patchi];
+            const fvPatchScalarField& H1p =
+                H1Coeff.boundaryField()[patchi];
+            const fvPatchScalarField& rAtUp =
+                rAtUMap.boundaryField()[patchi];
+
+            if
+            (
+                rAUp.type() != fvPatchFieldBase::extrapolatedCalculatedType()
+             || H1p.type() != fvPatchFieldBase::extrapolatedCalculatedType()
+             || rAtUp.type() != "calculated"
+            )
+            {
+                FatalErrorInFunction
+                    << "Unsupported pressure boundary coefficient patch "
+                    << "types on patch " << patch.name()
+                    << ": rAU=" << rAUp.type()
+                    << ", H1=" << H1p.type()
+                    << ", rAtU=" << rAtUp.type()
+                    << exit(FatalError);
+            }
+
+            const labelUList& faceCells = patch.faceCells();
+            forAll(barRAtUp, facei)
+            {
+                const scalar barRAtUb = barRAtUp[facei];
+                if (mag(barRAtUb) <= SMALL)
+                {
+                    continue;
+                }
+
+                const label celli = faceCells[facei];
+                const scalar rAUb = rAUp[facei];
+                const scalar rAtUb = rAtUp[facei];
+
+                if (mag(rAUb) <= VSMALL)
+                {
+                    FatalErrorInFunction
+                        << "Cannot reverse boundary rAtU algebra on patch "
+                        << patch.name() << " face " << facei
+                        << " because base rAU boundary is zero."
+                        << exit(FatalError);
+                }
+
+                barrAU[celli] += barRAtUb*sqr(rAtUb)/sqr(rAUb);
+                barUEqnH1Coeff[celli] += barRAtUb*sqr(rAtUb);
+            }
+        }
+    }
+
     if (trace)
     {
-        trace->barrAtUFromPressureStage = pressureBarrAtU;
+        trace->barrAtUFromPressureStage = pressureRAtUSeed.internal;
     }
 
     tmp<surfaceScalarField> tPredictorFSeedBeforeAdjust =
@@ -10184,6 +10291,52 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
         {
             tape.rAtUBoundary[patchi] =
                 trAtU().boundaryField()[patchi];
+        }
+        static bool printedBoundaryCoeffSource = false;
+        if (!printedBoundaryCoeffSource)
+        {
+            Info<< "ATC-T boundary coefficient source paths: "
+                << "$FOAM_SRC/finiteVolume/fvMatrices/fvMatrix/"
+                << "fvMatrix.C::fvMatrix<Type>::A(), "
+                << "$FOAM_SRC/finiteVolume/fvMatrices/fvMatrix/"
+                << "fvMatrix.C::fvMatrix<Type>::H1(), "
+                << "$FOAM_SRC/finiteVolume/fields/fvPatchFields/basic/"
+                << "extrapolatedCalculated/"
+                << "extrapolatedCalculatedFvPatchField.C::evaluate(). "
+                << "A() and H1() construct extrapolatedCalculated "
+                << "patch fields and evaluate by extrapolateInternal()."
+                << endl;
+
+            forAll(mesh_.boundary(), patchi)
+            {
+                if (mesh_.boundary()[patchi].type() == "empty")
+                {
+                    continue;
+                }
+
+                const fvPatchScalarField& rAUp =
+                    rAUField.boundaryField()[patchi];
+                const fvPatchScalarField& H1p =
+                    H1Coeff.boundaryField()[patchi];
+                const fvPatchScalarField& rAtUp =
+                    trAtU().boundaryField()[patchi];
+
+                Info<< "ATC-T boundary coefficient patch types: "
+                    << "patch " << mesh_.boundary()[patchi].name()
+                    << " rAUType " << rAUp.type()
+                    << " rAUAssignable " << rAUp.assignable()
+                    << " rAUFixesValue " << rAUp.fixesValue()
+                    << " H1Type " << H1p.type()
+                    << " H1Assignable " << H1p.assignable()
+                    << " H1FixesValue " << H1p.fixesValue()
+                    << " rAtUType " << rAtUp.type()
+                    << " rAtUAssignable " << rAtUp.assignable()
+                    << " rAtUFixesValue " << rAtUp.fixesValue()
+                    << " coupled " << mesh_.boundary()[patchi].coupled()
+                    << endl;
+            }
+
+            printedBoundaryCoeffSource = true;
         }
         tape.H1 = H1Velocity.primitiveField();
         copySurfaceToTape(F2, tape.F2Internal, tape.F2Boundary);
@@ -17549,6 +17702,17 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
             scalar boundaryH1OwnerCandidate = Zero;
             scalar boundaryRAUZeroCandidate = Zero;
             scalar boundaryH1ZeroCandidate = Zero;
+            scalar boundaryRAUOwnerResidualL1 = Zero;
+            scalar boundaryH1OwnerResidualL1 = Zero;
+            scalar boundaryRAtUOwnerResidualL1 = Zero;
+            scalar boundaryRAUOwnerScaleL1 = VSMALL;
+            scalar boundaryH1OwnerScaleL1 = VSMALL;
+            scalar boundaryRAtUOwnerScaleL1 = VSMALL;
+            scalar boundaryRAUOwnerMaxResidual = Zero;
+            scalar boundaryH1OwnerMaxResidual = Zero;
+            scalar boundaryRAtUOwnerMaxResidual = Zero;
+            scalarField boundaryBarrAUOwner(mesh_.nCells(), Zero);
+            scalarField boundaryBarH1Owner(mesh_.nCells(), Zero);
             forAll(mesh_.boundary(), patchi)
             {
                 const fvPatch& patch = mesh_.boundary()[patchi];
@@ -17562,6 +17726,15 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                 scalar patchAlgebraResidualL1 = Zero;
                 scalar patchRAUOwnerCandidate = Zero;
                 scalar patchH1OwnerCandidate = Zero;
+                scalar patchRAUOwnerResidualL1 = Zero;
+                scalar patchH1OwnerResidualL1 = Zero;
+                scalar patchRAtUOwnerResidualL1 = Zero;
+                scalar patchRAUOwnerScaleL1 = VSMALL;
+                scalar patchH1OwnerScaleL1 = VSMALL;
+                scalar patchRAtUOwnerScaleL1 = VSMALL;
+                scalar patchRAUOwnerMaxResidual = Zero;
+                scalar patchH1OwnerMaxResidual = Zero;
+                scalar patchRAtUOwnerMaxResidual = Zero;
                 forAll(patch, facei)
                 {
                     const label celli = faceCells[facei];
@@ -17585,6 +17758,9 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                         dTape.rAUBoundary[patchi][facei];
                     const scalar dH1b =
                         dTape.UEqnH1Boundary[patchi][facei];
+                    const scalar dRAUOwner = dTape.rAU[celli];
+                    const scalar dH1Owner = dTape.UEqnH1Coeff[celli];
+                    const scalar dRAtUOwner = dTape.rAtU[celli];
                     const scalar dRAtUPred =
                         sqr(rAtUb)/sqr(rAUb)*dRAUb
                       + sqr(rAtUb)*dH1b;
@@ -17608,12 +17784,44 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                     patchRAUOwnerCandidate += barRAUb*dTape.rAU[celli];
                     patchH1OwnerCandidate +=
                         barH1b*dTape.UEqnH1Coeff[celli];
+                    boundaryBarrAUOwner[celli] += barRAUb;
+                    boundaryBarH1Owner[celli] += barH1b;
+
+                    const scalar rauOwnerResidual = dRAUb - dRAUOwner;
+                    const scalar h1OwnerResidual = dH1b - dH1Owner;
+                    const scalar rAtUOwnerResidual = dRAtUb - dRAtUOwner;
+                    patchRAUOwnerResidualL1 += mag(rauOwnerResidual);
+                    patchH1OwnerResidualL1 += mag(h1OwnerResidual);
+                    patchRAtUOwnerResidualL1 += mag(rAtUOwnerResidual);
+                    patchRAUOwnerScaleL1 += mag(dRAUb) + mag(dRAUOwner);
+                    patchH1OwnerScaleL1 += mag(dH1b) + mag(dH1Owner);
+                    patchRAtUOwnerScaleL1 +=
+                        mag(dRAtUb) + mag(dRAtUOwner);
+                    patchRAUOwnerMaxResidual =
+                        max(patchRAUOwnerMaxResidual, mag(rauOwnerResidual));
+                    patchH1OwnerMaxResidual =
+                        max(patchH1OwnerMaxResidual, mag(h1OwnerResidual));
+                    patchRAtUOwnerMaxResidual =
+                        max
+                        (
+                            patchRAtUOwnerMaxResidual,
+                            mag(rAtUOwnerResidual)
+                        );
                 }
                 reduce(patchAlgebraLhs, sumOp<scalar>());
                 reduce(patchAlgebraRhs, sumOp<scalar>());
                 reduce(patchAlgebraResidualL1, sumOp<scalar>());
                 reduce(patchRAUOwnerCandidate, sumOp<scalar>());
                 reduce(patchH1OwnerCandidate, sumOp<scalar>());
+                reduce(patchRAUOwnerResidualL1, sumOp<scalar>());
+                reduce(patchH1OwnerResidualL1, sumOp<scalar>());
+                reduce(patchRAtUOwnerResidualL1, sumOp<scalar>());
+                reduce(patchRAUOwnerScaleL1, sumOp<scalar>());
+                reduce(patchH1OwnerScaleL1, sumOp<scalar>());
+                reduce(patchRAtUOwnerScaleL1, sumOp<scalar>());
+                reduce(patchRAUOwnerMaxResidual, maxOp<scalar>());
+                reduce(patchH1OwnerMaxResidual, maxOp<scalar>());
+                reduce(patchRAtUOwnerMaxResidual, maxOp<scalar>());
 
                 if
                 (
@@ -17640,8 +17848,50 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                         << endl;
                 }
 
+                if
+                (
+                    patchRAUOwnerScaleL1 > VSMALL
+                 || patchH1OwnerScaleL1 > VSMALL
+                 || patchRAtUOwnerScaleL1 > VSMALL
+                )
+                {
+                    Info<< "ATC-T boundary coefficient owner tangent: "
+                        << seedName << " " << directionName
+                        << " eps " << eps
+                        << " patch " << patch.name()
+                        << " dRAUBoundaryOwnerRel "
+                        << patchRAUOwnerResidualL1/patchRAUOwnerScaleL1
+                        << " dH1BoundaryOwnerRel "
+                        << patchH1OwnerResidualL1/patchH1OwnerScaleL1
+                        << " dRAtUBoundaryOwnerRel "
+                        << patchRAtUOwnerResidualL1/patchRAtUOwnerScaleL1
+                        << " dRAUMaxResidual "
+                        << patchRAUOwnerMaxResidual
+                        << " dH1MaxResidual "
+                        << patchH1OwnerMaxResidual
+                        << " dRAtUMaxResidual "
+                        << patchRAtUOwnerMaxResidual
+                        << endl;
+                }
+
                 boundaryRAUOwnerCandidate += patchRAUOwnerCandidate;
                 boundaryH1OwnerCandidate += patchH1OwnerCandidate;
+                boundaryRAUOwnerResidualL1 += patchRAUOwnerResidualL1;
+                boundaryH1OwnerResidualL1 += patchH1OwnerResidualL1;
+                boundaryRAtUOwnerResidualL1 += patchRAtUOwnerResidualL1;
+                boundaryRAUOwnerScaleL1 += patchRAUOwnerScaleL1;
+                boundaryH1OwnerScaleL1 += patchH1OwnerScaleL1;
+                boundaryRAtUOwnerScaleL1 += patchRAtUOwnerScaleL1;
+                boundaryRAUOwnerMaxResidual =
+                    max(boundaryRAUOwnerMaxResidual, patchRAUOwnerMaxResidual);
+                boundaryH1OwnerMaxResidual =
+                    max(boundaryH1OwnerMaxResidual, patchH1OwnerMaxResidual);
+                boundaryRAtUOwnerMaxResidual =
+                    max
+                    (
+                        boundaryRAtUOwnerMaxResidual,
+                        patchRAtUOwnerMaxResidual
+                    );
             }
             boundaryAlgebraRhs =
                 boundaryAlgebraRAUPart + boundaryAlgebraH1Part;
@@ -17655,6 +17905,106 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
             reduce(boundaryH1OwnerCandidate, sumOp<scalar>());
             reduce(boundaryRAUZeroCandidate, sumOp<scalar>());
             reduce(boundaryH1ZeroCandidate, sumOp<scalar>());
+            reduce(boundaryRAUOwnerResidualL1, sumOp<scalar>());
+            reduce(boundaryH1OwnerResidualL1, sumOp<scalar>());
+            reduce(boundaryRAtUOwnerResidualL1, sumOp<scalar>());
+            reduce(boundaryRAUOwnerScaleL1, sumOp<scalar>());
+            reduce(boundaryH1OwnerScaleL1, sumOp<scalar>());
+            reduce(boundaryRAtUOwnerScaleL1, sumOp<scalar>());
+            reduce(boundaryRAUOwnerMaxResidual, maxOp<scalar>());
+            reduce(boundaryH1OwnerMaxResidual, maxOp<scalar>());
+            reduce(boundaryRAtUOwnerMaxResidual, maxOp<scalar>());
+
+            scalarField boundaryExtraBarD(mesh_.nCells(), Zero);
+            scalarField zeroScalarSeed(mesh_.nCells(), Zero);
+            vectorField zeroVectorSeed(mesh_.nCells(), vector::zero);
+            List<vectorField> zeroVectorBoundary(mesh_.boundary().size());
+            forAll(zeroVectorBoundary, patchi)
+            {
+                zeroVectorBoundary[patchi].setSize
+                (
+                    mesh_.boundary()[patchi].size(),
+                    vector::zero
+                );
+            }
+            forAll(boundaryExtraBarD, celli)
+            {
+                boundaryExtraBarD[celli] =
+                   -boundaryBarrAUOwner[celli]
+                   *sqr(baseTapeForStages.rAU[celli])/mesh_.V()[celli];
+            }
+
+            PredictorReverseSeed boundaryRAUPhiSeed =
+                reversePredictorYFullState
+                (
+                    zeroVectorSeed,
+                    zeroVectorBoundary,
+                    boundaryExtraBarD,
+                    zeroScalarSeed,
+                    true,
+                    true
+                );
+            PredictorReverseSeed boundaryH1PhiSeed =
+                reversePredictorYFullState
+                (
+                    zeroVectorSeed,
+                    zeroVectorBoundary,
+                    zeroScalarSeed,
+                    boundaryBarH1Owner,
+                    true,
+                    true
+                );
+            PredictorReverseSeed boundaryCombinedPhiSeed =
+                reversePredictorYFullState
+                (
+                    zeroVectorSeed,
+                    zeroVectorBoundary,
+                    boundaryExtraBarD,
+                    boundaryBarH1Owner,
+                    true,
+                    true
+                );
+
+            scalar rauPhiU = Zero;
+            scalar rauPhiInternal = Zero;
+            scalar rauPhiBoundary = Zero;
+            predictorSeedStateBlocks
+            (
+                boundaryRAUPhiSeed,
+                dir,
+                rauPhiU,
+                rauPhiInternal,
+                rauPhiBoundary
+            );
+            scalar h1PhiU = Zero;
+            scalar h1PhiInternal = Zero;
+            scalar h1PhiBoundary = Zero;
+            predictorSeedStateBlocks
+            (
+                boundaryH1PhiSeed,
+                dir,
+                h1PhiU,
+                h1PhiInternal,
+                h1PhiBoundary
+            );
+            scalar combinedPhiU = Zero;
+            scalar combinedPhiInternal = Zero;
+            scalar combinedPhiBoundary = Zero;
+            predictorSeedStateBlocks
+            (
+                boundaryCombinedPhiSeed,
+                dir,
+                combinedPhiU,
+                combinedPhiInternal,
+                combinedPhiBoundary
+            );
+            const scalar rauPhiRhs =
+                rauPhiU + rauPhiInternal + rauPhiBoundary;
+            const scalar h1PhiRhs =
+                h1PhiU + h1PhiInternal + h1PhiBoundary;
+            const scalar combinedPhiRhs =
+                combinedPhiU + combinedPhiInternal + combinedPhiBoundary;
+            const scalar separatePhiRhs = rauPhiRhs + h1PhiRhs;
 
             Info<< "ATC-T pressure-rAtU boundary face transpose: "
                 << seedName << " " << directionName
@@ -17688,6 +18038,49 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                 << " h1Part " << boundaryAlgebraH1Part
                 << " rauOwnerCandidate " << boundaryRAUOwnerCandidate
                 << " h1OwnerCandidate " << boundaryH1OwnerCandidate
+                << endl;
+
+            Info<< "ATC-T boundary coefficient owner tangent total: "
+                << seedName << " " << directionName
+                << " eps " << eps
+                << " dRAURel "
+                << boundaryRAUOwnerResidualL1/boundaryRAUOwnerScaleL1
+                << " dH1Rel "
+                << boundaryH1OwnerResidualL1/boundaryH1OwnerScaleL1
+                << " dRAtURel "
+                << boundaryRAtUOwnerResidualL1/boundaryRAtUOwnerScaleL1
+                << " dRAUMax " << boundaryRAUOwnerMaxResidual
+                << " dH1Max " << boundaryH1OwnerMaxResidual
+                << " dRAtUMax " << boundaryRAtUOwnerMaxResidual
+                << endl;
+
+            Info<< "ATC-T boundary pressure phi reconstruction: "
+                << seedName << " " << directionName
+                << " eps " << eps
+                << " rauLhs " << boundaryAlgebraRAUPart
+                << " rauOwnerState "
+                << boundaryRAUOwnerCandidate
+                << " rauPhiRhs " << rauPhiRhs
+                << " rauGap "
+                << boundaryAlgebraRAUPart - rauPhiRhs
+                << " h1Lhs " << boundaryAlgebraH1Part
+                << " h1OwnerState "
+                << boundaryH1OwnerCandidate
+                << " h1PhiRhs " << h1PhiRhs
+                << " h1Gap "
+                << boundaryAlgebraH1Part - h1PhiRhs
+                << " combinedLhs " << boundaryAlgebraLhs
+                << " separatePhiRhs " << separatePhiRhs
+                << " combinedPhiRhs " << combinedPhiRhs
+                << " separateGap "
+                << boundaryAlgebraLhs - separatePhiRhs
+                << " combinedGap "
+                << boundaryAlgebraLhs - combinedPhiRhs
+                << " fullGapBefore " << lhs - rhs
+                << " correctedGapSeparate "
+                << lhs - (rhs + separatePhiRhs)
+                << " correctedGapCombined "
+                << lhs - (rhs + combinedPhiRhs)
                 << endl;
 
             scalar internalCellContribution =
