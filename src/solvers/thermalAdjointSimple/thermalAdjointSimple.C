@@ -776,7 +776,10 @@ void Foam::thermalAdjointSimple::validateExactThermalCouplingOptions() const
      || checkFixedPointAdjointSolve_
      || checkFixedPointAdjointRepeatability_
      || checkFixedPointAdjointNeumann_
-     || checkFixedPointAdjointBetaSensitivity_;
+     || checkFixedPointAdjointBetaSensitivity_
+     || computeAnalyticFixedPointAdjointBeta_
+     || checkAnalyticFixedPointAdjointBeta_
+     || writeAnalyticFixedPointAdjointBeta_;
 
     if (needsExactScalar && !exactScalarThermalTranspose_)
     {
@@ -875,6 +878,33 @@ void Foam::thermalAdjointSimple::validateFixedPointAdjointControls() const
                     << fixedPointAdjointBetaFDEps_[epsi]
                     << exit(FatalError);
             }
+        }
+    }
+
+    if (computeAnalyticFixedPointAdjointBeta_ && !solveFixedPointAdjoint_)
+    {
+        FatalErrorInFunction
+            << "computeAnalyticFixedPointAdjointBeta requires "
+            << "solveFixedPointAdjoint true." << exit(FatalError);
+    }
+
+    if (checkAnalyticFixedPointAdjointBeta_)
+    {
+        if (!computeAnalyticFixedPointAdjointBeta_)
+        {
+            FatalErrorInFunction
+                << "checkAnalyticFixedPointAdjointBeta requires "
+                << "computeAnalyticFixedPointAdjointBeta true."
+                << exit(FatalError);
+        }
+
+        if (!checkFixedPointAdjointBetaSensitivity_)
+        {
+            FatalErrorInFunction
+                << "checkAnalyticFixedPointAdjointBeta requires "
+                << "checkFixedPointAdjointBetaSensitivity true so the "
+                << "selected-cell finite-difference beta plateaus are "
+                << "computed independently." << exit(FatalError);
         }
     }
 }
@@ -2731,7 +2761,8 @@ Foam::thermalAdjointSimple::reversePredictorYFullState
     const scalarField& extraBarDfinal,
     const scalarField& extraBarUEqnH1Coeff,
     const bool doRelax,
-    const bool doFvOptionsConstrain
+    const bool doFvOptionsConstrain,
+    FixedPointBetaReverseTrace* betaTrace
 )
 {
     volVectorField& U = primalVars_.U();
@@ -2790,6 +2821,7 @@ Foam::thermalAdjointSimple::reversePredictorYFullState
     const scalarField lowerRaw(UEqn.lower());
     const scalarField upperRaw(UEqn.upper());
     const FieldField<Field, vector> internalCoeffsRaw(UEqn.internalCoeffs());
+    const FieldField<Field, vector> boundaryCoeffsRaw(UEqn.boundaryCoeffs());
     const vectorField sourceRaw(UEqn.source());
     scalarField diagRelax(diagRaw);
     vectorField sourceRelax(sourceRaw);
@@ -2809,6 +2841,85 @@ Foam::thermalAdjointSimple::reversePredictorYFullState
         fvOptions.constrain(UEqn);
         diagFinal = UEqn.diag();
         sourceFinal = UEqn.source();
+    }
+
+    if (betaTrace)
+    {
+        betaTrace->rawDiag = diagRaw;
+        betaTrace->relaxedDiag = diagRelax;
+        betaTrace->finalDiag = diagFinal;
+        betaTrace->rawSource = sourceRaw;
+        betaTrace->relaxedSource = sourceRelax;
+        betaTrace->finalSource = sourceFinal;
+
+        scalarField rawRelaxD(diagRaw);
+        scalarField rawRelaxSumOff(mesh_.nCells(), Zero);
+
+        const labelUList& owners = mesh_.owner();
+        const labelUList& neighbours = mesh_.neighbour();
+        forAll(owners, facei)
+        {
+            const label P = owners[facei];
+            const label N = neighbours[facei];
+            rawRelaxSumOff[N] += mag(lowerRaw[facei]);
+            rawRelaxSumOff[P] += mag(upperRaw[facei]);
+        }
+
+        forAll(U.boundaryField(), patchi)
+        {
+            const fvPatchVectorField& Up = U.boundaryField()[patchi];
+            if (!Up.size())
+            {
+                continue;
+            }
+
+            const labelUList& faceCells = mesh_.boundary()[patchi].faceCells();
+            const vectorField& iCoeffs = internalCoeffsRaw[patchi];
+
+            if (Up.coupled())
+            {
+                const vectorField& bCoeffs = boundaryCoeffsRaw[patchi];
+                forAll(faceCells, facei)
+                {
+                    const label celli = faceCells[facei];
+                    rawRelaxD[celli] += component(iCoeffs[facei], 0);
+                    rawRelaxSumOff[celli] +=
+                        mag(component(bCoeffs[facei], 0));
+                }
+            }
+            else
+            {
+                forAll(faceCells, facei)
+                {
+                    rawRelaxD[faceCells[facei]] +=
+                        cmptMax(cmptMag(iCoeffs[facei]));
+                }
+            }
+        }
+
+        betaTrace->rawRelaxD = rawRelaxD;
+        betaTrace->rawRelaxSumOff = rawRelaxSumOff;
+        forAll(rawRelaxD, celli)
+        {
+            const scalar magD = mag(rawRelaxD[celli]);
+            const scalar sumOff = rawRelaxSumOff[celli];
+            betaTrace->rawRelaxSelected[celli] = max(magD, sumOff);
+            betaTrace->rawRelaxBranchMargin[celli] =
+                mag(magD - sumOff)/max(magD + sumOff, VSMALL);
+
+            if (betaTrace->rawRelaxBranchMargin[celli] <= scalar(1e-10))
+            {
+                betaTrace->rawRelaxBranch[celli] = 2;
+            }
+            else if (magD > sumOff)
+            {
+                betaTrace->rawRelaxBranch[celli] = 0;
+            }
+            else
+            {
+                betaTrace->rawRelaxBranch[celli] = 1;
+            }
+        }
     }
 
     volScalarField rAU(1.0/UEqn.A());
@@ -2939,6 +3050,17 @@ Foam::thermalAdjointSimple::reversePredictorYFullState
         barU[celli] += barYWork[celli];
     }
 
+    if (betaTrace)
+    {
+        betaTrace->barResidual = barE;
+        betaTrace->barFinalSource = barE;
+        forAll(barE, celli)
+        {
+            betaTrace->barFinalDFromResidual[celli] =
+               -(barE[celli] & U[celli]);
+        }
+    }
+
     if (extraBarDfinal.size() != mesh_.nCells())
     {
         FatalErrorInFunction
@@ -3032,6 +3154,14 @@ Foam::thermalAdjointSimple::reversePredictorYFullState
     // transpose as the intrinsic predictor diagonal seed.
     const scalarField barDFromY(barD);
     barD += extraBarDfinal;
+
+    if (betaTrace)
+    {
+        betaTrace->barFinalDFromRAU = barD;
+        betaTrace->barFinalDTotal = betaTrace->barFinalDFromResidual;
+        betaTrace->barFinalDTotal += betaTrace->barFinalDFromRAU;
+        betaTrace->barFinalH1 = extraBarUEqnH1Coeff;
+    }
 
     forAll(own, facei)
     {
@@ -3333,7 +3463,8 @@ Foam::thermalAdjointSimple::reverseOneSimpleMapSeedImpl
 (
     const SimpleMapSeed& seedNew,
     const volScalarField& rAtUBase,
-    SmoothPhiCoefficientTrace* trace
+    SmoothPhiCoefficientTrace* trace,
+    FixedPointBetaReverseTrace* betaTrace
 )
 {
     const labelUList& own = mesh_.owner();
@@ -4145,7 +4276,8 @@ Foam::thermalAdjointSimple::reverseOneSimpleMapSeedImpl
             barDfinal,
             barUEqnH1Coeff,
             true,
-            true
+            true,
+            betaTrace
         );
 
     SimpleMapSeed seedOld(mesh_);
@@ -6392,6 +6524,3429 @@ Foam::thermalAdjointSimple::runFixedPointAdjointSolve()
 }
 
 
+Foam::tmp<Foam::volScalarField>
+Foam::thermalAdjointSimple::analyticFixedPointAdjointBeta
+(
+    const SimpleMapSeed& psi,
+    const word& designVariablesName,
+    const scalar dt
+)
+{
+    if (!computeAnalyticFixedPointAdjointBeta_)
+    {
+        return tmp<volScalarField>::New
+        (
+            IOobject
+            (
+                "ATCTfixedPointBetaFlowBetaMult",
+                mesh_.time().timeName(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE
+            ),
+            mesh_,
+            dimensionedScalar(dimless, Zero),
+            calculatedFvPatchScalarField::typeName
+        );
+    }
+
+    if (mag(dt) <= VSMALL)
+    {
+        FatalErrorInFunction
+            << "analyticFixedPointAdjointBeta requires non-zero dt."
+            << exit(FatalError);
+    }
+
+    if (!mesh_.foundObject<topOVariablesBase>("topOVars"))
+    {
+        FatalErrorInFunction
+            << "Analytic fixed-point beta reverse requires topOVars."
+            << exit(FatalError);
+    }
+
+    checkSimpleMapSeedSizes(psi, "analyticFixedPointAdjointBeta psi");
+
+    topOVariablesBase& vars =
+        const_cast<topOVariablesBase&>
+        (
+            mesh_.lookupObject<topOVariablesBase>("topOVars")
+        );
+    const topOZones& zones = vars.getTopOZones();
+    volScalarField& beta = const_cast<volScalarField&>(vars.beta());
+    volVectorField& U = primalVars_.U();
+    volScalarField& p = const_cast<volScalarField&>(primalVars_.p());
+    surfaceScalarField& phi = primalVars_.phi();
+    volScalarField& T = const_cast<volScalarField&>(TRef());
+    autoPtr<incompressible::turbulenceModel>& turbulence =
+        primalVars_.turbulence();
+    fv::options& fvOptions(fv::options::New(mesh_));
+    const scalarField& V = mesh_.V();
+
+    if (!fvOptions.appliesToField(U.name()))
+    {
+        FatalErrorInFunction
+            << "Analytic fixed-point beta reverse requires an active "
+            << "momentum fvOption on field " << U.name() << "."
+            << exit(FatalError);
+    }
+
+    Info<< "ATC-T analytic fixed-point beta source audit: "
+        << "topOSource.C:55-90 getSource uses "
+        << "topOVariablesBase::sourceTerm(interpolation,betaMax); "
+        << "topOSource.C:116-121 adds eqn -= fvm::Sp(getSource(),U); "
+        << "topOSource.C:170-196 postProcessSens applies the same "
+        << "interpolation derivative and betaMax; "
+        << "fvmSup.C:118-154 gives fvm::Sp diag += V*source; "
+        << "fvMatrix.C:1101-1247 relaxes D=max(mag(D),sumOff)/alpha and "
+        << "adds (D-D0)*U to source; fvMatrix.C:1280-1328 defines "
+        << "D() and A()==D()/V; fvMatrix.C:1384-1410 defines H1() from "
+        << "off-diagonal coefficients only for non-coupled patches."
+        << endl;
+
+    bitSet isDesign(mesh_.nCells(), false);
+    if (zones.adjointPorousZoneIDs().empty())
+    {
+        isDesign.fill(true);
+    }
+    else
+    {
+        for (const label zoneID : zones.adjointPorousZoneIDs())
+        {
+            for (const label celli : mesh_.cellZones()[zoneID])
+            {
+                isDesign.set(celli);
+            }
+        }
+    }
+
+    auto unsetZone = [&](const label zoneID)
+    {
+        if (zoneID != -1)
+        {
+            for (const label celli : mesh_.cellZones()[zoneID])
+            {
+                isDesign.unset(celli);
+            }
+        }
+    };
+
+    for (const label zoneID : zones.fixedPorousZoneIDs())
+    {
+        unsetZone(zoneID);
+    }
+    for (const label zoneID : zones.fixedZeroPorousZoneIDs())
+    {
+        unsetZone(zoneID);
+    }
+    for (const label celli : zones.IOCells())
+    {
+        isDesign.unset(celli);
+    }
+
+    label nActive = 0;
+    forAll(isDesign, celli)
+    {
+        if (isDesign.test(celli))
+        {
+            ++nActive;
+        }
+    }
+    reduce(nActive, sumOp<label>());
+
+    tmp<volScalarField> trAtUBase = fixedPointAdjointRAtUBase();
+    const volScalarField& rAtUBase = trAtUBase();
+
+    FixedPointBetaReverseTrace betaTrace(mesh_);
+    SimpleMapSeed traced =
+        reverseOneSimpleMapSeedImpl
+        (
+            psi,
+            rAtUBase,
+            nullptr,
+            &betaTrace
+        );
+    SimpleMapSeed untraced = reverseOneSimpleMapSeed(psi, rAtUBase);
+    const scalar traceSeedDiff = maxDifferenceSimpleMapSeed(traced, untraced);
+
+    Info<< "ATC-T analytic fixed-point beta trace no-change maxDiff "
+        << traceSeedDiff << endl;
+
+    if (traceSeedDiff > scalar(1e-14))
+    {
+        FatalErrorInFunction
+            << "Adding the analytic beta trace changed reverseOneSimpleMapSeed."
+            << " maxDifference = " << traceSeedDiff << exit(FatalError);
+    }
+
+    scalar alphaU = scalar(1);
+    scalar relaxCoeff = scalar(0);
+    const word URelaxName = U.select(mesh_.data().isFinalIteration());
+    if (mesh_.relaxEquation(URelaxName, relaxCoeff))
+    {
+        alphaU = relaxCoeff;
+    }
+
+    if (alphaU <= scalar(0))
+    {
+        FatalErrorInFunction
+            << "Unsupported non-positive U relaxation coefficient "
+            << alphaU << exit(FatalError);
+    }
+
+    const scalar betaBoundTol = scalar(1e-12);
+    const scalar tieRelTol = scalar(1e-12);
+    const scalar strictBranchMarginTol = scalar(1e-10);
+
+    enum RelaxBranchClass
+    {
+        strictRawDiagonal = 0,
+        strictOffDiagonal = 1,
+        structuralLowerBoundTie = 2,
+        unsupportedTie = 3
+    };
+
+    auto classifyRelaxBranch =
+        [&]
+        (
+            const scalar betaValue,
+            const scalar rawD,
+            const scalar sumOff,
+            const scalar margin
+        )
+    {
+        if
+        (
+            rawD > scalar(0)
+         && rawD > sumOff
+         && margin > strictBranchMarginTol
+        )
+        {
+            return strictRawDiagonal;
+        }
+
+        if (sumOff > mag(rawD) && margin > strictBranchMarginTol)
+        {
+            return strictOffDiagonal;
+        }
+
+        const scalar tie =
+            mag(rawD - sumOff)/max(mag(rawD) + sumOff, VSMALL);
+        if
+        (
+            betaValue <= betaBoundTol
+         && rawD > scalar(0)
+         && tie <= tieRelTol
+        )
+        {
+            return structuralLowerBoundTie;
+        }
+
+        return unsupportedTie;
+    };
+
+    auto relaxClassName = [](const label relaxClass)
+    {
+        if (relaxClass == strictRawDiagonal)
+        {
+            return word("strictRawDiagonal");
+        }
+        if (relaxClass == strictOffDiagonal)
+        {
+            return word("strictOffDiagonal");
+        }
+        if (relaxClass == structuralLowerBoundTie)
+        {
+            return word("structuralLowerBoundTie");
+        }
+        return word("unsupportedTie");
+    };
+
+    scalarField dRawDiag_da(V);
+    scalarField dFinalD_da(mesh_.nCells(), Zero);
+    vectorField dFinalSource_da(mesh_.nCells(), vector::zero);
+    scalarField dFinalH1_da(mesh_.nCells(), Zero);
+
+    labelList relaxClass(mesh_.nCells(), unsupportedTie);
+    boolList isStructuralLowerBoundTie(mesh_.nCells(), false);
+
+    label nClassicalRawBranchCells = 0;
+    label nStrictOffDiagonalCells = 0;
+    label nStructuralLowerBoundTieCells = 0;
+    label nUnsupportedTieCells = 0;
+    scalar minStrictRelaxBranchMargin = GREAT;
+    scalar minRawRelaxD = GREAT;
+    label minStrictRelaxBranchMarginCell = -1;
+    forAll(V, celli)
+    {
+        dFinalD_da[celli] = dRawDiag_da[celli]/alphaU;
+        dFinalSource_da[celli] =
+            (dFinalD_da[celli] - dRawDiag_da[celli])*U[celli];
+        dFinalH1_da[celli] = Zero;
+
+        if (!isDesign.test(celli))
+        {
+            continue;
+        }
+
+        const scalar rawD = betaTrace.rawRelaxD[celli];
+        const scalar sumOff = betaTrace.rawRelaxSumOff[celli];
+        const scalar margin = betaTrace.rawRelaxBranchMargin[celli];
+        const label cellRelaxClass =
+            classifyRelaxBranch(beta[celli], rawD, sumOff, margin);
+        relaxClass[celli] = cellRelaxClass;
+
+        if
+        (
+            (cellRelaxClass == strictRawDiagonal)
+         && margin < minStrictRelaxBranchMargin
+        )
+        {
+            minStrictRelaxBranchMargin = margin;
+            minStrictRelaxBranchMarginCell = celli;
+        }
+        minRawRelaxD = min(minRawRelaxD, rawD);
+
+        if (cellRelaxClass == strictRawDiagonal)
+        {
+            ++nClassicalRawBranchCells;
+        }
+        else if (cellRelaxClass == strictOffDiagonal)
+        {
+            if (nStrictOffDiagonalCells < 20)
+            {
+                Info<< "ATC-T analytic fixed-point beta unsupported strict "
+                    << "off-diagonal branch: cell " << celli
+                    << " rawD " << rawD
+                    << " sumOff " << sumOff
+                    << " margin " << margin
+                    << " beta " << beta[celli]
+                    << endl;
+            }
+            ++nStrictOffDiagonalCells;
+        }
+        else if (cellRelaxClass == structuralLowerBoundTie)
+        {
+            isStructuralLowerBoundTie[celli] = true;
+            if (nStructuralLowerBoundTieCells < 20)
+            {
+                Info<< "ATC-T analytic fixed-point beta structural "
+                    << "lower-bound relaxation tie: cell " << celli
+                    << " rawD " << rawD
+                    << " sumOff " << sumOff
+                    << " tieRel "
+                    << mag(rawD - sumOff)/max(mag(rawD) + sumOff, VSMALL)
+                    << " beta " << beta[celli]
+                    << endl;
+            }
+            ++nStructuralLowerBoundTieCells;
+        }
+        else
+        {
+            if (nUnsupportedTieCells < 20)
+            {
+                Info<< "ATC-T analytic fixed-point beta unsupported "
+                    << "relaxation tie: cell " << celli
+                    << " rawD " << rawD
+                    << " sumOff " << sumOff
+                    << " margin " << margin
+                    << " beta " << beta[celli]
+                    << " sourceBranch " << betaTrace.rawRelaxBranch[celli]
+                    << endl;
+            }
+            ++nUnsupportedTieCells;
+        }
+    }
+    reduce(nClassicalRawBranchCells, sumOp<label>());
+    reduce(nStrictOffDiagonalCells, sumOp<label>());
+    reduce(nStructuralLowerBoundTieCells, sumOp<label>());
+    reduce(nUnsupportedTieCells, sumOp<label>());
+    reduce(minStrictRelaxBranchMargin, minOp<scalar>());
+    reduce(minRawRelaxD, minOp<scalar>());
+
+    betaTrace.dFinalD_dRawSourceCoeff = dFinalD_da;
+    betaTrace.dFinalSource_dRawSourceCoeff = dFinalSource_da;
+    betaTrace.dFinalH1_dRawSourceCoeff = dFinalH1_da;
+
+    scalarField coeffIntegrated(mesh_.nCells(), Zero);
+    scalarField residualPart(mesh_.nCells(), Zero);
+    scalarField rAUPart(mesh_.nCells(), Zero);
+    scalarField sourcePart(mesh_.nCells(), Zero);
+    scalarField h1Part(mesh_.nCells(), Zero);
+    scalar maxSimplifiedAbsDiff = Zero;
+    scalar maxSimplifiedRelDiff = Zero;
+    label maxSimplifiedDiffCell = -1;
+
+    forAll(coeffIntegrated, celli)
+    {
+        residualPart[celli] =
+            betaTrace.barFinalDFromResidual[celli]*dFinalD_da[celli];
+        rAUPart[celli] =
+            betaTrace.barFinalDFromRAU[celli]*dFinalD_da[celli];
+        sourcePart[celli] =
+            betaTrace.barFinalSource[celli] & dFinalSource_da[celli];
+        h1Part[celli] =
+            betaTrace.barFinalH1[celli]*dFinalH1_da[celli];
+
+        coeffIntegrated[celli] =
+            residualPart[celli]
+          + rAUPart[celli]
+          + sourcePart[celli]
+          + h1Part[celli];
+
+        const scalar simplified =
+            betaTrace.barFinalDFromResidual[celli]*dRawDiag_da[celli]
+          + rAUPart[celli];
+        const scalar simplifiedDiff = mag(coeffIntegrated[celli] - simplified);
+        const scalar simplifiedRel =
+            simplifiedDiff
+           /max(mag(coeffIntegrated[celli]) + mag(simplified), VSMALL);
+
+        if (simplifiedDiff > maxSimplifiedAbsDiff)
+        {
+            maxSimplifiedAbsDiff = simplifiedDiff;
+            maxSimplifiedRelDiff = simplifiedRel;
+            maxSimplifiedDiffCell = celli;
+        }
+    }
+    reduce(maxSimplifiedAbsDiff, maxOp<scalar>());
+    reduce(maxSimplifiedRelDiff, maxOp<scalar>());
+
+    scalarField flowIntegratedBeta(coeffIntegrated);
+    fvOptions.postProcessSens(flowIntegratedBeta, U.name(), designVariablesName);
+
+    label nNonzeroBeforeMask = 0;
+    forAll(flowIntegratedBeta, celli)
+    {
+        if (mag(flowIntegratedBeta[celli]) > SMALL)
+        {
+            ++nNonzeroBeforeMask;
+        }
+    }
+    reduce(nNonzeroBeforeMask, sumOp<label>());
+
+    forAll(flowIntegratedBeta, celli)
+    {
+        if (!isDesign.test(celli))
+        {
+            flowIntegratedBeta[celli] = Zero;
+        }
+    }
+
+    label nNonzeroAfterMask = 0;
+    forAll(flowIntegratedBeta, celli)
+    {
+        if (mag(flowIntegratedBeta[celli]) > SMALL)
+        {
+            ++nNonzeroAfterMask;
+        }
+    }
+    reduce(nNonzeroAfterMask, sumOp<label>());
+
+    auto tFlowBetaMult =
+        tmp<volScalarField>::New
+        (
+            IOobject
+            (
+                "ATCTfixedPointBetaFlowBetaMult",
+                mesh_.time().timeName(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE
+            ),
+            beta
+        );
+    volScalarField& flowBetaMult = tFlowBetaMult.ref();
+    flowBetaMult.primitiveFieldRef() = flowIntegratedBeta/V*dt;
+
+    forAll(flowBetaMult.boundaryFieldRef(), patchi)
+    {
+        flowBetaMult.boundaryFieldRef()[patchi] == Zero;
+    }
+
+    Info<< "ATC-T analytic fixed-point beta controls: alphaU " << alphaU
+        << " activeDesignCells " << nActive
+        << " nonzeroBeforeMask " << nNonzeroBeforeMask
+        << " nonzeroAfterMask " << nNonzeroAfterMask
+        << " minStrictRelaxBranchMargin " << minStrictRelaxBranchMargin
+        << " minStrictRelaxBranchMarginCell "
+        << minStrictRelaxBranchMarginCell
+        << " nClassicalRawBranchCells " << nClassicalRawBranchCells
+        << " nStrictOffDiagonalCells " << nStrictOffDiagonalCells
+        << " nFeasibleRightDerivativeCells "
+        << nStructuralLowerBoundTieCells
+        << " nUnsupportedTieCells " << nUnsupportedTieCells
+        << " minRawD " << minRawRelaxD
+        << endl;
+
+    Info<< "ATC-T analytic fixed-point beta full-vs-simplified coefficient "
+        << "contraction: maxAbsDiff " << maxSimplifiedAbsDiff
+        << " maxRelDiff " << maxSimplifiedRelDiff
+        << " cell " << maxSimplifiedDiffCell
+        << endl;
+
+    if (maxSimplifiedAbsDiff > scalar(1e-13))
+    {
+        FatalErrorInFunction
+            << "Full and simplified analytic beta coefficient contractions "
+            << "differ by " << maxSimplifiedAbsDiff
+            << " at cell " << maxSimplifiedDiffCell << exit(FatalError);
+    }
+
+    if (nStrictOffDiagonalCells || nUnsupportedTieCells)
+    {
+        FatalErrorInFunction
+            << "Analytic fixed-point beta reverse found "
+            << nStrictOffDiagonalCells << " strict off-diagonal cells and "
+            << nUnsupportedTieCells
+            << " unsupported relaxation ties. No feasible lower-bound "
+            << "interpretation has been applied to these cells."
+            << exit(FatalError);
+    }
+
+    const scalarField betaProbeBaseInternal(beta.primitiveField());
+    List<scalarField> betaProbeBaseBoundary(mesh_.boundary().size());
+    forAll(betaProbeBaseBoundary, patchi)
+    {
+        betaProbeBaseBoundary[patchi] = beta.boundaryField()[patchi];
+    }
+
+    auto restoreBetaProbe = [&]()
+    {
+        beta.primitiveFieldRef() = betaProbeBaseInternal;
+        forAll(beta.boundaryFieldRef(), patchi)
+        {
+            beta.boundaryFieldRef()[patchi] == betaProbeBaseBoundary[patchi];
+        }
+        beta.correctBoundaryConditions();
+    };
+
+    struct BetaRelaxProbeState
+    {
+        scalarField rawRelaxD;
+        scalarField rawRelaxSumOff;
+        scalarField rawRelaxSelected;
+        scalarField rawRelaxBranchMargin;
+        labelList rawRelaxBranch;
+        scalarField finalD;
+        vectorField finalSource;
+        scalarField finalH1;
+
+        explicit BetaRelaxProbeState(const fvMesh& mesh)
+        :
+            rawRelaxD(mesh.nCells(), Zero),
+            rawRelaxSumOff(mesh.nCells(), Zero),
+            rawRelaxSelected(mesh.nCells(), Zero),
+            rawRelaxBranchMargin(mesh.nCells(), GREAT),
+            rawRelaxBranch(mesh.nCells(), -1),
+            finalD(mesh.nCells(), Zero),
+            finalSource(mesh.nCells(), vector::zero),
+            finalH1(mesh.nCells(), Zero)
+        {}
+    };
+
+    auto assembleRelaxProbe = [&]()
+    {
+        BetaRelaxProbeState state(mesh_);
+
+        tmp<fvVectorMatrix> tUEqn
+        (
+            fvm::div(phi, U)
+          + turbulence->divDevReff(U)
+         ==
+            fvOptions(U)
+        );
+        fvVectorMatrix& UEqn = tUEqn.ref();
+
+        const scalarField diagRaw(UEqn.diag());
+        const scalarField lowerRaw(UEqn.lower());
+        const scalarField upperRaw(UEqn.upper());
+        const FieldField<Field, vector> internalCoeffsRaw
+        (
+            UEqn.internalCoeffs()
+        );
+        const FieldField<Field, vector> boundaryCoeffsRaw
+        (
+            UEqn.boundaryCoeffs()
+        );
+
+        state.rawRelaxD = diagRaw;
+
+        const labelUList& owners = mesh_.owner();
+        const labelUList& neighbours = mesh_.neighbour();
+        forAll(owners, facei)
+        {
+            const label P = owners[facei];
+            const label N = neighbours[facei];
+            state.rawRelaxSumOff[N] += mag(lowerRaw[facei]);
+            state.rawRelaxSumOff[P] += mag(upperRaw[facei]);
+        }
+
+        forAll(U.boundaryField(), patchi)
+        {
+            const fvPatchVectorField& Up = U.boundaryField()[patchi];
+            if (!Up.size())
+            {
+                continue;
+            }
+
+            const labelUList& faceCells =
+                mesh_.boundary()[patchi].faceCells();
+            const vectorField& iCoeffs = internalCoeffsRaw[patchi];
+
+            if (Up.coupled())
+            {
+                const vectorField& bCoeffs = boundaryCoeffsRaw[patchi];
+                forAll(faceCells, facei)
+                {
+                    const label celli = faceCells[facei];
+                    state.rawRelaxD[celli] +=
+                        component(iCoeffs[facei], 0);
+                    state.rawRelaxSumOff[celli] +=
+                        mag(component(bCoeffs[facei], 0));
+                }
+            }
+            else
+            {
+                forAll(faceCells, facei)
+                {
+                    state.rawRelaxD[faceCells[facei]] +=
+                        cmptMax(cmptMag(iCoeffs[facei]));
+                }
+            }
+        }
+
+        forAll(state.rawRelaxD, celli)
+        {
+            const scalar magD = mag(state.rawRelaxD[celli]);
+            const scalar sumOff = state.rawRelaxSumOff[celli];
+            state.rawRelaxSelected[celli] = max(magD, sumOff);
+            state.rawRelaxBranchMargin[celli] =
+                mag(magD - sumOff)/max(magD + sumOff, VSMALL);
+            state.rawRelaxBranch[celli] =
+                classifyRelaxBranch
+                (
+                    beta[celli],
+                    state.rawRelaxD[celli],
+                    sumOff,
+                    state.rawRelaxBranchMargin[celli]
+                );
+        }
+
+        UEqn.relax();
+        fvOptions.constrain(UEqn);
+
+        tmp<scalarField> tD = UEqn.D();
+        state.finalD = tD();
+        state.finalSource = UEqn.source();
+        tmp<volScalarField> tH1 = UEqn.H1();
+        state.finalH1 = tH1().primitiveField();
+
+        return state;
+    };
+
+    auto probeSingleCellRelaxState =
+        [&](const label celli, const scalar betaValue)
+    {
+        restoreBetaProbe();
+        beta.primitiveFieldRef()[celli] = betaValue;
+        beta.correctBoundaryConditions();
+        BetaRelaxProbeState state = assembleRelaxProbe();
+        restoreBetaProbe();
+        return state;
+    };
+
+    restoreBetaProbe();
+    BetaRelaxProbeState baseRelaxProbe = assembleRelaxProbe();
+    restoreBetaProbe();
+
+    DynamicList<label> structuralProbeReportCells;
+    auto addStructuralProbeReportCell = [&](const label celli)
+    {
+        if
+        (
+            celli >= 0
+         && celli < mesh_.nCells()
+         && isDesign.test(celli)
+         && isStructuralLowerBoundTie[celli]
+        )
+        {
+            forAll(structuralProbeReportCells, i)
+            {
+                if (structuralProbeReportCells[i] == celli)
+                {
+                    return;
+                }
+            }
+            structuralProbeReportCells.append(celli);
+        }
+    };
+
+    for (label celli = 61; celli <= 80; ++celli)
+    {
+        addStructuralProbeReportCell(celli);
+    }
+    addStructuralProbeReportCell(708);
+    addStructuralProbeReportCell(709);
+
+    for (label pick = 0; pick < 5; ++pick)
+    {
+        label bestCell = -1;
+        scalar bestMag = -1;
+        forAll(flowBetaMult, celli)
+        {
+            if
+            (
+                !isStructuralLowerBoundTie[celli]
+             || !isDesign.test(celli)
+            )
+            {
+                continue;
+            }
+
+            const scalar candidate = mag(flowBetaMult[celli]);
+            bool alreadySelected = false;
+            forAll(structuralProbeReportCells, i)
+            {
+                if (structuralProbeReportCells[i] == celli)
+                {
+                    alreadySelected = true;
+                    break;
+                }
+            }
+            if (!alreadySelected && candidate > bestMag)
+            {
+                bestMag = candidate;
+                bestCell = celli;
+            }
+        }
+        addStructuralProbeReportCell(bestCell);
+    }
+
+    for (label pick = 0; pick < 5; ++pick)
+    {
+        for (label attempt = 0; attempt < mesh_.nCells(); ++attempt)
+        {
+            const label celli =
+                (
+                    label(769)*(pick + 1)
+                  + label(43)*attempt
+                  + label(197)
+                ) % mesh_.nCells();
+
+            if
+            (
+                isDesign.test(celli)
+             && isStructuralLowerBoundTie[celli]
+            )
+            {
+                addStructuralProbeReportCell(celli);
+                break;
+            }
+        }
+    }
+
+    if (nStructuralLowerBoundTieCells)
+    {
+        Info<< "ATC-T analytic fixed-point beta structural-tie probe "
+            << "columns: h cell beta baseBranch hBranch twoHBranch "
+            << "rawD0 rawDh rawD2h dRawD dSumOff dFinalD "
+            << "dFinalDExpected sourceErrMag dFinalH1 daDbeta"
+            << endl;
+
+        scalarList structuralProbeH(2, Zero);
+        structuralProbeH[0] = scalar(1e-5);
+        structuralProbeH[1] = scalar(3e-6);
+
+        forAll(structuralProbeH, hi)
+        {
+            const scalar h = structuralProbeH[hi];
+
+            restoreBetaProbe();
+            forAll(beta.primitiveFieldRef(), celli)
+            {
+                if (isStructuralLowerBoundTie[celli])
+                {
+                    beta.primitiveFieldRef()[celli] =
+                        min(scalar(1), betaProbeBaseInternal[celli] + h);
+                }
+            }
+            beta.correctBoundaryConditions();
+            BetaRelaxProbeState plus1 = assembleRelaxProbe();
+
+            restoreBetaProbe();
+            forAll(beta.primitiveFieldRef(), celli)
+            {
+                if (isStructuralLowerBoundTie[celli])
+                {
+                    beta.primitiveFieldRef()[celli] =
+                        min
+                        (
+                            scalar(1),
+                            betaProbeBaseInternal[celli] + scalar(2)*h
+                        );
+                }
+            }
+            beta.correctBoundaryConditions();
+            BetaRelaxProbeState plus2 = assembleRelaxProbe();
+            restoreBetaProbe();
+
+            scalar dFinalDErrL1 = Zero;
+            scalar dFinalDL1 = VSMALL;
+            scalar dFinalSourceErrL1 = Zero;
+            scalar dFinalSourceL1 = VSMALL;
+            scalar maxH1Abs = Zero;
+            scalar maxSumOffDerivative = Zero;
+            scalar minDaDbeta = GREAT;
+            scalar maxDaDbeta = -GREAT;
+            label nNegativeDa = 0;
+            label nZeroDa = 0;
+            label nPositiveDa = 0;
+            label nProbeFailures = 0;
+
+            forAll(isStructuralLowerBoundTie, celli)
+            {
+                if (!isStructuralLowerBoundTie[celli])
+                {
+                    continue;
+                }
+
+                const scalar dRawD =
+                    (
+                        -scalar(3)*baseRelaxProbe.rawRelaxD[celli]
+                      + scalar(4)*plus1.rawRelaxD[celli]
+                      - plus2.rawRelaxD[celli]
+                    )/(scalar(2)*h);
+                const scalar dSumOff =
+                    (
+                        -scalar(3)*baseRelaxProbe.rawRelaxSumOff[celli]
+                      + scalar(4)*plus1.rawRelaxSumOff[celli]
+                      - plus2.rawRelaxSumOff[celli]
+                    )/(scalar(2)*h);
+                const scalar dFinalD =
+                    (
+                        -scalar(3)*baseRelaxProbe.finalD[celli]
+                      + scalar(4)*plus1.finalD[celli]
+                      - plus2.finalD[celli]
+                    )/(scalar(2)*h);
+                const vector dFinalSource =
+                    (
+                        -scalar(3)*baseRelaxProbe.finalSource[celli]
+                      + scalar(4)*plus1.finalSource[celli]
+                      - plus2.finalSource[celli]
+                    )/(scalar(2)*h);
+                const scalar dFinalH1 =
+                    (
+                        -scalar(3)*baseRelaxProbe.finalH1[celli]
+                      + scalar(4)*plus1.finalH1[celli]
+                      - plus2.finalH1[celli]
+                    )/(scalar(2)*h);
+
+                const scalar dFinalDExpected = dRawD/alphaU;
+                const vector dFinalSourceExpected =
+                    (scalar(1)/alphaU - scalar(1))*dRawD*U[celli];
+                const scalar daDbeta = dRawD/max(V[celli], VSMALL);
+
+                dFinalDErrL1 += mag(dFinalD - dFinalDExpected);
+                dFinalDL1 += mag(dFinalD) + mag(dFinalDExpected);
+                dFinalSourceErrL1 +=
+                    mag(dFinalSource - dFinalSourceExpected);
+                dFinalSourceL1 +=
+                    mag(dFinalSource) + mag(dFinalSourceExpected);
+                maxH1Abs = max(maxH1Abs, mag(dFinalH1));
+                maxSumOffDerivative =
+                    max(maxSumOffDerivative, mag(dSumOff));
+                minDaDbeta = min(minDaDbeta, daDbeta);
+                maxDaDbeta = max(maxDaDbeta, daDbeta);
+
+                if (daDbeta < -scalar(1e-12))
+                {
+                    ++nNegativeDa;
+                }
+                else if (mag(daDbeta) <= scalar(1e-12))
+                {
+                    ++nZeroDa;
+                }
+                else
+                {
+                    ++nPositiveDa;
+                }
+
+                const bool derivativeZero = mag(dRawD) <= scalar(1e-12);
+                const bool plus1BranchOK =
+                    plus1.rawRelaxBranch[celli] == strictRawDiagonal
+                 || (
+                        derivativeZero
+                     && plus1.rawRelaxBranchMargin[celli] <= tieRelTol
+                    );
+                const bool plus2BranchOK =
+                    plus2.rawRelaxBranch[celli] == strictRawDiagonal
+                 || (
+                        derivativeZero
+                     && plus2.rawRelaxBranchMargin[celli] <= tieRelTol
+                    );
+                const scalar monotoneTol =
+                    scalar(1e-12)
+                   *max
+                    (
+                        scalar(1),
+                        mag(baseRelaxProbe.rawRelaxD[celli])
+                    );
+                const bool monotone =
+                    plus1.rawRelaxD[celli] + monotoneTol
+                 >= baseRelaxProbe.rawRelaxD[celli]
+                 && plus2.rawRelaxD[celli] + monotoneTol
+                 >= plus1.rawRelaxD[celli];
+                const scalar sumOffTol =
+                    max
+                    (
+                        scalar(1e-14),
+                        scalar(1e-9)*max(scalar(1), mag(dRawD))
+                    );
+                const bool sumOffOK = mag(dSumOff) <= sumOffTol;
+
+                if (!plus1BranchOK || !plus2BranchOK || !monotone || !sumOffOK)
+                {
+                    ++nProbeFailures;
+                }
+
+                forAll(structuralProbeReportCells, reporti)
+                {
+                    if (structuralProbeReportCells[reporti] == celli)
+                    {
+                        Info<< "ATC-T analytic fixed-point beta "
+                            << "structural-tie probe: "
+                            << h << " "
+                            << celli << " "
+                            << betaProbeBaseInternal[celli] << " "
+                            << relaxClassName(relaxClass[celli]) << " "
+                            << relaxClassName(plus1.rawRelaxBranch[celli])
+                            << " "
+                            << relaxClassName(plus2.rawRelaxBranch[celli])
+                            << " "
+                            << baseRelaxProbe.rawRelaxD[celli] << " "
+                            << plus1.rawRelaxD[celli] << " "
+                            << plus2.rawRelaxD[celli] << " "
+                            << dRawD << " "
+                            << dSumOff << " "
+                            << dFinalD << " "
+                            << dFinalDExpected << " "
+                            << mag(dFinalSource - dFinalSourceExpected)
+                            << " "
+                            << dFinalH1 << " "
+                            << daDbeta
+                            << endl;
+                        break;
+                    }
+                }
+            }
+
+            reduce(dFinalDErrL1, sumOp<scalar>());
+            reduce(dFinalDL1, sumOp<scalar>());
+            reduce(dFinalSourceErrL1, sumOp<scalar>());
+            reduce(dFinalSourceL1, sumOp<scalar>());
+            reduce(maxH1Abs, maxOp<scalar>());
+            reduce(maxSumOffDerivative, maxOp<scalar>());
+            reduce(minDaDbeta, minOp<scalar>());
+            reduce(maxDaDbeta, maxOp<scalar>());
+            reduce(nNegativeDa, sumOp<label>());
+            reduce(nZeroDa, sumOp<label>());
+            reduce(nPositiveDa, sumOp<label>());
+            reduce(nProbeFailures, sumOp<label>());
+
+            const scalar dFinalDRel = dFinalDErrL1/max(dFinalDL1, VSMALL);
+            const scalar dFinalSourceRel =
+                dFinalSourceErrL1/max(dFinalSourceL1, VSMALL);
+
+            Info<< "ATC-T analytic fixed-point beta structural-tie "
+                << "probe summary: h " << h
+                << " dFinalDRel " << dFinalDRel
+                << " dFinalSourceRel " << dFinalSourceRel
+                << " maxH1Abs " << maxH1Abs
+                << " maxDsumOffDbeta " << maxSumOffDerivative
+                << " minDaDbeta " << minDaDbeta
+                << " maxDaDbeta " << maxDaDbeta
+                << " nNegativeDa " << nNegativeDa
+                << " nZeroDa " << nZeroDa
+                << " nPositiveDa " << nPositiveDa
+                << " nProbeFailures " << nProbeFailures
+                << endl;
+
+            if
+            (
+                dFinalDRel > scalar(1e-7)
+             || dFinalSourceRel > scalar(1e-7)
+             || maxH1Abs > scalar(1e-8)
+             || nNegativeDa
+             || nProbeFailures
+            )
+            {
+                FatalErrorInFunction
+                    << "Structural lower-bound relaxation tie feasible "
+                    << "right-derivative probe failed at h " << h
+                    << ". dFinalDRel " << dFinalDRel
+                    << " dFinalSourceRel " << dFinalSourceRel
+                    << " maxH1Abs " << maxH1Abs
+                    << " nNegativeDa " << nNegativeDa
+                    << " nProbeFailures " << nProbeFailures
+                    << exit(FatalError);
+            }
+        }
+
+        Info<< "ATC-T analytic fixed-point beta derivative semantics: "
+            << "strict raw-diagonal cells are classical derivatives; "
+            << "structural lower-bound relaxation ties use the feasible "
+            << "right derivative with respect to increasing Brinkman/source "
+            << "coefficient, not a two-sided classical derivative."
+            << endl;
+    }
+
+    if (writeAnalyticFixedPointAdjointBeta_)
+    {
+        volScalarField rawCoeffField
+        (
+            IOobject
+            (
+                "ATCTfixedPointBetaRawCoefficientSensitivity",
+                mesh_.time().timeName(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::AUTO_WRITE
+            ),
+            beta
+        );
+        volScalarField integratedField
+        (
+            IOobject
+            (
+                "ATCTfixedPointBetaFlowIntegrated",
+                mesh_.time().timeName(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::AUTO_WRITE
+            ),
+            beta
+        );
+        volScalarField perVolumeField
+        (
+            IOobject
+            (
+                "ATCTfixedPointBetaFlowPerVolume",
+                mesh_.time().timeName(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::AUTO_WRITE
+            ),
+            beta
+        );
+
+        rawCoeffField.primitiveFieldRef() = coeffIntegrated;
+        integratedField.primitiveFieldRef() = flowIntegratedBeta;
+        perVolumeField.primitiveFieldRef() = flowIntegratedBeta/V;
+
+        forAll(rawCoeffField.boundaryFieldRef(), patchi)
+        {
+            rawCoeffField.boundaryFieldRef()[patchi] == Zero;
+            integratedField.boundaryFieldRef()[patchi] == Zero;
+            perVolumeField.boundaryFieldRef()[patchi] == Zero;
+        }
+
+        rawCoeffField.write();
+        integratedField.write();
+        perVolumeField.write();
+        flowBetaMult.write();
+
+        Info<< "ATC-T analytic fixed-point beta diagnostic fields written: "
+            << rawCoeffField.name() << ", " << integratedField.name()
+            << ", " << perVolumeField.name() << ", "
+            << flowBetaMult.name()
+            << ". These are diagnostic fixed-point flow sensitivity fields, "
+            << "not production betaMult contributions." << endl;
+    }
+
+    if (!checkAnalyticFixedPointAdjointBeta_)
+    {
+        return tFlowBetaMult;
+    }
+
+    const volVectorField UBase
+    (
+        IOobject
+        (
+            "ATCTAnalyticFPBetaUBase",
+            mesh_.time().timeName(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE
+        ),
+        U
+    );
+    const volScalarField pBase
+    (
+        IOobject
+        (
+            "ATCTAnalyticFPBetapBase",
+            mesh_.time().timeName(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE
+        ),
+        p
+    );
+    const surfaceScalarField phiBase
+    (
+        IOobject
+        (
+            "ATCTAnalyticFPBetaPhiBase",
+            mesh_.time().timeName(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE
+        ),
+        phi
+    );
+    const volScalarField betaBase
+    (
+        IOobject
+        (
+            "ATCTAnalyticFPBetaBetaBase",
+            mesh_.time().timeName(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE
+        ),
+        beta
+    );
+    const volScalarField TBase
+    (
+        IOobject
+        (
+            "ATCTAnalyticFPBetaTBase",
+            mesh_.time().timeName(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE
+        ),
+        T
+    );
+
+    const bool pressureNeedsReference = p.needReference();
+    const label pRefCell = solverControl_().pRefCell();
+
+    auto removeMean = [](scalarField& fld)
+    {
+        const label n = returnReduce(fld.size(), sumOp<label>());
+        if (n > 0)
+        {
+            fld -= gSum(fld)/scalar(n);
+        }
+    };
+
+    auto projectPressureDirection = [&](scalarField& fld)
+    {
+        if (!pressureNeedsReference)
+        {
+            return;
+        }
+
+        if (pRefCell >= 0 && pRefCell < mesh_.nCells())
+        {
+            fld[pRefCell] = Zero;
+        }
+        else
+        {
+            removeMean(fld);
+        }
+    };
+
+    const typename pTraits<vector>::labelType validVectorComponents
+    (
+        mesh_.validComponents<vector>()
+    );
+    auto projectValidVectorComponents = [&](vectorField& vf)
+    {
+        forAll(vf, celli)
+        {
+            for (direction cmpt = 0; cmpt < vector::nComponents; ++cmpt)
+            {
+                if (component(validVectorComponents, cmpt) == -1)
+                {
+                    vf[celli][cmpt] = Zero;
+                }
+            }
+        }
+    };
+
+    auto projectMapStateDirection = [&](SimpleMapState& state)
+    {
+        projectValidVectorComponents(state.U);
+        projectPressureDirection(state.p);
+    };
+
+    auto enforcePressureBoundaryState = [&]()
+    {
+        bool hasUpdateablePressureSnGrad = false;
+        forAll(p.boundaryField(), patchi)
+        {
+            if
+            (
+                mesh_.boundary()[patchi].type() == "empty"
+             || mesh_.boundary()[patchi].coupled()
+            )
+            {
+                continue;
+            }
+
+            if
+            (
+                isA<updateablePatchTypes::updateableSnGrad>
+                (
+                    p.boundaryField()[patchi]
+                )
+            )
+            {
+                hasUpdateablePressureSnGrad = true;
+            }
+        }
+
+        forAll(p.boundaryFieldRef(), patchi)
+        {
+            p.boundaryFieldRef()[patchi] == pBase.boundaryField()[patchi];
+        }
+
+        if (!hasUpdateablePressureSnGrad)
+        {
+            p.correctBoundaryConditions();
+        }
+    };
+
+    auto restoreAll = [&]()
+    {
+        U.primitiveFieldRef() = UBase.primitiveField();
+        forAll(U.boundaryFieldRef(), patchi)
+        {
+            U.boundaryFieldRef()[patchi] == UBase.boundaryField()[patchi];
+        }
+        U.correctBoundaryConditions();
+
+        p.primitiveFieldRef() = pBase.primitiveField();
+        forAll(p.boundaryFieldRef(), patchi)
+        {
+            p.boundaryFieldRef()[patchi] == pBase.boundaryField()[patchi];
+        }
+        enforcePressureBoundaryState();
+
+        phi.primitiveFieldRef() = phiBase.primitiveField();
+        forAll(phi.boundaryFieldRef(), patchi)
+        {
+            phi.boundaryFieldRef()[patchi] == phiBase.boundaryField()[patchi];
+        }
+
+        beta.primitiveFieldRef() = betaBase.primitiveField();
+        forAll(beta.boundaryFieldRef(), patchi)
+        {
+            beta.boundaryFieldRef()[patchi] == betaBase.boundaryField()[patchi];
+        }
+        beta.correctBoundaryConditions();
+
+        T.primitiveFieldRef() = TBase.primitiveField();
+        forAll(T.boundaryFieldRef(), patchi)
+        {
+            T.boundaryFieldRef()[patchi] == TBase.boundaryField()[patchi];
+        }
+        T.correctBoundaryConditions();
+    };
+
+    auto mapStateDifference =
+        [&](const SimpleMapState& plus, const SimpleMapState& minus, const scalar eps)
+    {
+        SimpleMapState diff(mesh_);
+
+        forAll(diff.U, celli)
+        {
+            diff.U[celli] = (plus.U[celli] - minus.U[celli])/(2*eps);
+            diff.p[celli] = (plus.p[celli] - minus.p[celli])/(2*eps);
+        }
+        forAll(diff.phiInternal, facei)
+        {
+            diff.phiInternal[facei] =
+                (plus.phiInternal[facei] - minus.phiInternal[facei])
+               /(2*eps);
+        }
+        forAll(diff.phiBoundary, patchi)
+        {
+            forAll(diff.phiBoundary[patchi], facei)
+            {
+                diff.phiBoundary[patchi][facei] =
+                    (
+                        plus.phiBoundary[patchi][facei]
+                      - minus.phiBoundary[patchi][facei]
+                    )
+                   /(2*eps);
+            }
+        }
+
+        projectMapStateDirection(diff);
+        return diff;
+    };
+
+    auto mapStateThreePoint =
+        [&]
+        (
+            const SimpleMapState& a,
+            const scalar ca,
+            const SimpleMapState& b,
+            const scalar cb,
+            const SimpleMapState& c,
+            const scalar cc,
+            const scalar denom
+        )
+    {
+        SimpleMapState diff(mesh_);
+
+        forAll(diff.U, celli)
+        {
+            diff.U[celli] =
+                (ca*a.U[celli] + cb*b.U[celli] + cc*c.U[celli])/denom;
+            diff.p[celli] =
+                (ca*a.p[celli] + cb*b.p[celli] + cc*c.p[celli])/denom;
+        }
+        forAll(diff.phiInternal, facei)
+        {
+            diff.phiInternal[facei] =
+                (
+                    ca*a.phiInternal[facei]
+                  + cb*b.phiInternal[facei]
+                  + cc*c.phiInternal[facei]
+                )/denom;
+        }
+        forAll(diff.phiBoundary, patchi)
+        {
+            forAll(diff.phiBoundary[patchi], facei)
+            {
+                diff.phiBoundary[patchi][facei] =
+                    (
+                        ca*a.phiBoundary[patchi][facei]
+                      + cb*b.phiBoundary[patchi][facei]
+                      + cc*c.phiBoundary[patchi][facei]
+                    )/denom;
+            }
+        }
+
+        projectMapStateDirection(diff);
+        return diff;
+    };
+
+    auto mapStateFivePoint =
+        [&]
+        (
+            const SimpleMapState& a,
+            const scalar ca,
+            const SimpleMapState& b,
+            const scalar cb,
+            const SimpleMapState& c,
+            const scalar cc,
+            const SimpleMapState& d,
+            const scalar cd,
+            const SimpleMapState& e,
+            const scalar ce,
+            const scalar denom
+        )
+    {
+        SimpleMapState diff(mesh_);
+
+        forAll(diff.U, celli)
+        {
+            diff.U[celli] =
+                (
+                    ca*a.U[celli]
+                  + cb*b.U[celli]
+                  + cc*c.U[celli]
+                  + cd*d.U[celli]
+                  + ce*e.U[celli]
+                )/denom;
+            diff.p[celli] =
+                (
+                    ca*a.p[celli]
+                  + cb*b.p[celli]
+                  + cc*c.p[celli]
+                  + cd*d.p[celli]
+                  + ce*e.p[celli]
+                )/denom;
+        }
+        forAll(diff.phiInternal, facei)
+        {
+            diff.phiInternal[facei] =
+                (
+                    ca*a.phiInternal[facei]
+                  + cb*b.phiInternal[facei]
+                  + cc*c.phiInternal[facei]
+                  + cd*d.phiInternal[facei]
+                  + ce*e.phiInternal[facei]
+                )/denom;
+        }
+        forAll(diff.phiBoundary, patchi)
+        {
+            forAll(diff.phiBoundary[patchi], facei)
+            {
+                diff.phiBoundary[patchi][facei] =
+                    (
+                        ca*a.phiBoundary[patchi][facei]
+                      + cb*b.phiBoundary[patchi][facei]
+                      + cc*c.phiBoundary[patchi][facei]
+                      + cd*d.phiBoundary[patchi][facei]
+                      + ce*e.phiBoundary[patchi][facei]
+                    )/denom;
+            }
+        }
+
+        projectMapStateDirection(diff);
+        return diff;
+    };
+
+    auto maxMapStateDifference =
+        [&](const SimpleMapState& a, const SimpleMapState& b)
+    {
+        scalar maxDiff = Zero;
+
+        forAll(a.U, celli)
+        {
+            maxDiff = max(maxDiff, mag(a.U[celli] - b.U[celli]));
+            maxDiff = max(maxDiff, mag(a.p[celli] - b.p[celli]));
+        }
+        forAll(a.phiInternal, facei)
+        {
+            maxDiff =
+                max(maxDiff, mag(a.phiInternal[facei] - b.phiInternal[facei]));
+        }
+        forAll(a.phiBoundary, patchi)
+        {
+            forAll(a.phiBoundary[patchi], facei)
+            {
+                maxDiff =
+                    max
+                    (
+                        maxDiff,
+                        mag
+                        (
+                            a.phiBoundary[patchi][facei]
+                          - b.phiBoundary[patchi][facei]
+                        )
+                    );
+            }
+        }
+
+        reduce(maxDiff, maxOp<scalar>());
+        return maxDiff;
+    };
+
+    restoreAll();
+    SimpleMapState baseMap =
+        primalSimpleMapStateAtFrozenState("ATCTAnalyticFPBetaBaseMap");
+    restoreAll();
+    SimpleMapState baseMapTol14 =
+        primalSimpleMapStateAtFrozenState
+        (
+            "ATCTAnalyticFPBetaBaseMapTol14",
+            scalar(1e-14)
+        );
+    restoreAll();
+
+    auto countMapPhiSignChanges =
+        [&](const SimpleMapState& a, const SimpleMapState& b)
+    {
+        label nChanges = 0;
+        forAll(a.phiInternal, facei)
+        {
+            if (a.phiInternal[facei]*b.phiInternal[facei] < scalar(0))
+            {
+                ++nChanges;
+            }
+        }
+        forAll(a.phiBoundary, patchi)
+        {
+            forAll(a.phiBoundary[patchi], facei)
+            {
+                if
+                (
+                    a.phiBoundary[patchi][facei]
+                   *b.phiBoundary[patchi][facei]
+                  < scalar(0)
+                )
+                {
+                    ++nChanges;
+                }
+            }
+        }
+        reduce(nChanges, sumOp<label>());
+        return nChanges;
+    };
+
+    DynamicList<label> betaReportCells;
+    auto containsReportCell = [&](const label celli)
+    {
+        forAll(betaReportCells, i)
+        {
+            if (betaReportCells[i] == celli)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto addReportCell = [&](const label celli)
+    {
+        if
+        (
+            celli >= 0
+         && celli < mesh_.nCells()
+         && isDesign.test(celli)
+         && !containsReportCell(celli)
+        )
+        {
+            betaReportCells.append(celli);
+        }
+    };
+
+    forAll(fixedPointTangentCells_, reporti)
+    {
+        addReportCell(fixedPointTangentCells_[reporti]);
+    }
+
+    for (label pick = 0; pick < 5; ++pick)
+    {
+        label bestCell = -1;
+        scalar bestMag = -1;
+        forAll(betaBase, celli)
+        {
+            if
+            (
+                !isDesign.test(celli)
+             || !isStructuralLowerBoundTie[celli]
+             || containsReportCell(celli)
+            )
+            {
+                continue;
+            }
+
+            const scalar candidate = mag(flowBetaMult[celli]);
+            if (candidate > bestMag)
+            {
+                bestMag = candidate;
+                bestCell = celli;
+            }
+        }
+        addReportCell(bestCell);
+    }
+
+    for (label pick = 0; pick < 5; ++pick)
+    {
+        for (label attempt = 0; attempt < mesh_.nCells(); ++attempt)
+        {
+            const label celli =
+                (
+                    label(997)*(pick + 1)
+                  + label(37)*attempt
+                  + label(211)
+                ) % mesh_.nCells();
+
+            if
+            (
+                isDesign.test(celli)
+             && isStructuralLowerBoundTie[celli]
+             && !containsReportCell(celli)
+            )
+            {
+                addReportCell(celli);
+                break;
+            }
+        }
+    }
+
+    for (label pick = 0; pick < 3; ++pick)
+    {
+        for (label attempt = 0; attempt < mesh_.nCells(); ++attempt)
+        {
+            const label celli =
+                (
+                    label(881)*(pick + 1)
+                  + label(53)*attempt
+                  + label(269)
+                ) % mesh_.nCells();
+
+            if
+            (
+                isDesign.test(celli)
+             && relaxClass[celli] == strictRawDiagonal
+             && betaBase[celli] > betaBoundTol
+             && scalar(1) - betaBase[celli] > betaBoundTol
+             && !containsReportCell(celli)
+            )
+            {
+                addReportCell(celli);
+                break;
+            }
+        }
+    }
+
+    auto contractPsiWithState =
+        [&]
+        (
+            const SimpleMapState& state,
+            scalar& uPart,
+            scalar& pPart,
+            scalar& phiInternalPart,
+            scalar& phiBoundaryPart
+        )
+    {
+        uPart = Zero;
+        pPart = Zero;
+        phiInternalPart = Zero;
+        phiBoundaryPart = Zero;
+
+        forAll(psi.barU, celli)
+        {
+            uPart += psi.barU[celli] & state.U[celli];
+            pPart += psi.barp[celli]*state.p[celli];
+        }
+        forAll(psi.barPhiInternal, facei)
+        {
+            phiInternalPart +=
+                psi.barPhiInternal[facei]*state.phiInternal[facei];
+        }
+        forAll(psi.barPhiBoundary, patchi)
+        {
+            forAll(psi.barPhiBoundary[patchi], facei)
+            {
+                phiBoundaryPart +=
+                    psi.barPhiBoundary[patchi][facei]
+                   *state.phiBoundary[patchi][facei];
+            }
+        }
+
+        reduce(uPart, sumOp<scalar>());
+        reduce(pPart, sumOp<scalar>());
+        reduce(phiInternalPart, sumOp<scalar>());
+        reduce(phiBoundaryPart, sumOp<scalar>());
+    };
+
+    auto totalPsiContraction =
+        [&](const SimpleMapState& state)
+    {
+        scalar flowU = Zero;
+        scalar flowP = Zero;
+        scalar flowPhiInternal = Zero;
+        scalar flowPhiBoundary = Zero;
+        contractPsiWithState
+        (
+            state,
+            flowU,
+            flowP,
+            flowPhiInternal,
+            flowPhiBoundary
+        );
+        return flowU + flowP + flowPhiInternal + flowPhiBoundary;
+    };
+
+    label nSelectedCellsTested = 0;
+    label nSelectedCellsAccepted = 0;
+    bool selectedCell707Accepted = false;
+    bool selectedCell708Accepted = false;
+    bool selectedCell709Accepted = false;
+    scalar cell709BestSymRel = GREAT;
+    scalar cell709BestAbsGap = GREAT;
+    scalar cell709BestH = Zero;
+
+    Info<< "ATC-T analytic fixed-point beta selected-cell comparison: "
+        << "cells " << betaReportCells
+        << nl
+        << "cell beta derivativeType requestedH actualH flowU flowP "
+        << "flowPhiInternal flowPhiBoundary flowIntegrated flowBetaMult "
+        << "analyticFlowIntegrated analyticFlowBetaMult integratedGap "
+        << "integratedSymRel betaMultGap betaMultSymRel baseRelaxBranch "
+        << "firstRelaxBranch secondRelaxBranch phiSignFirst phiSignSecond "
+        << "cleanBranch accepted"
+        << endl;
+
+    forAll(betaReportCells, reporti)
+    {
+        const label cellj = betaReportCells[reporti];
+        if (cellj < 0 || cellj >= mesh_.nCells() || !isDesign.test(cellj))
+        {
+            continue;
+        }
+
+        ++nSelectedCellsTested;
+
+        scalarList sampled(fixedPointAdjointBetaFDEps_.size(), Zero);
+        boolList valid(fixedPointAdjointBetaFDEps_.size(), false);
+        label nValidSamples = 0;
+        label maxConsecutiveAccepted = 0;
+        label currentConsecutiveAccepted = 0;
+        label previousAcceptedIndex = -2;
+
+        forAll(fixedPointAdjointBetaFDEps_, epsi)
+        {
+            const scalar requestedEps = fixedPointAdjointBetaFDEps_[epsi];
+            const scalar oldBeta = betaBase[cellj];
+            const scalar room = min(oldBeta, scalar(1) - oldBeta);
+            word derivativeType("central");
+            scalar eps = requestedEps;
+
+            if (oldBeta <= SMALL)
+            {
+                derivativeType = "forwardSecondOrder";
+                eps = min(requestedEps, scalar(0.5)*(scalar(1) - oldBeta));
+            }
+            else if (scalar(1) - oldBeta <= SMALL)
+            {
+                derivativeType = "backwardSecondOrder";
+                eps = min(requestedEps, scalar(0.5)*oldBeta);
+            }
+            else
+            {
+                eps = min(requestedEps, scalar(0.25)*room);
+            }
+
+            if (eps <= SMALL)
+            {
+                Info<< "ATC-T analytic fixed-point beta selected sample "
+                    << "skipped: cell " << cellj
+                    << " beta " << oldBeta
+                    << " requestedEps " << requestedEps
+                    << " actualEps " << eps
+                    << endl;
+                continue;
+            }
+
+            SimpleMapState dM(mesh_);
+            label firstRelaxClass = unsupportedTie;
+            label secondRelaxClass = unsupportedTie;
+            label phiSignFirst = 0;
+            label phiSignSecond = 0;
+
+            if (derivativeType == "central")
+            {
+                BetaRelaxProbeState firstProbe =
+                    probeSingleCellRelaxState(cellj, oldBeta + eps);
+                BetaRelaxProbeState secondProbe =
+                    probeSingleCellRelaxState(cellj, oldBeta - eps);
+                firstRelaxClass = firstProbe.rawRelaxBranch[cellj];
+                secondRelaxClass = secondProbe.rawRelaxBranch[cellj];
+
+                restoreAll();
+                beta.primitiveFieldRef()[cellj] = oldBeta + eps;
+                beta.correctBoundaryConditions();
+                SimpleMapState plus =
+                    primalSimpleMapStateAtFrozenState
+                    (
+                        "ATCTAnalyticFPBetaPlus_cell"
+                      + Foam::name(cellj) + "_eps" + Foam::name(epsi)
+                    );
+                phiSignFirst = countMapPhiSignChanges(baseMap, plus);
+
+                restoreAll();
+                beta.primitiveFieldRef()[cellj] = oldBeta - eps;
+                beta.correctBoundaryConditions();
+                SimpleMapState minus =
+                    primalSimpleMapStateAtFrozenState
+                    (
+                        "ATCTAnalyticFPBetaMinus_cell"
+                      + Foam::name(cellj) + "_eps" + Foam::name(epsi)
+                    );
+                phiSignSecond = countMapPhiSignChanges(baseMap, minus);
+
+                dM = mapStateDifference(plus, minus, eps);
+            }
+            else if (derivativeType == "forwardSecondOrder")
+            {
+                BetaRelaxProbeState firstProbe =
+                    probeSingleCellRelaxState(cellj, oldBeta + eps);
+                BetaRelaxProbeState secondProbe =
+                    probeSingleCellRelaxState
+                    (
+                        cellj,
+                        oldBeta + scalar(2)*eps
+                    );
+                firstRelaxClass = firstProbe.rawRelaxBranch[cellj];
+                secondRelaxClass = secondProbe.rawRelaxBranch[cellj];
+
+                restoreAll();
+                beta.primitiveFieldRef()[cellj] = oldBeta + eps;
+                beta.correctBoundaryConditions();
+                SimpleMapState plus1 =
+                    primalSimpleMapStateAtFrozenState
+                    (
+                        "ATCTAnalyticFPBetaForward1_cell"
+                      + Foam::name(cellj) + "_eps" + Foam::name(epsi)
+                    );
+                phiSignFirst = countMapPhiSignChanges(baseMap, plus1);
+
+                restoreAll();
+                beta.primitiveFieldRef()[cellj] = oldBeta + scalar(2)*eps;
+                beta.correctBoundaryConditions();
+                SimpleMapState plus2 =
+                    primalSimpleMapStateAtFrozenState
+                    (
+                        "ATCTAnalyticFPBetaForward2_cell"
+                      + Foam::name(cellj) + "_eps" + Foam::name(epsi)
+                    );
+                phiSignSecond = countMapPhiSignChanges(baseMap, plus2);
+
+                dM =
+                    mapStateThreePoint
+                    (
+                        baseMap,
+                        scalar(-3),
+                        plus1,
+                        scalar(4),
+                        plus2,
+                        scalar(-1),
+                        scalar(2)*eps
+                    );
+            }
+            else
+            {
+                BetaRelaxProbeState firstProbe =
+                    probeSingleCellRelaxState(cellj, oldBeta - eps);
+                BetaRelaxProbeState secondProbe =
+                    probeSingleCellRelaxState
+                    (
+                        cellj,
+                        oldBeta - scalar(2)*eps
+                    );
+                firstRelaxClass = firstProbe.rawRelaxBranch[cellj];
+                secondRelaxClass = secondProbe.rawRelaxBranch[cellj];
+
+                restoreAll();
+                beta.primitiveFieldRef()[cellj] = oldBeta - eps;
+                beta.correctBoundaryConditions();
+                SimpleMapState minus1 =
+                    primalSimpleMapStateAtFrozenState
+                    (
+                        "ATCTAnalyticFPBetaBackward1_cell"
+                      + Foam::name(cellj) + "_eps" + Foam::name(epsi)
+                    );
+                phiSignFirst = countMapPhiSignChanges(baseMap, minus1);
+
+                restoreAll();
+                beta.primitiveFieldRef()[cellj] = oldBeta - scalar(2)*eps;
+                beta.correctBoundaryConditions();
+                SimpleMapState minus2 =
+                    primalSimpleMapStateAtFrozenState
+                    (
+                        "ATCTAnalyticFPBetaBackward2_cell"
+                      + Foam::name(cellj) + "_eps" + Foam::name(epsi)
+                    );
+                phiSignSecond = countMapPhiSignChanges(baseMap, minus2);
+
+                dM =
+                    mapStateThreePoint
+                    (
+                        baseMap,
+                        scalar(3),
+                        minus1,
+                        scalar(-4),
+                        minus2,
+                        scalar(1),
+                        scalar(2)*eps
+                    );
+            }
+
+            restoreAll();
+
+            scalar flowU = Zero;
+            scalar flowP = Zero;
+            scalar flowPhiInternal = Zero;
+            scalar flowPhiBoundary = Zero;
+            contractPsiWithState
+            (
+                dM,
+                flowU,
+                flowP,
+                flowPhiInternal,
+                flowPhiBoundary
+            );
+
+            const scalar flowIntegrated =
+                flowU + flowP + flowPhiInternal + flowPhiBoundary;
+            const scalar flowBeta = flowIntegrated/V[cellj]*dt;
+            const scalar analyticIntegrated = flowIntegratedBeta[cellj];
+            const scalar analytic = flowBetaMult[cellj];
+            const scalar gap = analytic - flowBeta;
+            const scalar integratedGap =
+                analyticIntegrated - flowIntegrated;
+            const scalar integratedSym =
+                mag(integratedGap)
+               /(mag(analyticIntegrated) + mag(flowIntegrated) + VSMALL);
+            const scalar sym =
+                mag(gap)/(mag(analytic) + mag(flowBeta) + VSMALL);
+            const scalar integratedAbsGate =
+                scalar(5e-11)
+               *max
+                (
+                    scalar(1),
+                    max(mag(flowIntegratedBeta[cellj]), mag(flowIntegrated))
+                );
+            const bool zeroAnalytic =
+                mag(flowIntegratedBeta[cellj])
+              <= scalar(5e-11)*max(scalar(1), mag(flowIntegrated));
+            const bool firstRelaxOK =
+                firstRelaxClass == strictRawDiagonal
+             || (
+                    zeroAnalytic
+                 && firstRelaxClass == structuralLowerBoundTie
+                );
+            const bool secondRelaxOK =
+                secondRelaxClass == strictRawDiagonal
+             || (
+                    zeroAnalytic
+                 && secondRelaxClass == structuralLowerBoundTie
+                );
+            const bool cleanBranch =
+                firstRelaxOK
+             && secondRelaxOK;
+            const bool accepted =
+                cleanBranch
+             &&
+                analytic*flowBeta >= -VSMALL
+             && (
+                    sym < scalar(1e-5)
+                 || mag(gap) < scalar(1e-7)*max(scalar(1), mag(flowBeta))
+                 || mag(integratedGap) < integratedAbsGate
+                );
+
+            if (cellj == 709 && cleanBranch && sym < cell709BestSymRel)
+            {
+                cell709BestSymRel = sym;
+                cell709BestAbsGap = mag(gap);
+                cell709BestH = eps;
+            }
+
+            sampled[epsi] = flowBeta;
+            valid[epsi] = accepted;
+            if (accepted)
+            {
+                ++nValidSamples;
+                if (epsi == previousAcceptedIndex + 1)
+                {
+                    ++currentConsecutiveAccepted;
+                }
+                else
+                {
+                    currentConsecutiveAccepted = 1;
+                }
+                previousAcceptedIndex = epsi;
+                maxConsecutiveAccepted =
+                    max(maxConsecutiveAccepted, currentConsecutiveAccepted);
+            }
+
+            Info<< "ATC-T analytic fixed-point beta selected sample: "
+                << cellj << " "
+                << oldBeta << " "
+                << derivativeType << " "
+                << requestedEps << " "
+                << eps << " "
+                << flowU << " "
+                << flowP << " "
+                << flowPhiInternal << " "
+                << flowPhiBoundary << " "
+                << flowIntegrated << " "
+                << flowBeta << " "
+                << analyticIntegrated << " "
+                << analytic << " "
+                << integratedGap << " "
+                << integratedSym << " "
+                << gap << " "
+                << sym << " "
+                << relaxClassName(relaxClass[cellj]) << " "
+                << relaxClassName(firstRelaxClass) << " "
+                << relaxClassName(secondRelaxClass) << " "
+                << phiSignFirst << " "
+                << phiSignSecond << " "
+                << cleanBranch << " "
+                << accepted
+                << endl;
+        }
+
+        bool plateauFound = false;
+        scalar plateau = Zero;
+        for (label epsi = 0; epsi + 1 < fixedPointAdjointBetaFDEps_.size(); ++epsi)
+        {
+            if (!valid[epsi] || !valid[epsi + 1])
+            {
+                continue;
+            }
+
+            const scalar gap = mag(sampled[epsi] - sampled[epsi + 1]);
+            const scalar sym =
+                gap/(mag(sampled[epsi]) + mag(sampled[epsi + 1]) + VSMALL);
+            const scalar integratedGap =
+                mag
+                (
+                    sampled[epsi]*V[cellj]/dt
+                  - sampled[epsi + 1]*V[cellj]/dt
+                );
+            const bool stable =
+                sym < scalar(1e-5)
+             || gap < scalar(1e-7)*max(scalar(1), mag(sampled[epsi]))
+             || integratedGap < scalar(5e-11);
+
+            if (stable && !plateauFound)
+            {
+                plateauFound = true;
+                plateau = scalar(0.5)*(sampled[epsi] + sampled[epsi + 1]);
+            }
+        }
+
+        if (!plateauFound || maxConsecutiveAccepted < 2)
+        {
+            if (nValidSamples == 0)
+            {
+                Info<< "ATC-T analytic fixed-point beta selected plateau "
+                    << "failed: cell " << cellj
+                    << " has no accepted clean derivative rows."
+                    << endl;
+            }
+
+            Info<< "ATC-T analytic fixed-point beta selected result: cell "
+                << cellj
+                << " nAcceptedRows " << nValidSamples
+                << " maxConsecutiveAccepted " << maxConsecutiveAccepted
+                << " bestH " << (cellj == 709 ? cell709BestH : Zero)
+                << " bestAbsGap "
+                << (cellj == 709 ? cell709BestAbsGap : GREAT)
+                << " bestSymRel "
+                << (cellj == 709 ? cell709BestSymRel : GREAT)
+                << " plateauFound " << plateauFound
+                << " selectedCellAccepted " << false
+                << endl;
+            continue;
+        }
+
+        const scalar analytic = flowBetaMult[cellj];
+        const scalar gap = analytic - plateau;
+        const scalar integratedGap =
+            flowIntegratedBeta[cellj] - plateau*V[cellj]/dt;
+        const scalar sym = mag(gap)/(mag(analytic) + mag(plateau) + VSMALL);
+        const scalar integratedAbsGate =
+            scalar(5e-11)
+           *max
+            (
+                scalar(1),
+                max(mag(flowIntegratedBeta[cellj]), mag(plateau*V[cellj]/dt))
+            );
+        const bool accepted =
+            analytic*plateau >= -VSMALL
+         && (
+                sym < scalar(1e-5)
+             || mag(gap) < scalar(1e-7)*max(scalar(1), mag(plateau))
+             || mag(integratedGap) < integratedAbsGate
+            );
+
+        Info<< "ATC-T analytic fixed-point beta selected plateau: cell "
+            << cellj
+            << " residualDPart " << residualPart[cellj]
+            << " rAUDPart " << rAUPart[cellj]
+            << " sourcePart " << sourcePart[cellj]
+            << " h1Part " << h1Part[cellj]
+            << " rawCoefficientIntegrated " << coeffIntegrated[cellj]
+            << " flowIntegratedBeta " << flowIntegratedBeta[cellj]
+            << " analyticFlowBetaMult " << analytic
+            << " plateauFlowBetaMult " << plateau
+            << " signedGap " << gap
+            << " integratedGap " << integratedGap
+            << " symRel " << sym
+            << " accepted " << accepted
+            << endl;
+
+        if (!accepted)
+        {
+            Info<< "ATC-T analytic fixed-point beta selected result: cell "
+                << cellj
+                << " nAcceptedRows " << nValidSamples
+                << " maxConsecutiveAccepted " << maxConsecutiveAccepted
+                << " bestH " << (cellj == 709 ? cell709BestH : Zero)
+                << " bestAbsGap "
+                << (cellj == 709 ? cell709BestAbsGap : GREAT)
+                << " bestSymRel "
+                << (cellj == 709 ? cell709BestSymRel : GREAT)
+                << " plateauFound " << plateauFound
+                << " selectedCellAccepted " << false
+                << endl;
+            continue;
+        }
+
+        ++nSelectedCellsAccepted;
+        if (cellj == 707)
+        {
+            selectedCell707Accepted = true;
+        }
+        else if (cellj == 708)
+        {
+            selectedCell708Accepted = true;
+        }
+        else if (cellj == 709)
+        {
+            selectedCell709Accepted = true;
+        }
+
+        Info<< "ATC-T analytic fixed-point beta selected result: cell "
+            << cellj
+            << " nAcceptedRows " << nValidSamples
+            << " maxConsecutiveAccepted " << maxConsecutiveAccepted
+            << " bestH " << (cellj == 709 ? cell709BestH : Zero)
+            << " bestAbsGap "
+            << (cellj == 709 ? cell709BestAbsGap : GREAT)
+            << " bestSymRel "
+            << (cellj == 709 ? cell709BestSymRel : GREAT)
+            << " plateauFound " << plateauFound
+            << " selectedCellAccepted " << true
+            << endl;
+    }
+
+    Info<< "ATC-T analytic fixed-point beta selected summary: "
+        << "tested " << nSelectedCellsTested
+        << " accepted " << nSelectedCellsAccepted
+        << " cell707Accepted " << selectedCell707Accepted
+        << " cell708Accepted " << selectedCell708Accepted
+        << " cell709Accepted " << selectedCell709Accepted
+        << " cell709BestH " << cell709BestH
+        << " cell709BestAbsGap " << cell709BestAbsGap
+        << " cell709BestSymRel " << cell709BestSymRel
+        << endl;
+
+    bool cell709DenseRoute1 = false;
+    bool cell709RichardsonRoute2 = false;
+    bool cell709SolveContaminationRoute3 = false;
+
+    struct CellFDRecord
+    {
+        scalar h;
+        scalar pressureTol;
+        scalar flowU;
+        scalar flowP;
+        scalar flowPhiInternal;
+        scalar flowPhiBoundary;
+        scalar flowIntegrated;
+        scalar flowBetaMult;
+        scalar integratedGap;
+        scalar integratedSymRel;
+        scalar betaMultGap;
+        scalar betaMultSymRel;
+        scalar basePressureResidual;
+        scalar firstPressureResidual;
+        scalar secondPressureResidual;
+        label baseRelaxClass;
+        label firstRelaxClass;
+        label secondRelaxClass;
+        label phiSignFirst;
+        label phiSignSecond;
+        bool pressureAchieved;
+        bool cleanBranch;
+        bool accepted;
+
+        CellFDRecord()
+        :
+            h(Zero),
+            pressureTol(Zero),
+            flowU(Zero),
+            flowP(Zero),
+            flowPhiInternal(Zero),
+            flowPhiBoundary(Zero),
+            flowIntegrated(Zero),
+            flowBetaMult(Zero),
+            integratedGap(Zero),
+            integratedSymRel(GREAT),
+            betaMultGap(Zero),
+            betaMultSymRel(GREAT),
+            basePressureResidual(GREAT),
+            firstPressureResidual(GREAT),
+            secondPressureResidual(GREAT),
+            baseRelaxClass(-1),
+            firstRelaxClass(-1),
+            secondRelaxClass(-1),
+            phiSignFirst(0),
+            phiSignSecond(0),
+            pressureAchieved(false),
+            cleanBranch(false),
+            accepted(false)
+        {}
+    };
+
+    auto mapAtSingleCellBeta =
+        [&](const label celli, const scalar betaValue, const scalar tol, const word& name)
+    {
+        restoreAll();
+        beta.primitiveFieldRef()[celli] = betaValue;
+        beta.correctBoundaryConditions();
+        SimpleMapState state = primalSimpleMapStateAtFrozenState(name, tol);
+        restoreAll();
+        return state;
+    };
+
+    auto secondOrderCellRecord =
+        [&]
+        (
+            const label celli,
+            const scalar requestedH,
+            const scalar pressureTol,
+            const word& tag
+        )
+    {
+        CellFDRecord rec;
+        rec.h = requestedH;
+        rec.pressureTol = pressureTol;
+        rec.baseRelaxClass = relaxClass[celli];
+
+        const scalar oldBeta = betaBase[celli];
+        SimpleMapState base =
+            mapAtSingleCellBeta
+            (
+                celli,
+                oldBeta,
+                pressureTol,
+                tag + "_base"
+            );
+
+        SimpleMapState dM(mesh_);
+        if (oldBeta <= SMALL)
+        {
+            rec.h =
+                min(requestedH, scalar(0.5)*(scalar(1) - oldBeta));
+            BetaRelaxProbeState firstProbe =
+                probeSingleCellRelaxState(celli, oldBeta + rec.h);
+            BetaRelaxProbeState secondProbe =
+                probeSingleCellRelaxState(celli, oldBeta + scalar(2)*rec.h);
+            rec.firstRelaxClass = firstProbe.rawRelaxBranch[celli];
+            rec.secondRelaxClass = secondProbe.rawRelaxBranch[celli];
+
+            SimpleMapState plus1 =
+                mapAtSingleCellBeta
+                (
+                    celli,
+                    oldBeta + rec.h,
+                    pressureTol,
+                    tag + "_plus1"
+                );
+            SimpleMapState plus2 =
+                mapAtSingleCellBeta
+                (
+                    celli,
+                    oldBeta + scalar(2)*rec.h,
+                    pressureTol,
+                    tag + "_plus2"
+                );
+            rec.phiSignFirst = countMapPhiSignChanges(base, plus1);
+            rec.phiSignSecond = countMapPhiSignChanges(base, plus2);
+            rec.basePressureResidual = base.pressureFinalResidual;
+            rec.firstPressureResidual = plus1.pressureFinalResidual;
+            rec.secondPressureResidual = plus2.pressureFinalResidual;
+
+            dM =
+                mapStateThreePoint
+                (
+                    base,
+                    scalar(-3),
+                    plus1,
+                    scalar(4),
+                    plus2,
+                    scalar(-1),
+                    scalar(2)*rec.h
+                );
+        }
+        else if (scalar(1) - oldBeta <= SMALL)
+        {
+            rec.h = min(requestedH, scalar(0.5)*oldBeta);
+            BetaRelaxProbeState firstProbe =
+                probeSingleCellRelaxState(celli, oldBeta - rec.h);
+            BetaRelaxProbeState secondProbe =
+                probeSingleCellRelaxState(celli, oldBeta - scalar(2)*rec.h);
+            rec.firstRelaxClass = firstProbe.rawRelaxBranch[celli];
+            rec.secondRelaxClass = secondProbe.rawRelaxBranch[celli];
+
+            SimpleMapState minus1 =
+                mapAtSingleCellBeta
+                (
+                    celli,
+                    oldBeta - rec.h,
+                    pressureTol,
+                    tag + "_minus1"
+                );
+            SimpleMapState minus2 =
+                mapAtSingleCellBeta
+                (
+                    celli,
+                    oldBeta - scalar(2)*rec.h,
+                    pressureTol,
+                    tag + "_minus2"
+                );
+            rec.phiSignFirst = countMapPhiSignChanges(base, minus1);
+            rec.phiSignSecond = countMapPhiSignChanges(base, minus2);
+            rec.basePressureResidual = base.pressureFinalResidual;
+            rec.firstPressureResidual = minus1.pressureFinalResidual;
+            rec.secondPressureResidual = minus2.pressureFinalResidual;
+
+            dM =
+                mapStateThreePoint
+                (
+                    base,
+                    scalar(3),
+                    minus1,
+                    scalar(-4),
+                    minus2,
+                    scalar(1),
+                    scalar(2)*rec.h
+                );
+        }
+        else
+        {
+            const scalar room = min(oldBeta, scalar(1) - oldBeta);
+            rec.h = min(requestedH, scalar(0.25)*room);
+            BetaRelaxProbeState firstProbe =
+                probeSingleCellRelaxState(celli, oldBeta + rec.h);
+            BetaRelaxProbeState secondProbe =
+                probeSingleCellRelaxState(celli, oldBeta - rec.h);
+            rec.firstRelaxClass = firstProbe.rawRelaxBranch[celli];
+            rec.secondRelaxClass = secondProbe.rawRelaxBranch[celli];
+
+            SimpleMapState plus =
+                mapAtSingleCellBeta
+                (
+                    celli,
+                    oldBeta + rec.h,
+                    pressureTol,
+                    tag + "_plus"
+                );
+            SimpleMapState minus =
+                mapAtSingleCellBeta
+                (
+                    celli,
+                    oldBeta - rec.h,
+                    pressureTol,
+                    tag + "_minus"
+                );
+            rec.phiSignFirst = countMapPhiSignChanges(base, plus);
+            rec.phiSignSecond = countMapPhiSignChanges(base, minus);
+            rec.basePressureResidual = base.pressureFinalResidual;
+            rec.firstPressureResidual = plus.pressureFinalResidual;
+            rec.secondPressureResidual = minus.pressureFinalResidual;
+
+            dM = mapStateDifference(plus, minus, rec.h);
+        }
+
+        contractPsiWithState
+        (
+            dM,
+            rec.flowU,
+            rec.flowP,
+            rec.flowPhiInternal,
+            rec.flowPhiBoundary
+        );
+        rec.flowIntegrated =
+            rec.flowU + rec.flowP + rec.flowPhiInternal + rec.flowPhiBoundary;
+        rec.flowBetaMult = rec.flowIntegrated/V[celli]*dt;
+        rec.integratedGap =
+            flowIntegratedBeta[celli] - rec.flowIntegrated;
+        rec.integratedSymRel =
+            mag(rec.integratedGap)
+           /(mag(flowIntegratedBeta[celli]) + mag(rec.flowIntegrated) + VSMALL);
+        rec.betaMultGap = flowBetaMult[celli] - rec.flowBetaMult;
+        rec.betaMultSymRel =
+            mag(rec.betaMultGap)
+           /(mag(flowBetaMult[celli]) + mag(rec.flowBetaMult) + VSMALL);
+
+        const bool zeroAnalytic =
+            mag(flowIntegratedBeta[celli])
+          <= scalar(5e-11)*max(scalar(1), mag(rec.flowIntegrated));
+        const bool firstRelaxOK =
+            rec.firstRelaxClass == strictRawDiagonal
+         || (zeroAnalytic && rec.firstRelaxClass == structuralLowerBoundTie);
+        const bool secondRelaxOK =
+            rec.secondRelaxClass == strictRawDiagonal
+         || (zeroAnalytic && rec.secondRelaxClass == structuralLowerBoundTie);
+        rec.cleanBranch =
+            firstRelaxOK
+         && secondRelaxOK;
+        rec.pressureAchieved =
+            rec.basePressureResidual <= max(pressureTol, scalar(10)*VSMALL)
+         && rec.firstPressureResidual <= max(pressureTol, scalar(10)*VSMALL)
+         && rec.secondPressureResidual <= max(pressureTol, scalar(10)*VSMALL);
+
+        const scalar integratedAbsGate =
+            scalar(5e-11)
+           *max
+            (
+                scalar(1),
+                max(mag(flowIntegratedBeta[celli]), mag(rec.flowIntegrated))
+            );
+        rec.accepted =
+            rec.cleanBranch
+         && rec.pressureAchieved
+         && flowIntegratedBeta[celli]*rec.flowIntegrated >= -VSMALL
+         && (
+                rec.integratedSymRel < scalar(1e-5)
+             || mag(rec.integratedGap) < integratedAbsGate
+            );
+
+        return rec;
+    };
+
+    if (709 >= 0 && 709 < mesh_.nCells() && isDesign.test(709))
+    {
+        scalarList denseH(14, Zero);
+        denseH[0] = scalar(2e-5);
+        denseH[1] = scalar(1.5e-5);
+        denseH[2] = scalar(1e-5);
+        denseH[3] = scalar(8e-6);
+        denseH[4] = scalar(7e-6);
+        denseH[5] = scalar(6e-6);
+        denseH[6] = scalar(5e-6);
+        denseH[7] = scalar(4e-6);
+        denseH[8] = scalar(3e-6);
+        denseH[9] = scalar(2.5e-6);
+        denseH[10] = scalar(2e-6);
+        denseH[11] = scalar(1.5e-6);
+        denseH[12] = scalar(1e-6);
+        denseH[13] = scalar(7e-7);
+
+        scalarList pressureTols(3, Zero);
+        pressureTols[0] = scalar(1e-12);
+        pressureTols[1] = scalar(1e-13);
+        pressureTols[2] = scalar(1e-14);
+
+        List<scalarList> denseU(pressureTols.size());
+        List<scalarList> denseP(pressureTols.size());
+        List<scalarList> densePhiI(pressureTols.size());
+        List<scalarList> densePhiB(pressureTols.size());
+        List<scalarList> denseIntegrated(pressureTols.size());
+        List<scalarList> denseGap(pressureTols.size());
+        List<scalarList> denseSym(pressureTols.size());
+        List<boolList> denseClean(pressureTols.size());
+        List<boolList> denseAccepted(pressureTols.size());
+        forAll(pressureTols, ti)
+        {
+            denseU[ti].setSize(denseH.size(), Zero);
+            denseP[ti].setSize(denseH.size(), Zero);
+            densePhiI[ti].setSize(denseH.size(), Zero);
+            densePhiB[ti].setSize(denseH.size(), Zero);
+            denseIntegrated[ti].setSize(denseH.size(), Zero);
+            denseGap[ti].setSize(denseH.size(), Zero);
+            denseSym[ti].setSize(denseH.size(), GREAT);
+            denseClean[ti].setSize(denseH.size(), false);
+            denseAccepted[ti].setSize(denseH.size(), false);
+        }
+
+        Info<< "ATC-T cell709 dense one-sided map oracle: "
+            << "h pressureTol basePressureResidual plusHPressureResidual "
+            << "plus2HPressureResidual flowU flowP flowPhiInternal "
+            << "flowPhiBoundary fdIntegrated analyticIntegrated "
+            << "integratedGap integratedSymRel fdBetaMult analyticBetaMult "
+            << "betaMultGap betaMultSymRel baseRelaxBranch hRelaxBranch "
+            << "twoHRelaxBranch phiSignH phiSign2H cleanBranch "
+            << "pressureAchieved accepted"
+            << endl;
+
+        forAll(denseH, hi)
+        {
+            forAll(pressureTols, ti)
+            {
+                CellFDRecord rec =
+                    secondOrderCellRecord
+                    (
+                        709,
+                        denseH[hi],
+                        pressureTols[ti],
+                        "ATCTCell709Dense_h" + Foam::name(hi)
+                      + "_tol" + Foam::name(ti)
+                    );
+
+                denseU[ti][hi] = rec.flowU;
+                denseP[ti][hi] = rec.flowP;
+                densePhiI[ti][hi] = rec.flowPhiInternal;
+                densePhiB[ti][hi] = rec.flowPhiBoundary;
+                denseIntegrated[ti][hi] = rec.flowIntegrated;
+                denseGap[ti][hi] = rec.integratedGap;
+                denseSym[ti][hi] = rec.integratedSymRel;
+                denseClean[ti][hi] = rec.cleanBranch;
+                denseAccepted[ti][hi] = rec.accepted;
+
+                if (rec.cleanBranch && rec.betaMultSymRel < cell709BestSymRel)
+                {
+                    cell709BestSymRel = rec.betaMultSymRel;
+                    cell709BestAbsGap = mag(rec.betaMultGap);
+                    cell709BestH = rec.h;
+                }
+
+                Info<< "ATC-T cell709 dense one-sided map oracle row: "
+                    << rec.h << " "
+                    << rec.pressureTol << " "
+                    << rec.basePressureResidual << " "
+                    << rec.firstPressureResidual << " "
+                    << rec.secondPressureResidual << " "
+                    << rec.flowU << " "
+                    << rec.flowP << " "
+                    << rec.flowPhiInternal << " "
+                    << rec.flowPhiBoundary << " "
+                    << rec.flowIntegrated << " "
+                    << flowIntegratedBeta[709] << " "
+                    << rec.integratedGap << " "
+                    << rec.integratedSymRel << " "
+                    << rec.flowBetaMult << " "
+                    << flowBetaMult[709] << " "
+                    << rec.betaMultGap << " "
+                    << rec.betaMultSymRel << " "
+                    << relaxClassName(rec.baseRelaxClass) << " "
+                    << relaxClassName(rec.firstRelaxClass) << " "
+                    << relaxClassName(rec.secondRelaxClass) << " "
+                    << rec.phiSignFirst << " "
+                    << rec.phiSignSecond << " "
+                    << rec.cleanBranch << " "
+                    << rec.pressureAchieved << " "
+                    << rec.accepted
+                    << endl;
+            }
+
+            const scalar gap12 = denseGap[0][hi];
+            const scalar gap14 = denseGap[2][hi];
+            const scalar solveContamination =
+                denseIntegrated[0][hi] - denseIntegrated[2][hi];
+            const scalar solveContaminationU =
+                denseU[0][hi] - denseU[2][hi];
+            const scalar solveContaminationP =
+                denseP[0][hi] - denseP[2][hi];
+            const scalar solveContaminationPhiI =
+                densePhiI[0][hi] - densePhiI[2][hi];
+            const scalar solveContaminationPhiB =
+                densePhiB[0][hi] - densePhiB[2][hi];
+            const scalar contaminationRatio =
+                mag(gap12 - gap14)/max(mag(solveContamination), VSMALL);
+
+            if
+            (
+                denseClean[0][hi]
+             && denseClean[2][hi]
+             && mag(solveContamination) >= scalar(0.25)*mag(gap12)
+             && contaminationRatio < scalar(2)
+            )
+            {
+                cell709SolveContaminationRoute3 = true;
+            }
+
+            Info<< "ATC-T cell709 pressure-solve contamination: h "
+                << denseH[hi]
+                << " gapTol1e12 " << gap12
+                << " gapTol1e14 " << gap14
+                << " contaminationU " << solveContaminationU
+                << " contaminationP " << solveContaminationP
+                << " contaminationPhiInternal " << solveContaminationPhiI
+                << " contaminationPhiBoundary " << solveContaminationPhiB
+                << " estimatedContamination " << solveContamination
+                << " ratio " << contaminationRatio
+                << endl;
+        }
+
+        forAll(pressureTols, ti)
+        {
+            label maxConsecutiveAccepted = 0;
+            label currentConsecutiveAccepted = 0;
+            label previousAcceptedIndex = -2;
+            forAll(denseH, hi)
+            {
+                if (denseAccepted[ti][hi])
+                {
+                    if (hi == previousAcceptedIndex + 1)
+                    {
+                        ++currentConsecutiveAccepted;
+                    }
+                    else
+                    {
+                        currentConsecutiveAccepted = 1;
+                    }
+                    previousAcceptedIndex = hi;
+                    maxConsecutiveAccepted =
+                        max(maxConsecutiveAccepted, currentConsecutiveAccepted);
+                }
+            }
+            Info<< "ATC-T cell709 dense route1 summary: pressureTol "
+                << pressureTols[ti]
+                << " maxConsecutiveAccepted " << maxConsecutiveAccepted
+                << endl;
+            if (maxConsecutiveAccepted >= 2)
+            {
+                cell709DenseRoute1 = true;
+            }
+        }
+
+        Info<< "ATC-T cell709 repeatability: "
+            << "h pressureTol maxStateDifference maxPsiContractionDifference"
+            << endl;
+        scalarList repeatH(5, Zero);
+        repeatH[0] = scalar(1e-5);
+        repeatH[1] = scalar(4e-6);
+        repeatH[2] = scalar(3e-6);
+        repeatH[3] = scalar(2e-6);
+        repeatH[4] = scalar(1e-6);
+        scalarList repeatTols(2, Zero);
+        repeatTols[0] = scalar(1e-12);
+        repeatTols[1] = scalar(1e-14);
+
+        forAll(repeatH, hi)
+        {
+            forAll(repeatTols, ti)
+            {
+                SimpleMapState firstBase(mesh_);
+                SimpleMapState firstPlus1(mesh_);
+                SimpleMapState firstPlus2(mesh_);
+                scalar firstDerivativeContraction = Zero;
+                scalar maxRepeatStateDiff = Zero;
+                scalar maxRepeatContractionDiff = Zero;
+
+                for (label rep = 0; rep < 3; ++rep)
+                {
+                    const scalar oldBeta = betaBase[709];
+                    SimpleMapState base =
+                        mapAtSingleCellBeta
+                        (
+                            709,
+                            oldBeta,
+                            repeatTols[ti],
+                            "ATCTCell709Repeat_base_h"
+                          + Foam::name(hi) + "_tol" + Foam::name(ti)
+                          + "_rep" + Foam::name(rep)
+                        );
+                    SimpleMapState plus1 =
+                        mapAtSingleCellBeta
+                        (
+                            709,
+                            oldBeta + repeatH[hi],
+                            repeatTols[ti],
+                            "ATCTCell709Repeat_plus1_h"
+                          + Foam::name(hi) + "_tol" + Foam::name(ti)
+                          + "_rep" + Foam::name(rep)
+                        );
+                    SimpleMapState plus2 =
+                        mapAtSingleCellBeta
+                        (
+                            709,
+                            oldBeta + scalar(2)*repeatH[hi],
+                            repeatTols[ti],
+                            "ATCTCell709Repeat_plus2_h"
+                          + Foam::name(hi) + "_tol" + Foam::name(ti)
+                          + "_rep" + Foam::name(rep)
+                        );
+                    SimpleMapState dM =
+                        mapStateThreePoint
+                        (
+                            base,
+                            scalar(-3),
+                            plus1,
+                            scalar(4),
+                            plus2,
+                            scalar(-1),
+                            scalar(2)*repeatH[hi]
+                        );
+                    const scalar contraction = totalPsiContraction(dM);
+
+                    if (rep == 0)
+                    {
+                        firstBase = base;
+                        firstPlus1 = plus1;
+                        firstPlus2 = plus2;
+                        firstDerivativeContraction = contraction;
+                    }
+                    else
+                    {
+                        maxRepeatStateDiff =
+                            max
+                            (
+                                maxRepeatStateDiff,
+                                maxMapStateDifference(base, firstBase)
+                            );
+                        maxRepeatStateDiff =
+                            max
+                            (
+                                maxRepeatStateDiff,
+                                maxMapStateDifference(plus1, firstPlus1)
+                            );
+                        maxRepeatStateDiff =
+                            max
+                            (
+                                maxRepeatStateDiff,
+                                maxMapStateDifference(plus2, firstPlus2)
+                            );
+                        maxRepeatContractionDiff =
+                            max
+                            (
+                                maxRepeatContractionDiff,
+                                mag(contraction - firstDerivativeContraction)
+                            );
+                    }
+                }
+
+                Info<< "ATC-T cell709 repeatability row: "
+                    << repeatH[hi] << " "
+                    << repeatTols[ti] << " "
+                    << maxRepeatStateDiff << " "
+                    << maxRepeatContractionDiff
+                    << endl;
+            }
+        }
+
+        Info<< "ATC-T cell709 Richardson table: "
+            << "h hHalf pressureTol richardsonU richardsonP "
+            << "richardsonPhiInternal richardsonPhiBoundary "
+            << "richardsonIntegrated analyticIntegrated integratedGap "
+            << "integratedSymRel betaMultValue analyticBetaMult "
+            << "betaMultGap betaMultSymRel cleanPair accepted"
+            << endl;
+
+        label maxConsecutiveRichardson = 0;
+        label currentConsecutiveRichardson = 0;
+        label previousRichardsonIndex = -2;
+        for (label hi = 0; hi + 1 < denseH.size(); ++hi)
+        {
+            const scalar h = denseH[hi];
+            const scalar hHalf = scalar(0.5)*h;
+            label hHalfIndex = -1;
+            forAll(denseH, findi)
+            {
+                if (mag(denseH[findi] - hHalf) <= scalar(1e-15))
+                {
+                    hHalfIndex = findi;
+                    break;
+                }
+            }
+            if (hHalfIndex < 0)
+            {
+                continue;
+            }
+
+            const label ti = 2;
+            const scalar richU =
+                (scalar(4)*denseU[ti][hHalfIndex] - denseU[ti][hi])/scalar(3);
+            const scalar richP =
+                (scalar(4)*denseP[ti][hHalfIndex] - denseP[ti][hi])/scalar(3);
+            const scalar richPhiI =
+                (
+                    scalar(4)*densePhiI[ti][hHalfIndex]
+                  - densePhiI[ti][hi]
+                )/scalar(3);
+            const scalar richPhiB =
+                (
+                    scalar(4)*densePhiB[ti][hHalfIndex]
+                  - densePhiB[ti][hi]
+                )/scalar(3);
+            const scalar richIntegrated =
+                richU + richP + richPhiI + richPhiB;
+            const scalar richBetaMult = richIntegrated/V[709]*dt;
+            const scalar integratedGap =
+                flowIntegratedBeta[709] - richIntegrated;
+            const scalar integratedSym =
+                mag(integratedGap)
+               /(mag(flowIntegratedBeta[709]) + mag(richIntegrated) + VSMALL);
+            const scalar betaGap = flowBetaMult[709] - richBetaMult;
+            const scalar betaSym =
+                mag(betaGap)/(mag(flowBetaMult[709]) + mag(richBetaMult) + VSMALL);
+            const bool cleanPair =
+                denseClean[ti][hi]
+             && denseClean[ti][hHalfIndex];
+            const scalar integratedAbsGate =
+                scalar(5e-11)
+               *max
+                (
+                    scalar(1),
+                    max(mag(flowIntegratedBeta[709]), mag(richIntegrated))
+                );
+            const bool accepted =
+                cleanPair
+             && flowIntegratedBeta[709]*richIntegrated >= -VSMALL
+             && (
+                    integratedSym < scalar(1e-5)
+                 || mag(integratedGap) < integratedAbsGate
+                );
+
+            if (accepted)
+            {
+                if (hi == previousRichardsonIndex + 1)
+                {
+                    ++currentConsecutiveRichardson;
+                }
+                else
+                {
+                    currentConsecutiveRichardson = 1;
+                }
+                previousRichardsonIndex = hi;
+                maxConsecutiveRichardson =
+                    max(maxConsecutiveRichardson, currentConsecutiveRichardson);
+            }
+
+            Info<< "ATC-T cell709 Richardson row: "
+                << h << " "
+                << hHalf << " "
+                << pressureTols[ti] << " "
+                << richU << " "
+                << richP << " "
+                << richPhiI << " "
+                << richPhiB << " "
+                << richIntegrated << " "
+                << flowIntegratedBeta[709] << " "
+                << integratedGap << " "
+                << integratedSym << " "
+                << richBetaMult << " "
+                << flowBetaMult[709] << " "
+                << betaGap << " "
+                << betaSym << " "
+                << cleanPair << " "
+                << accepted
+                << endl;
+        }
+        if (maxConsecutiveRichardson >= 2)
+        {
+            cell709RichardsonRoute2 = true;
+        }
+        Info<< "ATC-T cell709 Richardson summary: "
+            << "maxConsecutiveAccepted " << maxConsecutiveRichardson
+            << endl;
+
+        Info<< "ATC-T cell709 fourth-order forward table: "
+            << "h pressureTol flowU flowP flowPhiInternal flowPhiBoundary "
+            << "fdIntegrated analyticIntegrated integratedGap "
+            << "integratedSymRel fdBetaMult analyticBetaMult betaMultGap "
+            << "betaMultSymRel"
+            << endl;
+        scalarList fourthH(4, Zero);
+        fourthH[0] = scalar(1e-5);
+        fourthH[1] = scalar(6e-6);
+        fourthH[2] = scalar(4e-6);
+        fourthH[3] = scalar(3e-6);
+        forAll(fourthH, hi)
+        {
+            const scalar oldBeta = betaBase[709];
+            if (oldBeta + scalar(4)*fourthH[hi] > scalar(1) + SMALL)
+            {
+                continue;
+            }
+
+            SimpleMapState base =
+                mapAtSingleCellBeta
+                (
+                    709,
+                    oldBeta,
+                    scalar(1e-14),
+                    "ATCTCell709Fourth_base_h" + Foam::name(hi)
+                );
+            SimpleMapState plus1 =
+                mapAtSingleCellBeta
+                (
+                    709,
+                    oldBeta + fourthH[hi],
+                    scalar(1e-14),
+                    "ATCTCell709Fourth_plus1_h" + Foam::name(hi)
+                );
+            SimpleMapState plus2 =
+                mapAtSingleCellBeta
+                (
+                    709,
+                    oldBeta + scalar(2)*fourthH[hi],
+                    scalar(1e-14),
+                    "ATCTCell709Fourth_plus2_h" + Foam::name(hi)
+                );
+            SimpleMapState plus3 =
+                mapAtSingleCellBeta
+                (
+                    709,
+                    oldBeta + scalar(3)*fourthH[hi],
+                    scalar(1e-14),
+                    "ATCTCell709Fourth_plus3_h" + Foam::name(hi)
+                );
+            SimpleMapState plus4 =
+                mapAtSingleCellBeta
+                (
+                    709,
+                    oldBeta + scalar(4)*fourthH[hi],
+                    scalar(1e-14),
+                    "ATCTCell709Fourth_plus4_h" + Foam::name(hi)
+                );
+            SimpleMapState dM =
+                mapStateFivePoint
+                (
+                    base,
+                    scalar(-25),
+                    plus1,
+                    scalar(48),
+                    plus2,
+                    scalar(-36),
+                    plus3,
+                    scalar(16),
+                    plus4,
+                    scalar(-3),
+                    scalar(12)*fourthH[hi]
+                );
+            scalar flowU = Zero;
+            scalar flowP = Zero;
+            scalar flowPhiInternal = Zero;
+            scalar flowPhiBoundary = Zero;
+            contractPsiWithState
+            (
+                dM,
+                flowU,
+                flowP,
+                flowPhiInternal,
+                flowPhiBoundary
+            );
+            const scalar fdIntegrated =
+                flowU + flowP + flowPhiInternal + flowPhiBoundary;
+            const scalar fdBetaMult = fdIntegrated/V[709]*dt;
+            const scalar integratedGap =
+                flowIntegratedBeta[709] - fdIntegrated;
+            const scalar integratedSym =
+                mag(integratedGap)
+               /(mag(flowIntegratedBeta[709]) + mag(fdIntegrated) + VSMALL);
+            const scalar betaGap = flowBetaMult[709] - fdBetaMult;
+            const scalar betaSym =
+                mag(betaGap)/(mag(flowBetaMult[709]) + mag(fdBetaMult) + VSMALL);
+
+            Info<< "ATC-T cell709 fourth-order forward row: "
+                << fourthH[hi] << " "
+                << scalar(1e-14) << " "
+                << flowU << " "
+                << flowP << " "
+                << flowPhiInternal << " "
+                << flowPhiBoundary << " "
+                << fdIntegrated << " "
+                << flowIntegratedBeta[709] << " "
+                << integratedGap << " "
+                << integratedSym << " "
+                << fdBetaMult << " "
+                << flowBetaMult[709] << " "
+                << betaGap << " "
+                << betaSym
+                << endl;
+        }
+    }
+
+    Info<< "ATC-T analytic fixed-point beta direction identity: "
+        << "direction eps nDirectionCells flowU flowP flowPhiInternal "
+        << "flowPhiBoundary lhs rhsIntegrated rhsBetaMult signedGap symRel "
+        << "gapOverL1 basePressureResidual plusHPressureResidual "
+        << "plus2HPressureResidual nIntendedRelaxTieToRaw "
+        << "nUnexpectedRelaxChanges phiSignFirst phiSignSecond cleanBranch "
+        << "accepted"
+        << endl;
+
+    bool directionAccepted[3] = {false, false, false};
+    bool directionSkipped[3] = {false, false, false};
+    scalarList directionH(7, Zero);
+    directionH[0] = scalar(2e-5);
+    directionH[1] = scalar(1e-5);
+    directionH[2] = scalar(6e-6);
+    directionH[3] = scalar(4e-6);
+    directionH[4] = scalar(3e-6);
+    directionH[5] = scalar(2e-6);
+    directionH[6] = scalar(1e-6);
+
+    for (label diri = 0; diri < 3; ++diri)
+    {
+        scalarField dBeta(mesh_.nCells(), Zero);
+        label nDirectionCells = 0;
+        forAll(dBeta, celli)
+        {
+            if (!isDesign.test(celli))
+            {
+                continue;
+            }
+
+            const label a =
+                ((celli + label(17)*(diri + 1))
+               *(label(37) + label(11)*diri)) % label(101);
+            const scalar magCoeff = scalar(a + 1)/scalar(101);
+
+            if (diri == 0)
+            {
+                if (isStructuralLowerBoundTie[celli])
+                {
+                    dBeta[celli] = magCoeff;
+                }
+            }
+            else if (diri == 1)
+            {
+                if (scalar(1) - betaBase[celli] <= SMALL)
+                {
+                    dBeta[celli] = -magCoeff;
+                }
+            }
+            else
+            {
+                if (betaBase[celli] <= SMALL)
+                {
+                    dBeta[celli] = magCoeff;
+                }
+                else if (scalar(1) - betaBase[celli] <= SMALL)
+                {
+                    dBeta[celli] = -magCoeff;
+                }
+                else
+                {
+                    dBeta[celli] = (scalar(a) - scalar(50))/scalar(50);
+                }
+            }
+
+            if (mag(dBeta[celli]) > SMALL)
+            {
+                ++nDirectionCells;
+            }
+        }
+        reduce(nDirectionCells, sumOp<label>());
+
+        if (!nDirectionCells)
+        {
+            Info<< "ATC-T analytic fixed-point beta direction skipped: "
+                << diri << " has no admissible active cells."
+                << endl;
+            directionSkipped[diri] = true;
+            continue;
+        }
+
+        label maxConsecutiveAccepted = 0;
+        label currentConsecutiveAccepted = 0;
+        label previousAcceptedIndex = -2;
+        forAll(directionH, epsi)
+        {
+            scalar h = directionH[epsi];
+            forAll(dBeta, celli)
+            {
+                if (mag(dBeta[celli]) <= SMALL)
+                {
+                    continue;
+                }
+
+                const scalar room =
+                    dBeta[celli] > 0
+                  ? scalar(1) - betaBase[celli]
+                  : betaBase[celli];
+                h = min(h, scalar(0.5)*room/mag(dBeta[celli]));
+            }
+
+            if (h <= SMALL)
+            {
+                Info<< "ATC-T analytic fixed-point beta direction sample "
+                    << "skipped: direction " << diri
+                    << " requestedH " << directionH[epsi]
+                    << " actualH " << h
+                    << endl;
+                continue;
+            }
+
+            auto directionRelaxProbe = [&](const scalar step)
+            {
+                restoreAll();
+                beta.primitiveFieldRef() =
+                    betaBase.primitiveField() + step*h*dBeta;
+                beta.correctBoundaryConditions();
+                BetaRelaxProbeState state = assembleRelaxProbe();
+                restoreAll();
+                return state;
+            };
+
+            BetaRelaxProbeState firstProbe = directionRelaxProbe(scalar(1));
+            BetaRelaxProbeState secondProbe = directionRelaxProbe(scalar(2));
+
+            restoreAll();
+            beta.primitiveFieldRef() =
+                betaBase.primitiveField() + h*dBeta;
+            beta.correctBoundaryConditions();
+            SimpleMapState plus1 =
+                primalSimpleMapStateAtFrozenState
+                (
+                    "ATCTAnalyticFPBetaDirectionPlus1"
+                  + Foam::name(diri) + "_eps" + Foam::name(epsi)
+                  + "_tol14",
+                    scalar(1e-14)
+                );
+            const label phiSignFirst =
+                countMapPhiSignChanges(baseMapTol14, plus1);
+
+            restoreAll();
+            beta.primitiveFieldRef() =
+                betaBase.primitiveField() + scalar(2)*h*dBeta;
+            beta.correctBoundaryConditions();
+            SimpleMapState plus2 =
+                primalSimpleMapStateAtFrozenState
+                (
+                    "ATCTAnalyticFPBetaDirectionPlus2"
+                  + Foam::name(diri) + "_eps" + Foam::name(epsi)
+                  + "_tol14",
+                    scalar(1e-14)
+                );
+            const label phiSignSecond =
+                countMapPhiSignChanges(baseMapTol14, plus2);
+
+            restoreAll();
+            SimpleMapState dM =
+                mapStateThreePoint
+                (
+                    baseMapTol14,
+                    scalar(-3),
+                    plus1,
+                    scalar(4),
+                    plus2,
+                    scalar(-1),
+                    scalar(2)*h
+                );
+
+            scalar flowU = Zero;
+            scalar flowP = Zero;
+            scalar flowPhiInternal = Zero;
+            scalar flowPhiBoundary = Zero;
+            contractPsiWithState
+            (
+                dM,
+                flowU,
+                flowP,
+                flowPhiInternal,
+                flowPhiBoundary
+            );
+            const scalar lhs =
+                flowU + flowP + flowPhiInternal + flowPhiBoundary;
+
+            scalar rhsIntegrated = Zero;
+            scalar rhsBetaMult = Zero;
+            scalar l1 = VSMALL;
+            forAll(dBeta, celli)
+            {
+                rhsIntegrated += flowIntegratedBeta[celli]*dBeta[celli];
+                rhsBetaMult +=
+                    V[celli]*flowBetaMult[celli]/dt*dBeta[celli];
+                l1 += mag(flowIntegratedBeta[celli]*dBeta[celli]);
+            }
+            reduce(rhsIntegrated, sumOp<scalar>());
+            reduce(rhsBetaMult, sumOp<scalar>());
+            reduce(l1, sumOp<scalar>());
+
+            const scalar betaMultGap = mag(rhsIntegrated - rhsBetaMult);
+            if (betaMultGap > scalar(1e-12)*max(scalar(1), mag(rhsIntegrated)))
+            {
+                FatalErrorInFunction
+                    << "Integrated and betaMult-style analytic beta direction "
+                    << "contractions differ for direction " << diri
+                    << ". gap " << betaMultGap << exit(FatalError);
+            }
+
+            const scalar gap = lhs - rhsIntegrated;
+            const scalar sym =
+                mag(gap)/(mag(lhs) + mag(rhsIntegrated) + VSMALL);
+            const scalar gapOverL1 = mag(gap)/max(l1, VSMALL);
+            label nIntendedRelaxTieToRaw = 0;
+            label nUnexpectedRelaxChanges = 0;
+            forAll(dBeta, celli)
+            {
+                if (mag(dBeta[celli]) <= SMALL)
+                {
+                    continue;
+                }
+
+                const bool intendedTieToRaw =
+                    relaxClass[celli] == structuralLowerBoundTie
+                 && dBeta[celli] > scalar(0)
+                 && firstProbe.rawRelaxBranch[celli] == strictRawDiagonal
+                 && secondProbe.rawRelaxBranch[celli] == strictRawDiagonal;
+                const bool strictRawStable =
+                    relaxClass[celli] == strictRawDiagonal
+                 && firstProbe.rawRelaxBranch[celli] == strictRawDiagonal
+                 && secondProbe.rawRelaxBranch[celli] == strictRawDiagonal;
+
+                if (intendedTieToRaw)
+                {
+                    ++nIntendedRelaxTieToRaw;
+                }
+                else if (!strictRawStable)
+                {
+                    ++nUnexpectedRelaxChanges;
+                }
+            }
+            reduce(nIntendedRelaxTieToRaw, sumOp<label>());
+            reduce(nUnexpectedRelaxChanges, sumOp<label>());
+
+            const bool cleanBranch =
+                nUnexpectedRelaxChanges == 0;
+            const bool pressureAchieved =
+                baseMapTol14.pressureFinalResidual
+             <= max(scalar(1e-14), scalar(10)*VSMALL)
+             && plus1.pressureFinalResidual
+             <= max(scalar(1e-14), scalar(10)*VSMALL)
+             && plus2.pressureFinalResidual
+             <= max(scalar(1e-14), scalar(10)*VSMALL);
+            const bool accepted =
+                cleanBranch
+             && pressureAchieved
+             &&
+                (
+                    sym < scalar(1e-5)
+                 || (
+                        mag(gap) < scalar(1e-7)
+                     && gapOverL1 < scalar(1e-6)
+                    )
+                );
+
+            if (accepted)
+            {
+                if (epsi == previousAcceptedIndex + 1)
+                {
+                    ++currentConsecutiveAccepted;
+                }
+                else
+                {
+                    currentConsecutiveAccepted = 1;
+                }
+                previousAcceptedIndex = epsi;
+                maxConsecutiveAccepted =
+                    max(maxConsecutiveAccepted, currentConsecutiveAccepted);
+            }
+
+            Info<< "ATC-T analytic fixed-point beta direction sample: "
+                << diri << " "
+                << h << " "
+                << nDirectionCells << " "
+                << flowU << " "
+                << flowP << " "
+                << flowPhiInternal << " "
+                << flowPhiBoundary << " "
+                << lhs << " "
+                << rhsIntegrated << " "
+                << rhsBetaMult << " "
+                << gap << " "
+                << sym << " "
+                << gapOverL1 << " "
+                << baseMapTol14.pressureFinalResidual << " "
+                << plus1.pressureFinalResidual << " "
+                << plus2.pressureFinalResidual << " "
+                << nIntendedRelaxTieToRaw << " "
+                << nUnexpectedRelaxChanges << " "
+                << phiSignFirst << " "
+                << phiSignSecond << " "
+                << cleanBranch << " "
+                << accepted
+                << endl;
+        }
+
+        if (maxConsecutiveAccepted < 2)
+        {
+            Info<< "ATC-T analytic fixed-point beta direction result: "
+                << diri
+                << " accepted " << false
+                << " maxConsecutiveAccepted " << maxConsecutiveAccepted
+                << endl;
+        }
+        else
+        {
+            directionAccepted[diri] = true;
+            Info<< "ATC-T analytic fixed-point beta direction result: "
+                << diri
+                << " accepted " << true
+                << " maxConsecutiveAccepted " << maxConsecutiveAccepted
+                << endl;
+        }
+    }
+
+    const bool selectedCoreAccepted =
+        selectedCell707Accepted
+     && selectedCell708Accepted;
+    const bool directionCoreAccepted =
+        directionAccepted[0]
+     && directionAccepted[2]
+     && (directionAccepted[1] || directionSkipped[1]);
+    const bool cell709Route3 =
+        directionAccepted[0]
+     && directionAccepted[2]
+     && cell709BestSymRel < scalar(1e-5)
+     && cell709SolveContaminationRoute3;
+    const bool cell709AcceptedByAnyRoute =
+        selectedCell709Accepted
+     || cell709DenseRoute1
+     || cell709RichardsonRoute2
+     || cell709Route3;
+
+    const bool cell709ResolutionLimited =
+        cell709Route3
+     && !selectedCell709Accepted
+     && !cell709DenseRoute1
+     && !cell709RichardsonRoute2;
+
+    Info<< "ATC-T analytic fixed-point beta final decision: ";
+    if (selectedCoreAccepted && directionCoreAccepted && cell709AcceptedByAnyRoute)
+    {
+        if (cell709ResolutionLimited)
+        {
+            Info<< "VALIDATED, CELL-709 LOCAL FD RESOLUTION-LIMITED";
+        }
+        else
+        {
+            Info<< "VALIDATED";
+        }
+    }
+    else
+    {
+        Info<< "NOT VALIDATED";
+    }
+    Info
+        << " selectedCoreAccepted " << selectedCoreAccepted
+        << " directionCoreAccepted " << directionCoreAccepted
+        << " directionA " << directionAccepted[0]
+        << " directionB " << directionAccepted[1]
+        << " directionBSkipped " << directionSkipped[1]
+        << " directionC " << directionAccepted[2]
+        << " selectedCell709Accepted " << selectedCell709Accepted
+        << " cell709DenseRoute1 " << cell709DenseRoute1
+        << " cell709RichardsonRoute2 " << cell709RichardsonRoute2
+        << " cell709Route3 " << cell709Route3
+        << " cell709BestH " << cell709BestH
+        << " cell709BestAbsGap " << cell709BestAbsGap
+        << " cell709BestSymRel " << cell709BestSymRel
+        << endl;
+
+    restoreAll();
+
+    scalar maxRestoreScaledDiff = Zero;
+    word maxRestoreField("none");
+    auto recordRestoreDiff =
+        [&](const scalar diff, const scalar baseScale, const word& fieldName)
+    {
+        const scalar scaled = diff/max(max(baseScale, scalar(1)), SMALL);
+        if (scaled > maxRestoreScaledDiff)
+        {
+            maxRestoreScaledDiff = scaled;
+            maxRestoreField = fieldName;
+        }
+    };
+
+    forAll(U.primitiveField(), celli)
+    {
+        recordRestoreDiff
+        (
+            mag(U.primitiveField()[celli] - UBase.primitiveField()[celli]),
+            mag(UBase.primitiveField()[celli]),
+            "U"
+        );
+        recordRestoreDiff
+        (
+            mag(p.primitiveField()[celli] - pBase.primitiveField()[celli]),
+            mag(pBase.primitiveField()[celli]),
+            "p"
+        );
+        recordRestoreDiff
+        (
+            mag(beta.primitiveField()[celli] - betaBase.primitiveField()[celli]),
+            mag(betaBase.primitiveField()[celli]),
+            "beta"
+        );
+        recordRestoreDiff
+        (
+            mag(T.primitiveField()[celli] - TBase.primitiveField()[celli]),
+            mag(TBase.primitiveField()[celli]),
+            "T"
+        );
+    }
+    forAll(phi.primitiveField(), facei)
+    {
+        recordRestoreDiff
+        (
+            mag
+            (
+                phi.primitiveField()[facei]
+              - phiBase.primitiveField()[facei]
+            ),
+            mag(phiBase.primitiveField()[facei]),
+            "phi"
+        );
+    }
+    forAll(U.boundaryField(), patchi)
+    {
+        forAll(U.boundaryField()[patchi], facei)
+        {
+            recordRestoreDiff
+            (
+                mag
+                (
+                    U.boundaryField()[patchi][facei]
+                  - UBase.boundaryField()[patchi][facei]
+                ),
+                mag(UBase.boundaryField()[patchi][facei]),
+                "UBoundary"
+            );
+        }
+        forAll(p.boundaryField()[patchi], facei)
+        {
+            recordRestoreDiff
+            (
+                mag
+                (
+                    p.boundaryField()[patchi][facei]
+                  - pBase.boundaryField()[patchi][facei]
+                ),
+                mag(pBase.boundaryField()[patchi][facei]),
+                "pBoundary"
+            );
+        }
+        forAll(phi.boundaryField()[patchi], facei)
+        {
+            recordRestoreDiff
+            (
+                mag
+                (
+                    phi.boundaryField()[patchi][facei]
+                  - phiBase.boundaryField()[patchi][facei]
+                ),
+                mag(phiBase.boundaryField()[patchi][facei]),
+                "phiBoundary"
+            );
+        }
+        forAll(beta.boundaryField()[patchi], facei)
+        {
+            recordRestoreDiff
+            (
+                mag
+                (
+                    beta.boundaryField()[patchi][facei]
+                  - betaBase.boundaryField()[patchi][facei]
+                ),
+                mag(betaBase.boundaryField()[patchi][facei]),
+                "betaBoundary"
+            );
+        }
+        forAll(T.boundaryField()[patchi], facei)
+        {
+            recordRestoreDiff
+            (
+                mag
+                (
+                    T.boundaryField()[patchi][facei]
+                  - TBase.boundaryField()[patchi][facei]
+                ),
+                mag(TBase.boundaryField()[patchi][facei]),
+                "TBoundary"
+            );
+        }
+    }
+    reduce(maxRestoreScaledDiff, maxOp<scalar>());
+
+    Info<< "ATC-T analytic fixed-point beta state restoration: "
+        << "maxScaledDiff " << maxRestoreScaledDiff
+        << " field " << maxRestoreField
+        << endl;
+
+    if (maxRestoreScaledDiff > scalar(1e-13))
+    {
+        FatalErrorInFunction
+            << "Analytic fixed-point beta diagnostic did not restore state. "
+            << "maxScaledDiff " << maxRestoreScaledDiff
+            << " field " << maxRestoreField << exit(FatalError);
+    }
+
+    return tFlowBetaMult;
+}
+
+
 void Foam::thermalAdjointSimple::checkFixedPointAdjointBetaSensitivity
 (
     const SimpleMapSeed& psi,
@@ -7919,6 +11474,7 @@ void Foam::thermalAdjointSimple::checkFixedPointAdjointBetaSensitivity
             Zero
         );
         boolList validEps(fixedPointAdjointBetaFDEps_.size(), false);
+        label nValidEps = 0;
 
         forAll(fixedPointAdjointBetaFDEps_, epsi)
         {
@@ -7988,6 +11544,7 @@ void Foam::thermalAdjointSimple::checkFixedPointAdjointBetaSensitivity
             flowBetaMultValues[epsi] = flowBetaMult;
             totalBetaMultValues[epsi] = totalBetaMult;
             validEps[epsi] = true;
+            ++nValidEps;
 
             Info<< "ATC-T fixed-point adjoint beta sample: "
                 << cellj << " "
@@ -8123,6 +11680,8 @@ void Foam::thermalAdjointSimple::checkFixedPointAdjointBetaSensitivity
             const scalar flowAbsGate =
                 scalar(1e-7)
                *max(scalar(1), mag(flowIntegratedValues[epsi]));
+            const bool integratedFlowStable =
+                flowGap < scalar(5e-11);
 
             const scalar totalGap =
                 mag(totalRawValues[epsi] - totalRawValues[epsi + 1]);
@@ -8137,13 +11696,16 @@ void Foam::thermalAdjointSimple::checkFixedPointAdjointBetaSensitivity
                 scalar(1e-7)*max(scalar(1), mag(totalRawValues[epsi]));
 
             const bool stable =
-                (
-                    flowSym < scalar(1e-5)
-                 || flowGap < flowAbsGate
-                )
-             && (
-                    totalSym < scalar(1e-5)
-                 || totalGap < totalAbsGate
+                integratedFlowStable
+             || (
+                    (
+                        flowSym < scalar(1e-5)
+                     || flowGap < flowAbsGate
+                    )
+                 && (
+                        totalSym < scalar(1e-5)
+                     || totalGap < totalAbsGate
+                    )
                 );
 
             Info<< "ATC-T fixed-point adjoint beta plateau check: cell "
@@ -8166,6 +11728,15 @@ void Foam::thermalAdjointSimple::checkFixedPointAdjointBetaSensitivity
 
         if (plateauA == -1)
         {
+            if (nValidEps == 0)
+            {
+                Info<< "ATC-T fixed-point adjoint beta plateau skipped: cell "
+                    << cellj
+                    << " has no usable central-difference beta room."
+                    << endl;
+                continue;
+            }
+
             FatalErrorInFunction
                 << "No stable fixed-point adjoint beta plateau for cell "
                 << cellj << ". Diagnostic only; betaMult is unchanged."
@@ -11135,6 +14706,17 @@ Foam::thermalAdjointSimple::primalSimpleMapStateAtFrozenState
     const word& namePrefix
 )
 {
+    return primalSimpleMapStateAtFrozenState(namePrefix, scalar(1e-12));
+}
+
+
+Foam::thermalAdjointSimple::SimpleMapState
+Foam::thermalAdjointSimple::primalSimpleMapStateAtFrozenState
+(
+    const word& namePrefix,
+    const scalar pressureAbsTol
+)
+{
     const volScalarField& p = primalVars_.p();
     volVectorField& U = primalVars_.U();
     surfaceScalarField& phi = primalVars_.phi();
@@ -11199,8 +14781,8 @@ Foam::thermalAdjointSimple::primalSimpleMapStateAtFrozenState
     );
     dictionary pSolver(pEqn.solverDict("p"));
     pSolver.set("relTol", scalar(0));
-    pSolver.set("tolerance", scalar(1e-12));
-    pEqn.solve(pSolver);
+    pSolver.set("tolerance", pressureAbsTol);
+    SolverPerformance<scalar> pPerf = pEqn.solve(pSolver);
 
     surfaceScalarField phiNew
     (
@@ -11243,6 +14825,10 @@ Foam::thermalAdjointSimple::primalSimpleMapStateAtFrozenState
     state.U = Unew.primitiveField();
     state.p = pMap.primitiveField();
     state.phiInternal = phiNew.primitiveField();
+    state.pressureInitialResidual = pPerf.initialResidual();
+    state.pressureFinalResidual = pPerf.finalResidual();
+    state.pressureIterations = pPerf.nIterations();
+    state.pressureSolverName = pPerf.solverName();
     forAll(state.phiBoundary, patchi)
     {
         state.phiBoundary[patchi] = phiNew.boundaryField()[patchi];
@@ -29362,6 +32948,9 @@ Foam::thermalAdjointSimple::thermalAdjointSimple
     checkFixedPointAdjointNeumann_(false),
     checkFixedPointAdjointBetaSensitivity_(false),
     writeFixedPointAdjointBetaSamples_(false),
+    computeAnalyticFixedPointAdjointBeta_(false),
+    checkAnalyticFixedPointAdjointBeta_(false),
+    writeAnalyticFixedPointAdjointBeta_(false),
     fixedPointAdjointRestart_(20),
     fixedPointAdjointMaxIters_(200),
     fixedPointAdjointNeumannIters_(50),
@@ -29515,6 +33104,24 @@ Foam::thermalAdjointSimple::thermalAdjointSimple
         thermalDict.getOrDefault<bool>
         (
             "writeFixedPointAdjointBetaSamples",
+            false
+        );
+    computeAnalyticFixedPointAdjointBeta_ =
+        thermalDict.getOrDefault<bool>
+        (
+            "computeAnalyticFixedPointAdjointBeta",
+            false
+        );
+    checkAnalyticFixedPointAdjointBeta_ =
+        thermalDict.getOrDefault<bool>
+        (
+            "checkAnalyticFixedPointAdjointBeta",
+            false
+        );
+    writeAnalyticFixedPointAdjointBeta_ =
+        thermalDict.getOrDefault<bool>
+        (
+            "writeAnalyticFixedPointAdjointBeta",
             false
         );
     fixedPointAdjointRestart_ =
@@ -29766,6 +33373,24 @@ bool Foam::thermalAdjointSimple::readDict(const dictionary& dict)
                 "writeFixedPointAdjointBetaSamples",
                 false
             );
+        computeAnalyticFixedPointAdjointBeta_ =
+            thermalDict.getOrDefault<bool>
+            (
+                "computeAnalyticFixedPointAdjointBeta",
+                false
+            );
+        checkAnalyticFixedPointAdjointBeta_ =
+            thermalDict.getOrDefault<bool>
+            (
+                "checkAnalyticFixedPointAdjointBeta",
+                false
+            );
+        writeAnalyticFixedPointAdjointBeta_ =
+            thermalDict.getOrDefault<bool>
+            (
+                "writeAnalyticFixedPointAdjointBeta",
+                false
+            );
         fixedPointAdjointRestart_ =
             thermalDict.getOrDefault<label>("fixedPointAdjointRestart", 20);
         fixedPointAdjointMaxIters_ =
@@ -29891,6 +33516,30 @@ void Foam::thermalAdjointSimple::topOSensMultiplier
     {
         fixedPointResult = runFixedPointAdjointSolve();
         haveFixedPointResult = true;
+    }
+
+    if (computeAnalyticFixedPointAdjointBeta_)
+    {
+        if (!haveFixedPointResult || !fixedPointResult.converged)
+        {
+            FatalErrorInFunction
+                << "computeAnalyticFixedPointAdjointBeta requires a "
+                << "converged fixed-point adjoint result."
+                << exit(FatalError);
+        }
+
+        tmp<volScalarField> tAnalyticFlow =
+            analyticFixedPointAdjointBeta
+            (
+                fixedPointResult.psi,
+                designVariablesName,
+                dt
+            );
+
+        Info<< "ATC-T analytic fixed-point beta field "
+            << tAnalyticFlow().name()
+            << " computed. Diagnostic only; betaMult is unchanged."
+            << endl;
     }
 
     const bool needExactFluxDiagnostic =

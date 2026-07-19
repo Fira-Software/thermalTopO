@@ -229,6 +229,15 @@ protected:
         //- Write sparse selected-cell fixed-point beta sensitivity samples
         bool writeFixedPointAdjointBetaSamples_;
 
+        //- Diagnostic only: compute analytic all-cell M_beta^T psi flow field
+        bool computeAnalyticFixedPointAdjointBeta_;
+
+        //- Diagnostic only: compare analytic all-cell field with beta probes
+        bool checkAnalyticFixedPointAdjointBeta_;
+
+        //- Write analytic fixed-point flow sensitivity diagnostic fields
+        bool writeAnalyticFixedPointAdjointBeta_;
+
         //- Restart length for fixed-point adjoint GMRES
         label fixedPointAdjointRestart_;
 
@@ -419,6 +428,59 @@ protected:
             }
         };
 
+        //- Diagnostic seeds on final momentum matrix/source beta inputs
+        struct FixedPointBetaReverseTrace
+        {
+            vectorField barResidual;
+            vectorField barFinalSource;
+
+            scalarField barFinalDFromRAU;
+            scalarField barFinalDFromResidual;
+            scalarField barFinalDTotal;
+            scalarField barFinalH1;
+
+            scalarField rawDiag;
+            scalarField relaxedDiag;
+            scalarField finalDiag;
+            scalarField rawRelaxD;
+            scalarField rawRelaxSumOff;
+            scalarField rawRelaxSelected;
+            scalarField rawRelaxBranchMargin;
+            labelList rawRelaxBranch;
+
+            vectorField rawSource;
+            vectorField relaxedSource;
+            vectorField finalSource;
+
+            scalarField dFinalD_dRawSourceCoeff;
+            vectorField dFinalSource_dRawSourceCoeff;
+            scalarField dFinalH1_dRawSourceCoeff;
+
+            explicit FixedPointBetaReverseTrace(const fvMesh& mesh)
+            :
+                barResidual(mesh.nCells(), vector::zero),
+                barFinalSource(mesh.nCells(), vector::zero),
+                barFinalDFromRAU(mesh.nCells(), Zero),
+                barFinalDFromResidual(mesh.nCells(), Zero),
+                barFinalDTotal(mesh.nCells(), Zero),
+                barFinalH1(mesh.nCells(), Zero),
+                rawDiag(mesh.nCells(), Zero),
+                relaxedDiag(mesh.nCells(), Zero),
+                finalDiag(mesh.nCells(), Zero),
+                rawRelaxD(mesh.nCells(), Zero),
+                rawRelaxSumOff(mesh.nCells(), Zero),
+                rawRelaxSelected(mesh.nCells(), Zero),
+                rawRelaxBranchMargin(mesh.nCells(), GREAT),
+                rawRelaxBranch(mesh.nCells(), -1),
+                rawSource(mesh.nCells(), vector::zero),
+                relaxedSource(mesh.nCells(), vector::zero),
+                finalSource(mesh.nCells(), vector::zero),
+                dFinalD_dRawSourceCoeff(mesh.nCells(), Zero),
+                dFinalSource_dRawSourceCoeff(mesh.nCells(), vector::zero),
+                dFinalH1_dRawSourceCoeff(mesh.nCells(), Zero)
+            {}
+        };
+
         //- Diagnostic coefficient seeds in the SIMPLE-map reverse
         struct SmoothPhiCoefficientTrace
         {
@@ -556,13 +618,21 @@ protected:
             scalarField p;
             scalarField phiInternal;
             List<scalarField> phiBoundary;
+            scalar pressureInitialResidual;
+            scalar pressureFinalResidual;
+            label pressureIterations;
+            word pressureSolverName;
 
             SimpleMapState()
             :
                 U(),
                 p(),
                 phiInternal(),
-                phiBoundary()
+                phiBoundary(),
+                pressureInitialResidual(Zero),
+                pressureFinalResidual(Zero),
+                pressureIterations(0),
+                pressureSolverName("none")
             {}
 
             SimpleMapState(const label nCells)
@@ -570,7 +640,11 @@ protected:
                 U(nCells, vector::zero),
                 p(nCells, Zero),
                 phiInternal(),
-                phiBoundary()
+                phiBoundary(),
+                pressureInitialResidual(Zero),
+                pressureFinalResidual(Zero),
+                pressureIterations(0),
+                pressureSolverName("none")
             {}
 
             SimpleMapState(const fvMesh& mesh)
@@ -578,7 +652,11 @@ protected:
                 U(mesh.nCells(), vector::zero),
                 p(mesh.nCells(), Zero),
                 phiInternal(mesh.nInternalFaces(), Zero),
-                phiBoundary(mesh.boundary().size())
+                phiBoundary(mesh.boundary().size()),
+                pressureInitialResidual(Zero),
+                pressureFinalResidual(Zero),
+                pressureIterations(0),
+                pressureSolverName("none")
             {
                 forAll(phiBoundary, patchi)
                 {
@@ -729,7 +807,8 @@ protected:
             const scalarField& extraBarDfinal,
             const scalarField& extraBarUEqnH1Coeff,
             const bool doRelax = true,
-            const bool doFvOptionsConstrain = true
+            const bool doFvOptionsConstrain = true,
+            FixedPointBetaReverseTrace* betaTrace = nullptr
         );
 
         //- Reverse extra downstream seeds on the final relaxed UEqn diagonal
@@ -766,7 +845,8 @@ protected:
         (
             const SimpleMapSeed& seedNew,
             const volScalarField& rAtU,
-            SmoothPhiCoefficientTrace* trace
+            SmoothPhiCoefficientTrace* trace,
+            FixedPointBetaReverseTrace* betaTrace = nullptr
         );
 
         //- One state reverse pass of the frozen SIMPLE map
@@ -913,6 +993,14 @@ protected:
             scalar dt
         );
 
+        //- Diagnostic analytic all-cell M_beta^T psi flow sensitivity
+        tmp<volScalarField> analyticFixedPointAdjointBeta
+        (
+            const SimpleMapSeed& psi,
+            const word& designVariablesName,
+            scalar dt
+        );
+
         //- One velocity-only reverse pass of the frozen SIMPLE map
         tmp<vectorField> reverseSimpleMapVelocitySeed
         (
@@ -942,6 +1030,13 @@ protected:
         SimpleMapState primalSimpleMapStateAtFrozenState
         (
             const word& namePrefix
+        );
+
+        //- Rebuild one frozen SIMPLE map with diagnostic pressure tolerance
+        SimpleMapState primalSimpleMapStateAtFrozenState
+        (
+            const word& namePrefix,
+            const scalar pressureAbsTol
         );
 
         //- Rebuild the pressure sub-map pnew = P(F2,Uold,pold)
