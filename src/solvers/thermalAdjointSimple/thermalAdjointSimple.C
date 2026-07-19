@@ -9764,7 +9764,9 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
         scalarField Ainternal;
         scalarField AinternalTimesV;
         scalarField rAU;
+        List<scalarField> rAUBoundary;
         scalarField UEqnH1Coeff;
+        List<scalarField> UEqnH1Boundary;
         scalarField rAtU;
         List<scalarField> rAtUBoundary;
         scalarField q;
@@ -9814,7 +9816,9 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
             Ainternal(mesh.nCells(), Zero),
             AinternalTimesV(mesh.nCells(), Zero),
             rAU(mesh.nCells(), Zero),
+            rAUBoundary(mesh.boundary().size()),
             UEqnH1Coeff(mesh.nCells(), Zero),
+            UEqnH1Boundary(mesh.boundary().size()),
             rAtU(mesh.nCells(), Zero),
             rAtUBoundary(mesh.boundary().size()),
             q(mesh.nCells(), Zero),
@@ -9854,6 +9858,8 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                 const label nFaces = mesh.boundary()[patchi].size();
                 DboundaryByPatch[patchi].setSize(nFaces, Zero);
                 UoldBoundary[patchi].setSize(nFaces, vector::zero);
+                rAUBoundary[patchi].setSize(nFaces, Zero);
+                UEqnH1Boundary[patchi].setSize(nFaces, Zero);
                 rAtUBoundary[patchi].setSize(nFaces, Zero);
                 qBoundary[patchi].setSize(nFaces, Zero);
                 qFaceBoundary[patchi].setSize(nFaces, Zero);
@@ -10092,6 +10098,12 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                 tape.Ainternal[celli]*mesh_.V()[celli];
         }
         tape.UEqnH1Coeff = H1Coeff.primitiveField();
+        forAll(tape.rAUBoundary, patchi)
+        {
+            tape.rAUBoundary[patchi] = rAUField.boundaryField()[patchi];
+            tape.UEqnH1Boundary[patchi] =
+                H1Coeff.boundaryField()[patchi];
+        }
         tape.Y = YField.primitiveField();
         forAll(tape.YBoundary, patchi)
         {
@@ -10333,6 +10345,14 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
             diff.UoldBoundary[patchi] =
                 (plus.UoldBoundary[patchi] - minus.UoldBoundary[patchi])
                /(2*eps);
+            diff.rAUBoundary[patchi] =
+                (plus.rAUBoundary[patchi] - minus.rAUBoundary[patchi])
+               /(2*eps);
+            diff.UEqnH1Boundary[patchi] =
+                (
+                    plus.UEqnH1Boundary[patchi]
+                  - minus.UEqnH1Boundary[patchi]
+                )/(2*eps);
             diff.rAtUBoundary[patchi] =
                 (plus.rAtUBoundary[patchi] - minus.rAtUBoundary[patchi])
                /(2*eps);
@@ -12179,35 +12199,6 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
         return flux;
     };
 
-    auto gammaFaceAtRAtUDirection =
-        [&]
-        (
-            const scalarField& drAtU,
-            const scalar h,
-            const scalar sign,
-            const word& namePrefix
-        )
-    {
-        volScalarField rAtUProbe
-        (
-            IOobject
-            (
-                namePrefix + "RAtUProbe",
-                mesh_.time().timeName(),
-                mesh_,
-                IOobject::NO_READ,
-                IOobject::NO_WRITE
-            ),
-            rAtUBase
-        );
-        forAll(rAtUProbe, celli)
-        {
-            rAtUProbe.primitiveFieldRef()[celli] += sign*h*drAtU[celli];
-        }
-        rAtUProbe.correctBoundaryConditions();
-        return makeLinearGammaFace(rAtUProbe, namePrefix);
-    };
-
     auto validateUnitFaceDerivative =
         [&](const scalar eps)
     {
@@ -13791,6 +13782,37 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                             sign*h*dBoundary[patchi][facei];
                     }
                 }
+                return tmp<volScalarField>::New(field);
+            };
+
+            auto makeRAtULegacyAtDirection =
+                [&]
+                (
+                    const scalarField& dInternal,
+                    const scalar h,
+                    const scalar sign,
+                    const word& name
+                )
+            {
+                volScalarField field
+                (
+                    IOobject
+                    (
+                        name,
+                        mesh_.time().timeName(),
+                        mesh_,
+                        IOobject::NO_READ,
+                        IOobject::NO_WRITE
+                    ),
+                    rAtUBase
+                );
+                field.primitiveFieldRef() = baseTapeForStages.rAtU;
+                forAll(field.primitiveFieldRef(), celli)
+                {
+                    field.primitiveFieldRef()[celli] +=
+                        sign*h*dInternal[celli];
+                }
+                field.correctBoundaryConditions();
                 return tmp<volScalarField>::New(field);
             };
 
@@ -16580,6 +16602,96 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                     baseTapeForStages.F2Boundary,
                     "ATCTPressureF2Base" + seedName + directionName
                 );
+            scalarField zeroRAtUInternal(mesh_.nCells(), Zero);
+            List<scalarField> zeroRAtUBoundary(mesh_.boundary().size());
+            forAll(zeroRAtUBoundary, patchi)
+            {
+                zeroRAtUBoundary[patchi].setSize
+                (
+                    mesh_.boundary()[patchi].size(),
+                    Zero
+                );
+            }
+            tmp<volScalarField> tPressureRAtUInternalPlus =
+                makeRAtUAtDirection
+                (
+                    dTape.rAtU,
+                    zeroRAtUBoundary,
+                    hPressure,
+                    scalar(1),
+                    "ATCTPressureRAtUInternalPlus" + seedName + directionName
+                );
+            tmp<volScalarField> tPressureRAtUInternalMinus =
+                makeRAtUAtDirection
+                (
+                    dTape.rAtU,
+                    zeroRAtUBoundary,
+                    hPressure,
+                    scalar(-1),
+                    "ATCTPressureRAtUInternalMinus" + seedName + directionName
+                );
+            const PressureBlockState pressureRAtUInternalPlus =
+                evaluatePressureBlock
+                (
+                    tPressureF2Base(),
+                    tPressureRAtUInternalPlus(),
+                    "ATCTPressureRAtUInternalPlus" + seedName + directionName
+                );
+            const PressureBlockState pressureRAtUInternalMinus =
+                evaluatePressureBlock
+                (
+                    tPressureF2Base(),
+                    tPressureRAtUInternalMinus(),
+                    "ATCTPressureRAtUInternalMinus" + seedName + directionName
+                );
+            const PressureBlockState dPressureRAtUInternalOnly =
+                pressureBlockStateDifference
+                (
+                    pressureRAtUInternalPlus,
+                    pressureRAtUInternalMinus,
+                    hPressure
+                );
+
+            tmp<volScalarField> tPressureRAtUBoundaryPlus =
+                makeRAtUAtDirection
+                (
+                    zeroRAtUInternal,
+                    dTape.rAtUBoundary,
+                    hPressure,
+                    scalar(1),
+                    "ATCTPressureRAtUBoundaryPlus" + seedName + directionName
+                );
+            tmp<volScalarField> tPressureRAtUBoundaryMinus =
+                makeRAtUAtDirection
+                (
+                    zeroRAtUInternal,
+                    dTape.rAtUBoundary,
+                    hPressure,
+                    scalar(-1),
+                    "ATCTPressureRAtUBoundaryMinus" + seedName + directionName
+                );
+            const PressureBlockState pressureRAtUBoundaryPlus =
+                evaluatePressureBlock
+                (
+                    tPressureF2Base(),
+                    tPressureRAtUBoundaryPlus(),
+                    "ATCTPressureRAtUBoundaryPlus" + seedName + directionName
+                );
+            const PressureBlockState pressureRAtUBoundaryMinus =
+                evaluatePressureBlock
+                (
+                    tPressureF2Base(),
+                    tPressureRAtUBoundaryMinus(),
+                    "ATCTPressureRAtUBoundaryMinus" + seedName + directionName
+                );
+            const PressureBlockState dPressureRAtUBoundaryOnly =
+                pressureBlockStateDifference
+                (
+                    pressureRAtUBoundaryPlus,
+                    pressureRAtUBoundaryMinus,
+                    hPressure
+                );
+
             tmp<volScalarField> tPressureRAtUOnlyPlus =
                 makeRAtUAtDirection
                 (
@@ -16619,6 +16731,158 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                     pressureRAtUOnlyMinus,
                     hPressure
                 );
+
+            tmp<volScalarField> tPressureRAtULegacyPlus =
+                makeRAtULegacyAtDirection
+                (
+                    dTape.rAtU,
+                    hPressure,
+                    scalar(1),
+                    "ATCTPressureRAtULegacyPlus" + seedName + directionName
+                );
+            tmp<volScalarField> tPressureRAtULegacyMinus =
+                makeRAtULegacyAtDirection
+                (
+                    dTape.rAtU,
+                    hPressure,
+                    scalar(-1),
+                    "ATCTPressureRAtULegacyMinus" + seedName + directionName
+                );
+            const PressureBlockState pressureRAtULegacyPlus =
+                evaluatePressureBlock
+                (
+                    tPressureF2Base(),
+                    tPressureRAtULegacyPlus(),
+                    "ATCTPressureRAtULegacyPlus" + seedName + directionName
+                );
+            const PressureBlockState pressureRAtULegacyMinus =
+                evaluatePressureBlock
+                (
+                    tPressureF2Base(),
+                    tPressureRAtULegacyMinus(),
+                    "ATCTPressureRAtULegacyMinus" + seedName + directionName
+                );
+            const PressureBlockState dPressureRAtULegacy =
+                pressureBlockStateDifference
+                (
+                    pressureRAtULegacyPlus,
+                    pressureRAtULegacyMinus,
+                    hPressure
+                );
+
+            const scalar lhsPressureRAtUInternalSplit =
+                pressureBlockStateSeedDot
+                (
+                    trace.barpSolveFromRelaxOnly,
+                    seedNew,
+                    dPressureRAtUInternalOnly
+                );
+            const scalar lhsPressureRAtUBoundarySplit =
+                pressureBlockStateSeedDot
+                (
+                    trace.barpSolveFromRelaxOnly,
+                    seedNew,
+                    dPressureRAtUBoundaryOnly
+                );
+            const scalar lhsPressureRAtUActualSplit =
+                pressureBlockStateSeedDot
+                (
+                    trace.barpSolveFromRelaxOnly,
+                    seedNew,
+                    dPressureRAtUOnly
+                );
+            const scalar lhsPressureRAtULegacySplit =
+                pressureBlockStateSeedDot
+                (
+                    trace.barpSolveFromRelaxOnly,
+                    seedNew,
+                    dPressureRAtULegacy
+                );
+            const scalar lhsPressureRAtUSplitGap =
+                lhsPressureRAtUActualSplit
+              - lhsPressureRAtUInternalSplit
+              - lhsPressureRAtUBoundarySplit;
+
+            scalar rAtUInternalL1 = tapeScalarNorm(dTape.rAtU);
+            scalar rAtUBoundaryL1 = Zero;
+            scalar rAtULegacyBoundaryL1 = Zero;
+            scalar rAtUActualLegacyBoundaryDiffL1 = Zero;
+            scalar rAtUActualLegacyBoundaryMaxDiff = Zero;
+            forAll(mesh_.boundary(), patchi)
+            {
+                scalar patchActualL1 = Zero;
+                scalar patchLegacyL1 = Zero;
+                scalar patchDiffL1 = Zero;
+                scalar patchMaxDiff = Zero;
+                forAll(dTape.rAtUBoundary[patchi], facei)
+                {
+                    const scalar legacy =
+                        (
+                            tPressureRAtULegacyPlus().boundaryField()[patchi][facei]
+                          - tPressureRAtULegacyMinus().boundaryField()[patchi][facei]
+                        )/(2*hPressure);
+                    const scalar actual = dTape.rAtUBoundary[patchi][facei];
+                    patchActualL1 += mag(actual);
+                    patchLegacyL1 += mag(legacy);
+                    patchDiffL1 += mag(actual - legacy);
+                    patchMaxDiff = max(patchMaxDiff, mag(actual - legacy));
+                }
+                reduce(patchActualL1, sumOp<scalar>());
+                reduce(patchLegacyL1, sumOp<scalar>());
+                reduce(patchDiffL1, sumOp<scalar>());
+                reduce(patchMaxDiff, maxOp<scalar>());
+
+                rAtUBoundaryL1 += patchActualL1;
+                rAtULegacyBoundaryL1 += patchLegacyL1;
+                rAtUActualLegacyBoundaryDiffL1 += patchDiffL1;
+                rAtUActualLegacyBoundaryMaxDiff =
+                    max(rAtUActualLegacyBoundaryMaxDiff, patchMaxDiff);
+
+                if
+                (
+                    patchActualL1 > SMALL
+                 || patchLegacyL1 > SMALL
+                 || patchDiffL1 > SMALL
+                )
+                {
+                    Info<< "ATC-T pressure-rAtU perturbation patch: "
+                        << seedName << " " << directionName
+                        << " eps " << eps
+                        << " patch " << mesh_.boundary()[patchi].name()
+                        << " actualBoundaryL1 " << patchActualL1
+                        << " legacyBoundaryL1 " << patchLegacyL1
+                        << " actualMinusLegacyL1 " << patchDiffL1
+                        << " actualMinusLegacyMax " << patchMaxDiff
+                        << endl;
+                }
+            }
+            reduce(rAtUBoundaryL1, sumOp<scalar>());
+            reduce(rAtULegacyBoundaryL1, sumOp<scalar>());
+            reduce(rAtUActualLegacyBoundaryDiffL1, sumOp<scalar>());
+            reduce(rAtUActualLegacyBoundaryMaxDiff, maxOp<scalar>());
+
+            Info<< "ATC-T pressure-rAtU split contraction: "
+                << seedName << " " << directionName
+                << " eps " << eps
+                << " internalLhs " << lhsPressureRAtUInternalSplit
+                << " boundaryLhs " << lhsPressureRAtUBoundarySplit
+                << " actualLhs " << lhsPressureRAtUActualSplit
+                << " legacyLhs " << lhsPressureRAtULegacySplit
+                << " splitGap " << lhsPressureRAtUSplitGap
+                << " splitGapOverL1 "
+                << mag(lhsPressureRAtUSplitGap)
+                  /(mag(lhsPressureRAtUActualSplit)
+                  + mag(lhsPressureRAtUInternalSplit)
+                  + mag(lhsPressureRAtUBoundarySplit)
+                  + VSMALL)
+                << " drAtUInternalL1 " << rAtUInternalL1
+                << " drAtUBoundaryL1 " << rAtUBoundaryL1
+                << " drAtULegacyBoundaryL1 " << rAtULegacyBoundaryL1
+                << " actualMinusLegacyBoundaryL1 "
+                << rAtUActualLegacyBoundaryDiffL1
+                << " actualMinusLegacyBoundaryMax "
+                << rAtUActualLegacyBoundaryMaxDiff
+                << endl;
 
             printScalarSuperposition
             (
@@ -17007,20 +17271,28 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                 fixedPFluxTotal - rhsPressureCoeff;
 
             const surfaceScalarField gammaPlus =
-                gammaFaceAtRAtUDirection
+                makeLinearGammaFace
                 (
-                    dTape.rAtU,
-                    hPressure,
-                    scalar(1),
-                    "ATCTPressureGammaPlus" + seedName + directionName
+                    tPressureRAtUOnlyPlus(),
+                    "ATCTPressureGammaActualPlus" + seedName + directionName
                 );
             const surfaceScalarField gammaMinus =
-                gammaFaceAtRAtUDirection
+                makeLinearGammaFace
                 (
-                    dTape.rAtU,
-                    hPressure,
-                    scalar(-1),
-                    "ATCTPressureGammaMinus" + seedName + directionName
+                    tPressureRAtUOnlyMinus(),
+                    "ATCTPressureGammaActualMinus" + seedName + directionName
+                );
+            const surfaceScalarField gammaBoundaryPlus =
+                makeLinearGammaFace
+                (
+                    tPressureRAtUBoundaryPlus(),
+                    "ATCTPressureGammaBoundaryPlus" + seedName + directionName
+                );
+            const surfaceScalarField gammaBoundaryMinus =
+                makeLinearGammaFace
+                (
+                    tPressureRAtUBoundaryMinus(),
+                    "ATCTPressureGammaBoundaryMinus" + seedName + directionName
                 );
 
             scalarField dGammaInternal(mesh_.nInternalFaces(), Zero);
@@ -17033,9 +17305,15 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                     )/(2*hPressure);
             }
             List<scalarField> dGammaBoundary(mesh_.boundary().size());
+            List<scalarField> dGammaBoundaryOnly(mesh_.boundary().size());
             forAll(dGammaBoundary, patchi)
             {
                 dGammaBoundary[patchi].setSize
+                (
+                    mesh_.boundary()[patchi].size(),
+                    Zero
+                );
+                dGammaBoundaryOnly[patchi].setSize
                 (
                     mesh_.boundary()[patchi].size(),
                     Zero
@@ -17046,6 +17324,11 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                         (
                             gammaPlus.boundaryField()[patchi][facei]
                           - gammaMinus.boundaryField()[patchi][facei]
+                        )/(2*hPressure);
+                    dGammaBoundaryOnly[patchi][facei] =
+                        (
+                            gammaBoundaryPlus.boundaryField()[patchi][facei]
+                          - gammaBoundaryMinus.boundaryField()[patchi][facei]
                         )/(2*hPressure);
                 }
             }
@@ -17063,8 +17346,8 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
 
             scalar faceRhsInternal = Zero;
             scalar faceRhsBoundary = Zero;
-            scalar faceLhsInternal = frozenTotal.first();
-            scalar faceLhsBoundary = frozenTotal.second();
+            scalar faceLhsInternal = lhsPressureRAtUInternalSplit;
+            scalar faceLhsBoundary = lhsPressureRAtUBoundarySplit;
             forAll(barGammaInternal, facei)
             {
                 barGammaInternal[facei] =
@@ -17081,7 +17364,7 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                        *pressureRAtUUnitFlux.boundaryField()[patchi][facei];
                     faceRhsBoundary +=
                         barGammaBoundary[patchi][facei]
-                       *dGammaBoundary[patchi][facei];
+                       *dGammaBoundaryOnly[patchi][facei];
                 }
             }
             reduce(faceRhsInternal, sumOp<scalar>());
@@ -17144,7 +17427,9 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                 scalar drOwnerL1 = Zero;
                 scalar drBoundaryL1 = Zero;
                 scalar dGammaBoundaryL1 = Zero;
+                scalar dGammaBoundaryOnlyL1 = Zero;
                 scalar maxBoundaryOwnerDiff = Zero;
+                scalar maxGammaMinusBoundaryDiff = Zero;
                 scalar patchBarGammaDotDGamma = Zero;
                 scalar patchOwnerDotDR = Zero;
                 scalar patchDirectOwnerDotDR = Zero;
@@ -17156,13 +17441,18 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                     const scalar drOwner = dTape.rAtU[celli];
                     const scalar drBoundary = dTape.rAtUBoundary[patchi][facei];
                     const scalar dGamma = dGammaBoundary[patchi][facei];
+                    const scalar dGammaOnly =
+                        dGammaBoundaryOnly[patchi][facei];
                     drOwnerL1 += mag(drOwner);
                     drBoundaryL1 += mag(drBoundary);
                     dGammaBoundaryL1 += mag(dGamma);
+                    dGammaBoundaryOnlyL1 += mag(dGammaOnly);
                     maxBoundaryOwnerDiff =
                         max(maxBoundaryOwnerDiff, mag(dGamma - drOwner));
+                    maxGammaMinusBoundaryDiff =
+                        max(maxGammaMinusBoundaryDiff, mag(dGammaOnly - drBoundary));
                     patchBarGammaDotDGamma +=
-                        barGammaBoundary[patchi][facei]*dGamma;
+                        barGammaBoundary[patchi][facei]*dGammaOnly;
                     barrAtUDirectOwnerVariant[celli] +=
                         barGammaBoundary[patchi][facei];
                     patchDirectOwnerDotDR +=
@@ -17198,7 +17488,9 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                 reduce(drOwnerL1, sumOp<scalar>());
                 reduce(drBoundaryL1, sumOp<scalar>());
                 reduce(dGammaBoundaryL1, sumOp<scalar>());
+                reduce(dGammaBoundaryOnlyL1, sumOp<scalar>());
                 reduce(maxBoundaryOwnerDiff, maxOp<scalar>());
+                reduce(maxGammaMinusBoundaryDiff, maxOp<scalar>());
                 reduce(patchBarGammaDotDGamma, sumOp<scalar>());
                 reduce(patchOwnerDotDR, sumOp<scalar>());
                 reduce(patchDirectOwnerDotDR, sumOp<scalar>());
@@ -17223,8 +17515,12 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                         << " drOwnerL1 " << drOwnerL1
                         << " drBoundaryL1 " << drBoundaryL1
                         << " dGammaBoundaryL1 " << dGammaBoundaryL1
+                        << " dGammaBoundaryOnlyL1 "
+                        << dGammaBoundaryOnlyL1
                         << " maxDGammaMinusOwner "
                         << maxBoundaryOwnerDiff
+                        << " maxDGammaBoundaryOnlyMinusBoundary "
+                        << maxGammaMinusBoundaryDiff
                         << " ownerRel " << ownerRel
                         << " zeroBoundaryTangent " << zeroBoundaryTangent
                         << " mapsToOwner " << mapsToOwner
@@ -17243,6 +17539,157 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
             reduce(boundaryOmittedContraction, sumOp<scalar>());
             reduce(directOwnerVariantContraction, sumOp<scalar>());
 
+            scalar boundaryAlgebraLhs = Zero;
+            scalar boundaryAlgebraRhs = Zero;
+            scalar boundaryAlgebraRAUPart = Zero;
+            scalar boundaryAlgebraH1Part = Zero;
+            scalar boundaryAlgebraResidualL1 = Zero;
+            scalar boundaryAlgebraScaleL1 = VSMALL;
+            scalar boundaryRAUOwnerCandidate = Zero;
+            scalar boundaryH1OwnerCandidate = Zero;
+            scalar boundaryRAUZeroCandidate = Zero;
+            scalar boundaryH1ZeroCandidate = Zero;
+            forAll(mesh_.boundary(), patchi)
+            {
+                const fvPatch& patch = mesh_.boundary()[patchi];
+                if (patch.type() == "empty")
+                {
+                    continue;
+                }
+                const labelUList& faceCells = patch.faceCells();
+                scalar patchAlgebraLhs = Zero;
+                scalar patchAlgebraRhs = Zero;
+                scalar patchAlgebraResidualL1 = Zero;
+                scalar patchRAUOwnerCandidate = Zero;
+                scalar patchH1OwnerCandidate = Zero;
+                forAll(patch, facei)
+                {
+                    const label celli = faceCells[facei];
+                    const scalar rAUb =
+                        baseTapeForStages.rAUBoundary[patchi][facei];
+                    const scalar rAtUb =
+                        baseTapeForStages.rAtUBoundary[patchi][facei];
+                    const scalar barRAtUb =
+                        barGammaBoundary[patchi][facei];
+                    if (mag(rAUb) <= VSMALL && mag(barRAtUb) > SMALL)
+                    {
+                        FatalErrorInFunction
+                            << "Cannot reverse boundary rAtU algebra on patch "
+                            << patch.name() << " face " << facei
+                            << " because base rAU boundary is zero."
+                            << exit(FatalError);
+                    }
+                    const scalar dRAtUb =
+                        dTape.rAtUBoundary[patchi][facei];
+                    const scalar dRAUb =
+                        dTape.rAUBoundary[patchi][facei];
+                    const scalar dH1b =
+                        dTape.UEqnH1Boundary[patchi][facei];
+                    const scalar dRAtUPred =
+                        sqr(rAtUb)/sqr(rAUb)*dRAUb
+                      + sqr(rAtUb)*dH1b;
+                    const scalar barRAUb =
+                        barRAtUb*sqr(rAtUb)/sqr(rAUb);
+                    const scalar barH1b =
+                        barRAtUb*sqr(rAtUb);
+
+                    const scalar lhs = barRAtUb*dRAtUb;
+                    const scalar rauPart = barRAUb*dRAUb;
+                    const scalar h1Part = barH1b*dH1b;
+                    patchAlgebraLhs += lhs;
+                    patchAlgebraRhs += rauPart + h1Part;
+                    patchAlgebraResidualL1 += mag(dRAtUb - dRAtUPred);
+                    boundaryAlgebraResidualL1 += mag(dRAtUb - dRAtUPred);
+                    boundaryAlgebraLhs += lhs;
+                    boundaryAlgebraRAUPart += rauPart;
+                    boundaryAlgebraH1Part += h1Part;
+                    boundaryAlgebraScaleL1 += mag(dRAtUb) + mag(dRAtUPred);
+
+                    patchRAUOwnerCandidate += barRAUb*dTape.rAU[celli];
+                    patchH1OwnerCandidate +=
+                        barH1b*dTape.UEqnH1Coeff[celli];
+                }
+                reduce(patchAlgebraLhs, sumOp<scalar>());
+                reduce(patchAlgebraRhs, sumOp<scalar>());
+                reduce(patchAlgebraResidualL1, sumOp<scalar>());
+                reduce(patchRAUOwnerCandidate, sumOp<scalar>());
+                reduce(patchH1OwnerCandidate, sumOp<scalar>());
+
+                if
+                (
+                    mag(patchAlgebraLhs) > SMALL
+                 || patchAlgebraResidualL1 > SMALL
+                 || mag(patchRAUOwnerCandidate) > SMALL
+                 || mag(patchH1OwnerCandidate) > SMALL
+                )
+                {
+                    Info<< "ATC-T pressure-rAtU boundary algebra patch: "
+                        << seedName << " " << directionName
+                        << " eps " << eps
+                        << " patch " << patch.name()
+                        << " lhs " << patchAlgebraLhs
+                        << " rhs " << patchAlgebraRhs
+                        << " signedGap "
+                        << patchAlgebraLhs - patchAlgebraRhs
+                        << " tangentResidualL1 "
+                        << patchAlgebraResidualL1
+                        << " rauOwnerCandidate "
+                        << patchRAUOwnerCandidate
+                        << " h1OwnerCandidate "
+                        << patchH1OwnerCandidate
+                        << endl;
+                }
+
+                boundaryRAUOwnerCandidate += patchRAUOwnerCandidate;
+                boundaryH1OwnerCandidate += patchH1OwnerCandidate;
+            }
+            boundaryAlgebraRhs =
+                boundaryAlgebraRAUPart + boundaryAlgebraH1Part;
+            reduce(boundaryAlgebraLhs, sumOp<scalar>());
+            reduce(boundaryAlgebraRAUPart, sumOp<scalar>());
+            reduce(boundaryAlgebraH1Part, sumOp<scalar>());
+            reduce(boundaryAlgebraRhs, sumOp<scalar>());
+            reduce(boundaryAlgebraResidualL1, sumOp<scalar>());
+            reduce(boundaryAlgebraScaleL1, sumOp<scalar>());
+            reduce(boundaryRAUOwnerCandidate, sumOp<scalar>());
+            reduce(boundaryH1OwnerCandidate, sumOp<scalar>());
+            reduce(boundaryRAUZeroCandidate, sumOp<scalar>());
+            reduce(boundaryH1ZeroCandidate, sumOp<scalar>());
+
+            Info<< "ATC-T pressure-rAtU boundary face transpose: "
+                << seedName << " " << directionName
+                << " eps " << eps
+                << " lhsBoundary " << lhsPressureRAtUBoundarySplit
+                << " rhsBoundaryFace " << boundaryPatchContraction
+                << " signedGap "
+                << lhsPressureRAtUBoundarySplit - boundaryPatchContraction
+                << " gapOverL1 "
+                << mag(lhsPressureRAtUBoundarySplit - boundaryPatchContraction)
+                  /(mag(lhsPressureRAtUBoundarySplit)
+                  + mag(boundaryPatchContraction) + VSMALL)
+                << " lhsActual " << lhsPressureRAtUActualSplit
+                << " rhsInternalPlusBoundary "
+                << faceRhsInternal + boundaryPatchContraction
+                << " actualSignedGap "
+                << lhsPressureRAtUActualSplit
+                 - faceRhsInternal - boundaryPatchContraction
+                << endl;
+
+            Info<< "ATC-T pressure-rAtU boundary pointwise algebra: "
+                << seedName << " " << directionName
+                << " eps " << eps
+                << " lhs " << boundaryAlgebraLhs
+                << " rhs " << boundaryAlgebraRhs
+                << " signedGap "
+                << boundaryAlgebraLhs - boundaryAlgebraRhs
+                << " tangentRel "
+                << boundaryAlgebraResidualL1/boundaryAlgebraScaleL1
+                << " rauPart " << boundaryAlgebraRAUPart
+                << " h1Part " << boundaryAlgebraH1Part
+                << " rauOwnerCandidate " << boundaryRAUOwnerCandidate
+                << " h1OwnerCandidate " << boundaryH1OwnerCandidate
+                << endl;
+
             scalar internalCellContribution =
                 tapeScalarDot(barrAtUInternalFaces, dTape.rAtU);
             scalar boundaryCellContribution =
@@ -17251,6 +17698,8 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                 barrAtUInternalFaces + barrAtUBoundaryFaces;
             scalar totalCellContribution =
                 tapeScalarDot(barrAtUTotalFaces, dTape.rAtU);
+            const scalar totalSeparateRAtUContribution =
+                internalCellContribution + boundaryPatchContraction;
             scalar directOwnerCellContribution =
                 tapeScalarDot(barrAtUDirectOwnerVariant, dTape.rAtU);
             scalar omittedBoundaryContribution =
@@ -18433,6 +18882,16 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                 << pressureFluxDecompositionGap
                 << " fixedPIdentityGap " << fixedPIdentityGap
                 << " fixedPReverseGap " << fixedPReverseGap
+                << " pressureRAtUSplitInternalLhs "
+                << lhsPressureRAtUInternalSplit
+                << " pressureRAtUSplitBoundaryLhs "
+                << lhsPressureRAtUBoundarySplit
+                << " pressureRAtUSplitActualLhs "
+                << lhsPressureRAtUActualSplit
+                << " pressureRAtUSplitLegacyLhs "
+                << lhsPressureRAtULegacySplit
+                << " pressureRAtUSplitGap "
+                << lhsPressureRAtUSplitGap
                 << " pressureFaceSpaceLhsInternal " << faceLhsInternal
                 << " pressureFaceSpaceLhsBoundary " << faceLhsBoundary
                 << " pressureFaceSpaceRhsInternal " << faceRhsInternal
@@ -18441,6 +18900,28 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                 << faceSpaceLhs - faceSpaceRhs
                 << " pressureFaceSpaceRel "
                 << mag(faceSpaceLhs - faceSpaceRhs)/faceSpaceScale
+                << " pressureBoundarySeparateSeedContribution "
+                << boundaryPatchContraction
+                << " pressureActualSeparateSeedTotal "
+                << totalSeparateRAtUContribution
+                << " pressureActualSeparateSeedGap "
+                << lhsPressureRAtUActualSplit - totalSeparateRAtUContribution
+                << " pressureBoundaryAlgebraLhs "
+                << boundaryAlgebraLhs
+                << " pressureBoundaryAlgebraRhs "
+                << boundaryAlgebraRhs
+                << " pressureBoundaryAlgebraRAUPart "
+                << boundaryAlgebraRAUPart
+                << " pressureBoundaryAlgebraH1Part "
+                << boundaryAlgebraH1Part
+                << " pressureBoundaryAlgebraGap "
+                << boundaryAlgebraLhs - boundaryAlgebraRhs
+                << " pressureBoundaryAlgebraTangentRel "
+                << boundaryAlgebraResidualL1/boundaryAlgebraScaleL1
+                << " pressureBoundaryRAUOwnerCandidate "
+                << boundaryRAUOwnerCandidate
+                << " pressureBoundaryH1OwnerCandidate "
+                << boundaryH1OwnerCandidate
                 << " pressureInterpOrientARel "
                 << internalOrientADiff/internalOrientScale
                 << " pressureInterpOrientBRel "
