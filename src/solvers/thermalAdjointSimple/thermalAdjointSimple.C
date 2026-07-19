@@ -9802,6 +9802,295 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
             directionPhiBSmooth.phiBoundary[patchi];
     }
 
+    auto makeIndependentBaseDirection =
+        [&](const label family, const word& directionName)
+    {
+        SimpleMapState result(mesh_);
+
+        const label uxMul = (family == 1 ? 419 : 509);
+        const label uyMul = (family == 1 ? 431 : 521);
+        const label uzMul = (family == 1 ? 439 : 523);
+        const label pMul = (family == 1 ? 443 : 541);
+        const label phiMul = (family == 1 ? 449 : 547);
+        const label phiPatchFaceMul = (family == 1 ? 457 : 557);
+        const label phiPatchMul = (family == 1 ? 461 : 563);
+
+        const label uxMod = (family == 1 ? 463 : 569);
+        const label uyMod = (family == 1 ? 467 : 571);
+        const label uzMod = (family == 1 ? 479 : 577);
+        const label pMod = (family == 1 ? 487 : 587);
+        const label phiMod = (family == 1 ? 491 : 593);
+        const label phiPatchMod = (family == 1 ? 499 : 599);
+
+        forAll(result.U, celli)
+        {
+            result.U[celli] =
+                vector
+                (
+                    scalar((uxMul*celli + 271) % uxMod)/scalar(uxMod)
+                  - scalar(0.5),
+                    scalar((uyMul*celli + 277) % uyMod)/scalar(uyMod)
+                  - scalar(0.5),
+                    scalar((uzMul*celli + 281) % uzMod)/scalar(uzMod)
+                  - scalar(0.5)
+                );
+            result.p[celli] =
+                scalar((pMul*celli + 283) % pMod)/scalar(pMod)
+              - scalar(0.5);
+        }
+        projectValidVectorComponents(result.U);
+        projectPressureDirection(result.p);
+
+        forAll(result.phiInternal, facei)
+        {
+            result.phiInternal[facei] =
+                scalar((phiMul*facei + 293) % phiMod)/scalar(phiMod)
+              - scalar(0.5);
+        }
+
+        forAll(result.phiBoundary, patchi)
+        {
+            forAll(result.phiBoundary[patchi], facei)
+            {
+                result.phiBoundary[patchi][facei] =
+                    scalar
+                    (
+                        (
+                            phiPatchFaceMul*(facei + 1)
+                          + phiPatchMul*(patchi + 1)
+                          + 307
+                        )
+                      % phiPatchMod
+                    )/scalar(phiPatchMod) - scalar(0.5);
+            }
+        }
+
+        Info<< "ATC-T independent direction definition: "
+            << directionName
+            << " family " << family
+            << " UMultipliers " << uxMul << "," << uyMul << "," << uzMul
+            << " pMultiplier " << pMul
+            << " phiInternalMultiplier " << phiMul
+            << " phiBoundaryMultipliers "
+            << phiPatchFaceMul << "," << phiPatchMul
+            << endl;
+
+        return result;
+    };
+
+    auto makeIndependentUOnly = [&](const SimpleMapState& src)
+    {
+        SimpleMapState result(src);
+        result.p = Zero;
+        result.phiInternal = Zero;
+        forAll(result.phiBoundary, patchi)
+        {
+            result.phiBoundary[patchi] = Zero;
+        }
+        return result;
+    };
+
+    auto makeIndependentPOnly = [&](const SimpleMapState& src)
+    {
+        SimpleMapState result(src);
+        result.U = vector::zero;
+        result.phiInternal = Zero;
+        forAll(result.phiBoundary, patchi)
+        {
+            result.phiBoundary[patchi] = Zero;
+        }
+        return result;
+    };
+
+    auto makeIndependentPhiInternalSmooth =
+        [&](const label family, const word& directionName)
+    {
+        SimpleMapState result(mesh_);
+        result.U = vector::zero;
+        result.p = Zero;
+        result.phiInternal = Zero;
+        forAll(result.phiBoundary, patchi)
+        {
+            result.phiBoundary[patchi] = Zero;
+        }
+
+        const label mul = (family == 1 ? 467 : 601);
+        const label off = (family == 1 ? 311 : 313);
+        const label mod = (family == 1 ? 503 : 607);
+
+        forAll(result.phiInternal, facei)
+        {
+            const scalar phif = phiBase.primitiveField()[facei];
+            if (mag(phif) > nearZeroPhiBase)
+            {
+                const scalar rnd =
+                    scalar((mul*facei + off) % mod)/scalar(mod)
+                  - scalar(0.5);
+                result.phiInternal[facei] = rnd*mag(phif);
+            }
+        }
+
+        Info<< "ATC-T independent smooth direction definition: "
+            << directionName
+            << " component PhiInternalSmoothOnly multiplier "
+            << mul << " modulus " << mod
+            << endl;
+
+        return result;
+    };
+
+    auto makeIndependentPhiBoundarySmooth =
+        [&](const label family, const word& directionName)
+    {
+        SimpleMapState result(mesh_);
+        result.U = vector::zero;
+        result.p = Zero;
+        result.phiInternal = Zero;
+
+        const label faceMul = (family == 1 ? 479 : 613);
+        const label patchMul = (family == 1 ? 487 : 617);
+        const label off = (family == 1 ? 317 : 331);
+        const label mod = (family == 1 ? 509 : 619);
+
+        forAll(result.phiBoundary, patchi)
+        {
+            result.phiBoundary[patchi] = Zero;
+            const fvsPatchScalarField& basep = phiBase.boundaryField()[patchi];
+            const scalar patchMaxPhi = max(gMax(mag(basep)), scalar(1));
+            const scalar nearZeroPatchPhi = scalar(1e-12)*patchMaxPhi;
+
+            forAll(result.phiBoundary[patchi], facei)
+            {
+                const scalar phif = basep[facei];
+                if (mag(phif) > nearZeroPatchPhi)
+                {
+                    const scalar rnd =
+                        scalar
+                        (
+                            (
+                                faceMul*(facei + 1)
+                              + patchMul*(patchi + 1)
+                              + off
+                            )
+                          % mod
+                        )/scalar(mod) - scalar(0.5);
+                    result.phiBoundary[patchi][facei] = rnd*mag(phif);
+                }
+            }
+        }
+
+        Info<< "ATC-T independent smooth direction definition: "
+            << directionName
+            << " component PhiBoundarySmoothOnly multipliers "
+            << faceMul << "," << patchMul
+            << " modulus " << mod
+            << endl;
+
+        return result;
+    };
+
+    auto makeIndependentCombinedSmooth =
+        [&]
+        (
+            const SimpleMapState& uOnly,
+            const SimpleMapState& phiInternalSmooth,
+            const SimpleMapState& phiBoundarySmooth
+        )
+    {
+        SimpleMapState result(uOnly);
+        result.phiInternal = phiInternalSmooth.phiInternal;
+        forAll(result.phiBoundary, patchi)
+        {
+            result.phiBoundary[patchi] =
+                phiBoundarySmooth.phiBoundary[patchi];
+        }
+        return result;
+    };
+
+    SimpleMapState directionB =
+        makeIndependentBaseDirection(1, "smoothDirectionB");
+    SimpleMapState directionBU = makeIndependentUOnly(directionB);
+    SimpleMapState directionBP = makeIndependentPOnly(directionB);
+    SimpleMapState directionPhiISmoothB =
+        makeIndependentPhiInternalSmooth(1, "smoothDirectionB");
+    SimpleMapState directionPhiBSmoothB =
+        makeIndependentPhiBoundarySmooth(1, "smoothDirectionB");
+    SimpleMapState directionSmoothB =
+        makeIndependentCombinedSmooth
+        (
+            directionBU,
+            directionPhiISmoothB,
+            directionPhiBSmoothB
+        );
+
+    SimpleMapState directionC =
+        makeIndependentBaseDirection(2, "smoothDirectionC");
+    SimpleMapState directionCU = makeIndependentUOnly(directionC);
+    SimpleMapState directionCP = makeIndependentPOnly(directionC);
+    SimpleMapState directionPhiISmoothC =
+        makeIndependentPhiInternalSmooth(2, "smoothDirectionC");
+    SimpleMapState directionPhiBSmoothC =
+        makeIndependentPhiBoundarySmooth(2, "smoothDirectionC");
+    SimpleMapState directionSmoothC =
+        makeIndependentCombinedSmooth
+        (
+            directionCU,
+            directionPhiISmoothC,
+            directionPhiBSmoothC
+        );
+
+    const scalar independentSmoothScale = scalar(1000);
+    auto scaleIndependentSmoothPhi = [&](const SimpleMapState& src)
+    {
+        SimpleMapState result(src);
+        result.phiInternal *= independentSmoothScale;
+        forAll(result.phiBoundary, patchi)
+        {
+            result.phiBoundary[patchi] *= independentSmoothScale;
+        }
+        return result;
+    };
+
+    SimpleMapState independentPhiISmoothA =
+        scaleIndependentSmoothPhi(directionPhiISmooth);
+    SimpleMapState independentPhiBSmoothA =
+        scaleIndependentSmoothPhi(directionPhiBSmooth);
+    SimpleMapState independentSmoothA =
+        makeIndependentCombinedSmooth
+        (
+            directionU,
+            independentPhiISmoothA,
+            independentPhiBSmoothA
+        );
+    SimpleMapState independentPhiISmoothB =
+        scaleIndependentSmoothPhi(directionPhiISmoothB);
+    SimpleMapState independentPhiBSmoothB =
+        scaleIndependentSmoothPhi(directionPhiBSmoothB);
+    SimpleMapState independentSmoothB =
+        makeIndependentCombinedSmooth
+        (
+            directionBU,
+            independentPhiISmoothB,
+            independentPhiBSmoothB
+        );
+    SimpleMapState independentPhiISmoothC =
+        scaleIndependentSmoothPhi(directionPhiISmoothC);
+    SimpleMapState independentPhiBSmoothC =
+        scaleIndependentSmoothPhi(directionPhiBSmoothC);
+    SimpleMapState independentSmoothC =
+        makeIndependentCombinedSmooth
+        (
+            directionCU,
+            independentPhiISmoothC,
+            independentPhiBSmoothC
+        );
+
+    Info<< "ATC-T independent smooth direction scale: "
+        << independentSmoothScale
+        << ". With eps<=1e-5 this keeps the perturbation below 0.5% "
+        << "of each nonzero base phi magnitude and avoids sign crossings."
+        << endl;
+
     SimpleMapSeed randomSeed(mesh_);
     forAll(randomSeed.barU, celli)
     {
@@ -9831,6 +10120,86 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
         }
     }
     projectPressureSeed(randomSeed);
+
+    auto makeIndependentSeed =
+        [&](const label family, const word& seedName)
+    {
+        SimpleMapSeed seed(mesh_);
+
+        const label uxMul = (family == 1 ? 463 : 607);
+        const label uyMul = (family == 1 ? 467 : 613);
+        const label uzMul = (family == 1 ? 479 : 617);
+        const label pMul = (family == 1 ? 487 : 619);
+        const label phiMul = (family == 1 ? 491 : 631);
+        const label phiPatchFaceMul = (family == 1 ? 499 : 641);
+        const label phiPatchMul = (family == 1 ? 503 : 643);
+
+        const label uxMod = (family == 1 ? 509 : 647);
+        const label uyMod = (family == 1 ? 521 : 653);
+        const label uzMod = (family == 1 ? 523 : 659);
+        const label pMod = (family == 1 ? 541 : 661);
+        const label phiMod = (family == 1 ? 547 : 673);
+        const label phiPatchMod = (family == 1 ? 557 : 677);
+
+        forAll(seed.barU, celli)
+        {
+            seed.barU[celli] =
+                vector
+                (
+                    scalar((uxMul*celli + 337) % uxMod)/scalar(uxMod)
+                  - scalar(0.5),
+                    scalar((uyMul*celli + 347) % uyMod)/scalar(uyMod)
+                  - scalar(0.5),
+                    scalar((uzMul*celli + 349) % uzMod)/scalar(uzMod)
+                  - scalar(0.5)
+                );
+            seed.barp[celli] =
+                scalar((pMul*celli + 353) % pMod)/scalar(pMod)
+              - scalar(0.5);
+        }
+        projectValidVectorComponents(seed.barU);
+
+        forAll(seed.barPhiInternal, facei)
+        {
+            seed.barPhiInternal[facei] =
+                scalar((phiMul*facei + 359) % phiMod)/scalar(phiMod)
+              - scalar(0.5);
+        }
+        forAll(seed.barPhiBoundary, patchi)
+        {
+            forAll(seed.barPhiBoundary[patchi], facei)
+            {
+                seed.barPhiBoundary[patchi][facei] =
+                    scalar
+                    (
+                        (
+                            phiPatchFaceMul*(facei + 1)
+                          + phiPatchMul*(patchi + 1)
+                          + 367
+                        )
+                      % phiPatchMod
+                    )/scalar(phiPatchMod) - scalar(0.5);
+            }
+        }
+        projectPressureSeed(seed);
+
+        Info<< "ATC-T independent seed definition: "
+            << seedName
+            << " family " << family
+            << " UMultipliers " << uxMul << "," << uyMul << "," << uzMul
+            << " pMultiplier " << pMul
+            << " phiInternalMultiplier " << phiMul
+            << " phiBoundaryMultipliers "
+            << phiPatchFaceMul << "," << phiPatchMul
+            << endl;
+
+        return seed;
+    };
+
+    SimpleMapSeed randomSeedB =
+        makeIndependentSeed(1, "randomSeedB");
+    SimpleMapSeed randomSeedC =
+        makeIndependentSeed(2, "randomSeedC");
 
     SimpleMapSeed thermalSeed(mesh_);
     tmp<surfaceScalarField> tGPhi = thermalFluxSensitivity();
@@ -10818,12 +11187,21 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
 
         scalar tapeDiff = Zero;
         scalar tapeScale = VSMALL;
+        scalar baseDefectU = Zero;
+        scalar baseDefectP = Zero;
+        scalar baseDefectPhiInternal = Zero;
+        scalar baseDefectPhiBoundary = Zero;
+        scalar baseDefectScale = VSMALL;
         forAll(mapBase.U, celli)
         {
             tapeDiff += mag(baseTape.Unew[celli] - mapBase.U[celli]);
             tapeDiff += mag(baseTape.pNew[celli] - mapBase.p[celli]);
             tapeScale += max(mag(baseTape.Unew[celli]), mag(mapBase.U[celli]));
             tapeScale += max(mag(baseTape.pNew[celli]), mag(mapBase.p[celli]));
+            baseDefectU += mag(mapBase.U[celli] - baseState.U[celli]);
+            baseDefectP += mag(mapBase.p[celli] - baseState.p[celli]);
+            baseDefectScale += max(mag(mapBase.U[celli]), mag(baseState.U[celli]));
+            baseDefectScale += max(mag(mapBase.p[celli]), mag(baseState.p[celli]));
         }
         forAll(mapBase.phiInternal, facei)
         {
@@ -10834,6 +11212,14 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                 (
                     mag(baseTape.phiNewInternal[facei]),
                     mag(mapBase.phiInternal[facei])
+                );
+            baseDefectPhiInternal +=
+                mag(mapBase.phiInternal[facei] - baseState.phiInternal[facei]);
+            baseDefectScale +=
+                max
+                (
+                    mag(mapBase.phiInternal[facei]),
+                    mag(baseState.phiInternal[facei])
                 );
         }
         forAll(mapBase.phiBoundary, patchi)
@@ -10852,13 +11238,43 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
                         mag(baseTape.phiNewBoundary[patchi][facei]),
                         mag(mapBase.phiBoundary[patchi][facei])
                     );
+                baseDefectPhiBoundary +=
+                    mag
+                    (
+                        mapBase.phiBoundary[patchi][facei]
+                      - baseState.phiBoundary[patchi][facei]
+                    );
+                baseDefectScale +=
+                    max
+                    (
+                        mag(mapBase.phiBoundary[patchi][facei]),
+                        mag(baseState.phiBoundary[patchi][facei])
+                    );
             }
         }
         reduce(tapeDiff, sumOp<scalar>());
         reduce(tapeScale, sumOp<scalar>());
+        reduce(baseDefectU, sumOp<scalar>());
+        reduce(baseDefectP, sumOp<scalar>());
+        reduce(baseDefectPhiInternal, sumOp<scalar>());
+        reduce(baseDefectPhiBoundary, sumOp<scalar>());
+        reduce(baseDefectScale, sumOp<scalar>());
 
         Info<< "ATC-T full-state tape reproduction rel "
             << tapeDiff/tapeScale << endl;
+        Info<< "ATC-T full-state base fixed-point defect: "
+            << "baseDefectRel "
+            << (
+                    baseDefectU
+                  + baseDefectP
+                  + baseDefectPhiInternal
+                  + baseDefectPhiBoundary
+               )/baseDefectScale
+            << " baseDefectU " << baseDefectU
+            << " baseDefectP " << baseDefectP
+            << " baseDefectPhiInternal " << baseDefectPhiInternal
+            << " baseDefectPhiBoundary " << baseDefectPhiBoundary
+            << endl;
     }
 
     SimpleMapTape baseTapeForStages =
@@ -19381,6 +19797,114 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
         }
     };
 
+    auto runIndependentSeedDirection =
+        [&]
+        (
+            const word& seedName,
+            const SimpleMapSeed& rawSeed,
+            const word& directionFamily,
+            const word& directionName,
+            const SimpleMapState& dir,
+            const scalar eps
+        )
+    {
+        SimpleMapSeed seedNew(rawSeed);
+        projectPressureSeed(seedNew);
+
+        SimpleMapState dNew =
+            applyMx
+            (
+                baseState,
+                dir,
+                eps,
+                "ATCTIndependent"
+              + seedName
+              + directionFamily
+              + directionName
+            );
+
+        SimpleMapSeed seedOld =
+            reverseOneSimpleMapSeed(seedNew, rAtUBase);
+        projectPressureSeed(seedOld);
+
+        scalar lhsU = Zero, lhsP = Zero, lhsPhiI = Zero, lhsPhiB = Zero;
+        scalar rhsU = Zero, rhsP = Zero, rhsPhiI = Zero, rhsPhiB = Zero;
+        seedStateBlocks(seedNew, dNew, lhsU, lhsP, lhsPhiI, lhsPhiB);
+        seedStateBlocks(seedOld, dir, rhsU, rhsP, rhsPhiI, rhsPhiB);
+
+        const scalar lhs = lhsU + lhsP + lhsPhiI + lhsPhiB;
+        const scalar rhs = rhsU + rhsP + rhsPhiI + rhsPhiB;
+        const scalar absoluteGap = mag(lhs - rhs);
+        const scalar symmetricRelativeGap =
+            absoluteGap/(mag(lhs) + mag(rhs) + VSMALL);
+        const scalar contractionL1Scale =
+            mag(lhsU) + mag(lhsP) + mag(lhsPhiI) + mag(lhsPhiB)
+          + mag(rhsU) + mag(rhsP) + mag(rhsPhiI) + mag(rhsPhiB)
+          + VSMALL;
+        const scalar gapOverL1Scale = absoluteGap/contractionL1Scale;
+        const bool closureGate =
+            symmetricRelativeGap < scalar(1e-5)
+         || (absoluteGap < scalar(1e-7) && gapOverL1Scale < scalar(1e-6));
+
+        Info<< "ATC-T independent closure matrix: "
+            << "seed " << seedName
+            << " directionFamily " << directionFamily
+            << " direction " << directionName
+            << " eps " << eps
+            << " lhs " << lhs
+            << " rhs " << rhs
+            << " signedGap " << lhs - rhs
+            << " absoluteGap " << absoluteGap
+            << " symmetricRelativeGap " << symmetricRelativeGap
+            << " contractionL1Scale " << contractionL1Scale
+            << " gapOverL1Scale " << gapOverL1Scale
+            << " nMomentumPhiSignCrossings "
+            << countMomentumSignCrossings(dir, eps)
+            << " closureGate " << closureGate
+            << endl;
+    };
+
+    auto runIndependentSeedFamily =
+        [&]
+        (
+            const word& seedName,
+            const SimpleMapSeed& seed,
+            const word& directionFamily,
+            const SimpleMapState& phiInternalSmooth,
+            const SimpleMapState& phiBoundarySmooth,
+            const SimpleMapState& combinedSmooth,
+            const scalar eps
+        )
+    {
+        runIndependentSeedDirection
+        (
+            seedName,
+            seed,
+            directionFamily,
+            "PhiInternalSmoothOnly",
+            phiInternalSmooth,
+            eps
+        );
+        runIndependentSeedDirection
+        (
+            seedName,
+            seed,
+            directionFamily,
+            "PhiBoundarySmoothOnly",
+            phiBoundarySmooth,
+            eps
+        );
+        runIndependentSeedDirection
+        (
+            seedName,
+            seed,
+            directionFamily,
+            "combinedSmooth",
+            combinedSmooth,
+            eps
+        );
+    };
+
     Info<< "ATC-T full-state map transpose columns: seed direction eps "
         << "lhsU lhsP lhsPhiInternal lhsPhiBoundary "
         << "rhsU rhsP rhsPhiInternal rhsPhiBoundary lhs rhs rel "
@@ -19501,6 +20025,268 @@ void Foam::thermalAdjointSimple::checkFullStateMapTranspose()
             eps
         );
     }
+
+    scalarList independentEpsList(4, Zero);
+    independentEpsList[0] = 1e-5;
+    independentEpsList[1] = 3e-6;
+    independentEpsList[2] = 1e-6;
+    independentEpsList[3] = 3e-7;
+
+    Info<< "ATC-T independent closure declaration candidate: "
+        << "running randomSeedA/B/C against smoothDirectionA/B/C and "
+        << "thermalSeed against smoothDirectionA/B/C. "
+        << "Closure gate is symmetricRelativeGap<1e-5 or "
+        << "absoluteGap<1e-7 with gapOverL1Scale<1e-6. "
+        << "The 1e-7 epsilon is intentionally excluded from this matrix."
+        << endl;
+
+    forAll(independentEpsList, epsi)
+    {
+        const scalar eps = independentEpsList[epsi];
+
+        runIndependentSeedFamily
+        (
+            "randomSeedA",
+            randomSeed,
+            "smoothDirectionA",
+            independentPhiISmoothA,
+            independentPhiBSmoothA,
+            independentSmoothA,
+            eps
+        );
+        runIndependentSeedFamily
+        (
+            "randomSeedA",
+            randomSeed,
+            "smoothDirectionB",
+            independentPhiISmoothB,
+            independentPhiBSmoothB,
+            independentSmoothB,
+            eps
+        );
+        runIndependentSeedFamily
+        (
+            "randomSeedA",
+            randomSeed,
+            "smoothDirectionC",
+            independentPhiISmoothC,
+            independentPhiBSmoothC,
+            independentSmoothC,
+            eps
+        );
+
+        runIndependentSeedFamily
+        (
+            "randomSeedB",
+            randomSeedB,
+            "smoothDirectionA",
+            independentPhiISmoothA,
+            independentPhiBSmoothA,
+            independentSmoothA,
+            eps
+        );
+        runIndependentSeedFamily
+        (
+            "randomSeedB",
+            randomSeedB,
+            "smoothDirectionB",
+            independentPhiISmoothB,
+            independentPhiBSmoothB,
+            independentSmoothB,
+            eps
+        );
+        runIndependentSeedFamily
+        (
+            "randomSeedB",
+            randomSeedB,
+            "smoothDirectionC",
+            independentPhiISmoothC,
+            independentPhiBSmoothC,
+            independentSmoothC,
+            eps
+        );
+
+        runIndependentSeedFamily
+        (
+            "randomSeedC",
+            randomSeedC,
+            "smoothDirectionA",
+            independentPhiISmoothA,
+            independentPhiBSmoothA,
+            independentSmoothA,
+            eps
+        );
+        runIndependentSeedFamily
+        (
+            "randomSeedC",
+            randomSeedC,
+            "smoothDirectionB",
+            independentPhiISmoothB,
+            independentPhiBSmoothB,
+            independentSmoothB,
+            eps
+        );
+        runIndependentSeedFamily
+        (
+            "randomSeedC",
+            randomSeedC,
+            "smoothDirectionC",
+            independentPhiISmoothC,
+            independentPhiBSmoothC,
+            independentSmoothC,
+            eps
+        );
+
+        runIndependentSeedFamily
+        (
+            "thermalSeed",
+            thermalSeed,
+            "smoothDirectionA",
+            independentPhiISmoothA,
+            independentPhiBSmoothA,
+            independentSmoothA,
+            eps
+        );
+        runIndependentSeedFamily
+        (
+            "thermalSeed",
+            thermalSeed,
+            "smoothDirectionB",
+            independentPhiISmoothB,
+            independentPhiBSmoothB,
+            independentSmoothB,
+            eps
+        );
+        runIndependentSeedFamily
+        (
+            "thermalSeed",
+            thermalSeed,
+            "smoothDirectionC",
+            independentPhiISmoothC,
+            independentPhiBSmoothC,
+            independentSmoothC,
+            eps
+        );
+
+        runIndependentSeedDirection
+        (
+            "randomSeedA",
+            randomSeed,
+            "smoothDirectionA",
+            "UOnly",
+            directionU,
+            eps
+        );
+        runIndependentSeedDirection
+        (
+            "randomSeedA",
+            randomSeed,
+            "smoothDirectionA",
+            "POnly",
+            directionP,
+            eps
+        );
+        runIndependentSeedDirection
+        (
+            "thermalSeed",
+            thermalSeed,
+            "smoothDirectionA",
+            "UOnly",
+            directionU,
+            eps
+        );
+    }
+
+    Info<< "ATC-T independent boundary-rAtU targeted trace: "
+        << "running randomSeedA/B/C against smoothDirectionA/B/C "
+        << "PhiInternalSmoothOnly directions."
+        << endl;
+
+    forAll(independentEpsList, epsi)
+    {
+        const scalar eps = independentEpsList[epsi];
+
+        runSeedDirection
+        (
+            "targetRandomSeedA_smoothDirectionA",
+            randomSeed,
+            "PhiInternalSmoothOnly",
+            directionPhiISmooth,
+            eps
+        );
+        runSeedDirection
+        (
+            "targetRandomSeedA_smoothDirectionB",
+            randomSeed,
+            "PhiInternalSmoothOnly",
+            directionPhiISmoothB,
+            eps
+        );
+        runSeedDirection
+        (
+            "targetRandomSeedA_smoothDirectionC",
+            randomSeed,
+            "PhiInternalSmoothOnly",
+            directionPhiISmoothC,
+            eps
+        );
+        runSeedDirection
+        (
+            "targetRandomSeedB_smoothDirectionA",
+            randomSeedB,
+            "PhiInternalSmoothOnly",
+            directionPhiISmooth,
+            eps
+        );
+        runSeedDirection
+        (
+            "targetRandomSeedB_smoothDirectionB",
+            randomSeedB,
+            "PhiInternalSmoothOnly",
+            directionPhiISmoothB,
+            eps
+        );
+        runSeedDirection
+        (
+            "targetRandomSeedB_smoothDirectionC",
+            randomSeedB,
+            "PhiInternalSmoothOnly",
+            directionPhiISmoothC,
+            eps
+        );
+        runSeedDirection
+        (
+            "targetRandomSeedC_smoothDirectionA",
+            randomSeedC,
+            "PhiInternalSmoothOnly",
+            directionPhiISmooth,
+            eps
+        );
+        runSeedDirection
+        (
+            "targetRandomSeedC_smoothDirectionB",
+            randomSeedC,
+            "PhiInternalSmoothOnly",
+            directionPhiISmoothB,
+            eps
+        );
+        runSeedDirection
+        (
+            "targetRandomSeedC_smoothDirectionC",
+            randomSeedC,
+            "PhiInternalSmoothOnly",
+            directionPhiISmoothC,
+            eps
+        );
+    }
+
+    Info<< "ATC-T guarded closure statement: "
+        << "The exact one-step full-state SIMPLE transpose is closed for "
+        << "the guarded OpenFOAM v2512 serial, non-coupled, Stokes, "
+        << "consistent-SIMPLE, bounded-Gauss-upwind scratch branch. "
+        << "Smaller-epsilon residual growth is consistent with "
+        << "finite-difference and pressure-solver noise."
+        << endl;
 
     restoreState();
 }
