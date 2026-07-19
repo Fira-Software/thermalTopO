@@ -6744,6 +6744,78 @@ void Foam::thermalAdjointSimple::checkFixedPointAdjointBetaSensitivity
         return diff;
     };
 
+    auto contractSeedWithState =
+        [&]
+        (
+            const SimpleMapSeed& seed,
+            const SimpleMapState& state,
+            scalar& uPart,
+            scalar& pPart,
+            scalar& phiInternalPart,
+            scalar& phiBoundaryPart
+        )
+    {
+        checkSimpleMapSeedSizes(seed, "contractSeedWithState seed");
+        if (state.U.size() != mesh_.nCells() || state.p.size() != mesh_.nCells())
+        {
+            FatalErrorInFunction
+                << "SimpleMapState cell size mismatch in contractSeedWithState."
+                << exit(FatalError);
+        }
+        if
+        (
+            state.phiInternal.size() != mesh_.nInternalFaces()
+         || state.phiBoundary.size() != mesh_.boundary().size()
+        )
+        {
+            FatalErrorInFunction
+                << "SimpleMapState phi size mismatch in contractSeedWithState."
+                << exit(FatalError);
+        }
+
+        uPart = Zero;
+        pPart = Zero;
+        phiInternalPart = Zero;
+        phiBoundaryPart = Zero;
+
+        forAll(seed.barU, celli)
+        {
+            uPart += seed.barU[celli] & state.U[celli];
+            pPart += seed.barp[celli]*state.p[celli];
+        }
+        forAll(seed.barPhiInternal, facei)
+        {
+            phiInternalPart +=
+                seed.barPhiInternal[facei]*state.phiInternal[facei];
+        }
+        forAll(seed.barPhiBoundary, patchi)
+        {
+            if
+            (
+                seed.barPhiBoundary[patchi].size()
+             != state.phiBoundary[patchi].size()
+            )
+            {
+                FatalErrorInFunction
+                    << "SimpleMapState phi boundary size mismatch in "
+                    << "contractSeedWithState on patch "
+                    << mesh_.boundary()[patchi].name() << exit(FatalError);
+            }
+
+            forAll(seed.barPhiBoundary[patchi], facei)
+            {
+                phiBoundaryPart +=
+                    seed.barPhiBoundary[patchi][facei]
+                   *state.phiBoundary[patchi][facei];
+            }
+        }
+
+        reduce(uPart, sumOp<scalar>());
+        reduce(pPart, sumOp<scalar>());
+        reduce(phiInternalPart, sumOp<scalar>());
+        reduce(phiBoundaryPart, sumOp<scalar>());
+    };
+
     auto contractPsiWithState =
         [&]
         (
@@ -6754,35 +6826,1018 @@ void Foam::thermalAdjointSimple::checkFixedPointAdjointBetaSensitivity
             scalar& phiBoundaryPart
         )
     {
-        uPart = Zero;
-        pPart = Zero;
-        phiInternalPart = Zero;
-        phiBoundaryPart = Zero;
+        contractSeedWithState
+        (
+            psi,
+            state,
+            uPart,
+            pPart,
+            phiInternalPart,
+            phiBoundaryPart
+        );
+    };
 
-        forAll(psi.barU, celli)
+    const SimpleMapSeed objectiveSeed = fixedPointObjectiveSeed();
+
+    auto objectiveContraction = [&](const SimpleMapState& state)
+    {
+        scalar uPart = Zero;
+        scalar pPart = Zero;
+        scalar phiInternalPart = Zero;
+        scalar phiBoundaryPart = Zero;
+        contractSeedWithState
+        (
+            objectiveSeed,
+            state,
+            uPart,
+            pPart,
+            phiInternalPart,
+            phiBoundaryPart
+        );
+        return uPart + pPart + phiInternalPart + phiBoundaryPart;
+    };
+
+    auto checkMapStateSizes =
+        [&](const SimpleMapState& a, const SimpleMapState& b, const word& op)
+    {
+        if (a.U.size() != b.U.size() || a.p.size() != b.p.size())
         {
-            uPart += psi.barU[celli] & state.U[celli];
-            pPart += psi.barp[celli]*state.p[celli];
+            FatalErrorInFunction
+                << "SimpleMapState cell size mismatch in " << op
+                << exit(FatalError);
         }
-        forAll(psi.barPhiInternal, facei)
+        if
+        (
+            a.phiInternal.size() != b.phiInternal.size()
+         || a.phiBoundary.size() != b.phiBoundary.size()
+        )
         {
-            phiInternalPart +=
-                psi.barPhiInternal[facei]*state.phiInternal[facei];
+            FatalErrorInFunction
+                << "SimpleMapState phi size mismatch in " << op
+                << exit(FatalError);
         }
-        forAll(psi.barPhiBoundary, patchi)
+        forAll(a.phiBoundary, patchi)
         {
-            forAll(psi.barPhiBoundary[patchi], facei)
+            if (a.phiBoundary[patchi].size() != b.phiBoundary[patchi].size())
             {
-                phiBoundaryPart +=
-                    psi.barPhiBoundary[patchi][facei]
-                   *state.phiBoundary[patchi][facei];
+                FatalErrorInFunction
+                    << "SimpleMapState patch size mismatch in " << op
+                    << " on patch " << mesh_.boundary()[patchi].name()
+                    << exit(FatalError);
+            }
+        }
+    };
+
+    auto stateZero = [&](SimpleMapState& state)
+    {
+        state.U = vector::zero;
+        state.p = Zero;
+        state.phiInternal = Zero;
+        forAll(state.phiBoundary, patchi)
+        {
+            state.phiBoundary[patchi] = Zero;
+        }
+    };
+
+    auto stateAxpy =
+        [&](SimpleMapState& y, const scalar a, const SimpleMapState& x)
+    {
+        checkMapStateSizes(y, x, "stateAxpy");
+        y.U += a*x.U;
+        y.p += a*x.p;
+        y.phiInternal += a*x.phiInternal;
+        forAll(y.phiBoundary, patchi)
+        {
+            y.phiBoundary[patchi] += a*x.phiBoundary[patchi];
+        }
+    };
+
+    auto stateScale = [&](SimpleMapState& y, const scalar a)
+    {
+        y.U *= a;
+        y.p *= a;
+        y.phiInternal *= a;
+        forAll(y.phiBoundary, patchi)
+        {
+            y.phiBoundary[patchi] *= a;
+        }
+    };
+
+    auto stateDot =
+        [&]
+        (
+            const SimpleMapState& a,
+            const SimpleMapState& b,
+            const scalar UScale,
+            const scalar pScale,
+            const scalar phiScale
+        )
+    {
+        checkMapStateSizes(a, b, "stateDot");
+
+        scalar val = Zero;
+        const scalar invUSqr = scalar(1)/sqr(max(UScale, VSMALL));
+        const scalar invpSqr = scalar(1)/sqr(max(pScale, VSMALL));
+        const scalar invPhiSqr = scalar(1)/sqr(max(phiScale, VSMALL));
+
+        forAll(a.U, celli)
+        {
+            val += (a.U[celli] & b.U[celli])*invUSqr;
+            val += a.p[celli]*b.p[celli]*invpSqr;
+        }
+        forAll(a.phiInternal, facei)
+        {
+            val +=
+                a.phiInternal[facei]*b.phiInternal[facei]*invPhiSqr;
+        }
+        forAll(a.phiBoundary, patchi)
+        {
+            forAll(a.phiBoundary[patchi], facei)
+            {
+                val +=
+                    a.phiBoundary[patchi][facei]
+                   *b.phiBoundary[patchi][facei]
+                   *invPhiSqr;
             }
         }
 
-        reduce(uPart, sumOp<scalar>());
-        reduce(pPart, sumOp<scalar>());
-        reduce(phiInternalPart, sumOp<scalar>());
-        reduce(phiBoundaryPart, sumOp<scalar>());
+        return returnReduce(val, sumOp<scalar>());
+    };
+
+    auto stateNorm =
+        [&]
+        (
+            const SimpleMapState& a,
+            const scalar UScale,
+            const scalar pScale,
+            const scalar phiScale
+        )
+    {
+        return sqrt(max(stateDot(a, a, UScale, pScale, phiScale), Zero));
+    };
+
+    auto stateBlockNorms =
+        [&]
+        (
+            const SimpleMapState& a,
+            scalar& UNorm,
+            scalar& pNorm,
+            scalar& phiInternalNorm,
+            scalar& phiBoundaryNorm
+        )
+    {
+        scalar USqr = Zero;
+        scalar pSqr = Zero;
+        scalar phiInternalSqr = Zero;
+        scalar phiBoundarySqr = Zero;
+
+        forAll(a.U, celli)
+        {
+            USqr += magSqr(a.U[celli]);
+            pSqr += sqr(a.p[celli]);
+        }
+        forAll(a.phiInternal, facei)
+        {
+            phiInternalSqr += sqr(a.phiInternal[facei]);
+        }
+        forAll(a.phiBoundary, patchi)
+        {
+            forAll(a.phiBoundary[patchi], facei)
+            {
+                phiBoundarySqr += sqr(a.phiBoundary[patchi][facei]);
+            }
+        }
+
+        UNorm = sqrt(max(returnReduce(USqr, sumOp<scalar>()), Zero));
+        pNorm = sqrt(max(returnReduce(pSqr, sumOp<scalar>()), Zero));
+        phiInternalNorm =
+            sqrt(max(returnReduce(phiInternalSqr, sumOp<scalar>()), Zero));
+        phiBoundaryNorm =
+            sqrt(max(returnReduce(phiBoundarySqr, sumOp<scalar>()), Zero));
+    };
+
+    auto normalizePressureState = [&](SimpleMapState& state)
+    {
+        if (!pressureNeedsReference)
+        {
+            return;
+        }
+
+        if (pRefCell >= 0 && pRefCell < mesh_.nCells())
+        {
+            const scalar shift = state.p[pRefCell] - solverControl_().pRefValue();
+            state.p -= shift;
+        }
+        else
+        {
+            removeMean(state.p);
+        }
+    };
+
+    auto baseStateFromFields = [&]()
+    {
+        SimpleMapState state(mesh_);
+        state.U = UBase.primitiveField();
+        state.p = pBase.primitiveField();
+        state.phiInternal = phiBase.primitiveField();
+        forAll(state.phiBoundary, patchi)
+        {
+            state.phiBoundary[patchi] = phiBase.boundaryField()[patchi];
+        }
+        normalizePressureState(state);
+        return state;
+    };
+
+    auto installState = [&](const SimpleMapState& state)
+    {
+        if (state.U.size() != U.primitiveField().size())
+        {
+            FatalErrorInFunction
+                << "SimpleMapState U size mismatch in installState: "
+                << state.U.size() << " vs " << U.primitiveField().size()
+                << exit(FatalError);
+        }
+        if (state.p.size() != p.primitiveField().size())
+        {
+            FatalErrorInFunction
+                << "SimpleMapState p size mismatch in installState: "
+                << state.p.size() << " vs " << p.primitiveField().size()
+                << exit(FatalError);
+        }
+        if (state.phiInternal.size() != phi.primitiveField().size())
+        {
+            FatalErrorInFunction
+                << "SimpleMapState phiInternal size mismatch in installState: "
+                << state.phiInternal.size()
+                << " vs " << phi.primitiveField().size()
+                << exit(FatalError);
+        }
+
+        U.primitiveFieldRef() = state.U;
+        forAll(U.boundaryFieldRef(), patchi)
+        {
+            U.boundaryFieldRef()[patchi] == UBase.boundaryField()[patchi];
+        }
+        U.correctBoundaryConditions();
+
+        p.primitiveFieldRef() = state.p;
+        forAll(p.boundaryFieldRef(), patchi)
+        {
+            p.boundaryFieldRef()[patchi] == pBase.boundaryField()[patchi];
+        }
+        enforcePressureBoundaryState();
+
+        phi.primitiveFieldRef() = state.phiInternal;
+        forAll(phi.boundaryFieldRef(), patchi)
+        {
+            if (state.phiBoundary[patchi].size() != phi.boundaryField()[patchi].size())
+            {
+                FatalErrorInFunction
+                    << "SimpleMapState phiBoundary patch size mismatch in "
+                    << "installState on patch " << patchi << ": "
+                    << state.phiBoundary[patchi].size()
+                    << " vs " << phi.boundaryField()[patchi].size()
+                    << exit(FatalError);
+            }
+
+            phi.boundaryFieldRef()[patchi] == state.phiBoundary[patchi];
+        }
+    };
+
+    auto stateDifference =
+        [&](const SimpleMapState& a, const SimpleMapState& b)
+    {
+        SimpleMapState diff(a);
+        stateAxpy(diff, scalar(-1), b);
+        projectMapStateDirection(diff);
+        return diff;
+    };
+
+    auto setStatePerturbation =
+        [&](const scalar coeff, const SimpleMapState& direction)
+    {
+        restoreAll();
+
+        U.primitiveFieldRef() =
+            UBase.primitiveField() + coeff*direction.U;
+        p.primitiveFieldRef() =
+            pBase.primitiveField() + coeff*direction.p;
+        phi.primitiveFieldRef() =
+            phiBase.primitiveField() + coeff*direction.phiInternal;
+
+        forAll(U.boundaryFieldRef(), patchi)
+        {
+            U.boundaryFieldRef()[patchi] == UBase.boundaryField()[patchi];
+        }
+        U.correctBoundaryConditions();
+
+        forAll(p.boundaryFieldRef(), patchi)
+        {
+            p.boundaryFieldRef()[patchi] == pBase.boundaryField()[patchi];
+        }
+        enforcePressureBoundaryState();
+
+        forAll(phi.boundaryFieldRef(), patchi)
+        {
+            if (direction.phiBoundary[patchi].size() != phi.boundaryField()[patchi].size())
+            {
+                FatalErrorInFunction
+                    << "SimpleMapState phiBoundary patch size mismatch in "
+                    << "setStatePerturbation on patch " << patchi << ": "
+                    << direction.phiBoundary[patchi].size()
+                    << " vs " << phi.boundaryField()[patchi].size()
+                    << exit(FatalError);
+            }
+
+            phi.boundaryFieldRef()[patchi] =
+                phiBase.boundaryField()[patchi]
+              + coeff*direction.phiBoundary[patchi];
+        }
+    };
+
+    auto applyMxWithEps =
+        [&](const SimpleMapState& direction, const scalar eps)
+    {
+        setStatePerturbation(eps, direction);
+        SimpleMapState plus =
+            primalSimpleMapStateAtFrozenState("ATCTFPBetaOracleMxPlus");
+
+        setStatePerturbation(-eps, direction);
+        SimpleMapState minus =
+            primalSimpleMapStateAtFrozenState("ATCTFPBetaOracleMxMinus");
+
+        restoreAll();
+        return mapStateDifference(plus, minus, eps);
+    };
+
+    auto applyA =
+        [&](const SimpleMapState& direction)
+    {
+        SimpleMapState result(direction);
+        SimpleMapState Mx = applyMxWithEps(direction, fixedPointTangentFDEps_);
+        stateAxpy(result, scalar(-1), Mx);
+        projectMapStateDirection(result);
+        return result;
+    };
+
+    auto solveDense =
+        [&](List<scalarField>& A, scalarField b, const label n)
+    {
+        scalarField x(n, Zero);
+
+        for (label k = 0; k < n; ++k)
+        {
+            label pivot = k;
+            scalar pivotMag = mag(A[k][k]);
+
+            for (label i = k + 1; i < n; ++i)
+            {
+                if (mag(A[i][k]) > pivotMag)
+                {
+                    pivot = i;
+                    pivotMag = mag(A[i][k]);
+                }
+            }
+
+            if (pivot != k)
+            {
+                scalarField tmpRow(A[k]);
+                A[k] = A[pivot];
+                A[pivot] = tmpRow;
+
+                const scalar tmpB = b[k];
+                b[k] = b[pivot];
+                b[pivot] = tmpB;
+            }
+
+            const scalar diag = A[k][k];
+            if (mag(diag) <= VSMALL)
+            {
+                continue;
+            }
+
+            for (label i = k + 1; i < n; ++i)
+            {
+                const scalar factor = A[i][k]/diag;
+                A[i][k] = Zero;
+
+                for (label j = k + 1; j < n; ++j)
+                {
+                    A[i][j] -= factor*A[k][j];
+                }
+                b[i] -= factor*b[k];
+            }
+        }
+
+        for (label i = n - 1; i >= 0; --i)
+        {
+            scalar sum = b[i];
+            for (label j = i + 1; j < n; ++j)
+            {
+                sum -= A[i][j]*x[j];
+            }
+
+            if (mag(A[i][i]) > VSMALL)
+            {
+                x[i] = sum/A[i][i];
+            }
+        }
+
+        return x;
+    };
+
+    struct TangentApproxResult
+    {
+        SimpleMapState delta;
+        SimpleMapState residual;
+        label iterations;
+        scalar estimatedRel;
+        scalar finalRel;
+        scalarField residualBlockRel;
+        scalarField rhsBlockRel;
+
+        explicit TangentApproxResult(const fvMesh& mesh)
+        :
+            delta(mesh),
+            residual(mesh),
+            iterations(0),
+            estimatedRel(VGREAT),
+            finalRel(VGREAT),
+            residualBlockRel(4, Zero),
+            rhsBlockRel(4, Zero)
+        {}
+    };
+
+    auto solveTangentApprox =
+        [&]
+        (
+            const label reportCell,
+            const scalar betaEps,
+            const SimpleMapState& rhs,
+            const scalar UScale,
+            const scalar pScale,
+            const scalar phiScale
+        )
+    {
+        TangentApproxResult result(mesh_);
+        stateZero(result.delta);
+        stateZero(result.residual);
+
+        const label maxIters = max(label(1), fixedPointTangentMaxIters_);
+        const scalar rhsNorm =
+            max(stateNorm(rhs, UScale, pScale, phiScale), VSMALL);
+
+        scalar rhsUNorm = Zero;
+        scalar rhsPNorm = Zero;
+        scalar rhsPhiInternalNorm = Zero;
+        scalar rhsPhiBoundaryNorm = Zero;
+        stateBlockNorms
+        (
+            rhs,
+            rhsUNorm,
+            rhsPNorm,
+            rhsPhiInternalNorm,
+            rhsPhiBoundaryNorm
+        );
+        const scalar rhsRawNorm =
+            max
+            (
+                sqrt
+                (
+                    sqr(rhsUNorm)
+                  + sqr(rhsPNorm)
+                  + sqr(rhsPhiInternalNorm)
+                  + sqr(rhsPhiBoundaryNorm)
+                ),
+                VSMALL
+            );
+        result.rhsBlockRel[0] = rhsUNorm/rhsRawNorm;
+        result.rhsBlockRel[1] = rhsPNorm/rhsRawNorm;
+        result.rhsBlockRel[2] = rhsPhiInternalNorm/rhsRawNorm;
+        result.rhsBlockRel[3] = rhsPhiBoundaryNorm/rhsRawNorm;
+
+        List<SimpleMapState> basis(maxIters + 1, SimpleMapState(mesh_));
+        List<scalarField> H(maxIters + 1);
+        forAll(H, row)
+        {
+            H[row].setSize(maxIters);
+            H[row] = Zero;
+        }
+
+        basis[0] = rhs;
+        stateScale(basis[0], scalar(1)/rhsNorm);
+
+        scalarField bestY(0);
+        label usedIters = 0;
+
+        for (label k = 0; k < maxIters; ++k)
+        {
+            SimpleMapState w = applyA(basis[k]);
+
+            for (label i = 0; i <= k; ++i)
+            {
+                H[i][k] = stateDot(w, basis[i], UScale, pScale, phiScale);
+                stateAxpy(w, -H[i][k], basis[i]);
+            }
+
+            H[k + 1][k] = stateNorm(w, UScale, pScale, phiScale);
+            if (H[k + 1][k] > VSMALL && k + 1 < maxIters + 1)
+            {
+                basis[k + 1] = w;
+                stateScale(basis[k + 1], scalar(1)/H[k + 1][k]);
+            }
+
+            const label m = k + 1;
+            List<scalarField> normal(m);
+            forAll(normal, i)
+            {
+                normal[i].setSize(m);
+                normal[i] = Zero;
+            }
+            scalarField normalRhs(m, Zero);
+
+            for (label i = 0; i < m; ++i)
+            {
+                normalRhs[i] = H[0][i]*rhsNorm;
+
+                for (label j = 0; j < m; ++j)
+                {
+                    scalar accum = Zero;
+                    for (label row = 0; row <= m; ++row)
+                    {
+                        accum += H[row][i]*H[row][j];
+                    }
+                    normal[i][j] = accum;
+                }
+
+                normal[i][i] += VSMALL;
+            }
+
+            bestY = solveDense(normal, normalRhs, m);
+            usedIters = m;
+
+            scalar lsNormSqr = Zero;
+            for (label row = 0; row <= m; ++row)
+            {
+                scalar residual = (row == 0 ? rhsNorm : Zero);
+                for (label col = 0; col < m; ++col)
+                {
+                    residual -= H[row][col]*bestY[col];
+                }
+                lsNormSqr += sqr(residual);
+            }
+
+            result.estimatedRel = sqrt(lsNormSqr)/rhsNorm;
+
+            Info<< "ATC-T fixed-point adjoint beta tangent GMRES iter: cell "
+                << reportCell
+                << " betaEps " << betaEps
+                << " iteration " << m
+                << " estimatedRel " << result.estimatedRel
+                << " hNext " << H[k + 1][k]
+                << endl;
+
+            if (result.estimatedRel < fixedPointTangentRelTol_)
+            {
+                break;
+            }
+        }
+
+        for (label i = 0; i < usedIters; ++i)
+        {
+            stateAxpy(result.delta, bestY[i], basis[i]);
+        }
+        projectMapStateDirection(result.delta);
+
+        SimpleMapState Ax = applyA(result.delta);
+        result.residual = rhs;
+        stateAxpy(result.residual, scalar(-1), Ax);
+        projectMapStateDirection(result.residual);
+
+        result.finalRel =
+            stateNorm(result.residual, UScale, pScale, phiScale)/rhsNorm;
+        result.iterations = usedIters;
+
+        scalar resUNorm = Zero;
+        scalar resPNorm = Zero;
+        scalar resPhiInternalNorm = Zero;
+        scalar resPhiBoundaryNorm = Zero;
+        stateBlockNorms
+        (
+            result.residual,
+            resUNorm,
+            resPNorm,
+            resPhiInternalNorm,
+            resPhiBoundaryNorm
+        );
+        result.residualBlockRel[0] = resUNorm/rhsRawNorm;
+        result.residualBlockRel[1] = resPNorm/rhsRawNorm;
+        result.residualBlockRel[2] = resPhiInternalNorm/rhsRawNorm;
+        result.residualBlockRel[3] = resPhiBoundaryNorm/rhsRawNorm;
+
+        return result;
+    };
+
+    scalar tangentUScale = max(gMax(mag(UBase.primitiveField())), SMALL);
+    scalarField pBaseGauge(pBase.primitiveField());
+    if (pressureNeedsReference)
+    {
+        if (pRefCell >= 0 && pRefCell < mesh_.nCells())
+        {
+            pBaseGauge -= pBaseGauge[pRefCell] - solverControl_().pRefValue();
+        }
+        else
+        {
+            removeMean(pBaseGauge);
+        }
+    }
+    scalar tangentPScale = max(gMax(mag(pBaseGauge)), SMALL);
+    scalar tangentPhiScale = max(gMax(mag(phiBase.primitiveField())), SMALL);
+    forAll(phiBase.boundaryField(), patchi)
+    {
+        if (phiBase.boundaryField()[patchi].size())
+        {
+            tangentPhiScale =
+                max
+                (
+                    tangentPhiScale,
+                    gMax(mag(phiBase.boundaryField()[patchi]))
+                );
+        }
+    }
+
+    const SimpleMapState baseState = baseStateFromFields();
+
+    auto iterateFullSimpleMap =
+        [&]
+        (
+            const label cellj,
+            const scalar betaValue,
+            const SimpleMapState& initialState,
+            label& nIters,
+            scalar& finalRel
+        )
+    {
+        restoreAll();
+        beta.primitiveFieldRef()[cellj] = betaValue;
+        beta.correctBoundaryConditions();
+
+        SimpleMapState current(initialState);
+        normalizePressureState(current);
+        nIters = 0;
+        finalRel = VGREAT;
+
+        const label maxIters =
+            max(label(1), fixedPointValidationMaxIters_);
+
+        for (label iter = 0; iter < maxIters; ++iter)
+        {
+            installState(current);
+
+            SimpleMapState next =
+                primalSimpleMapStateAtFrozenState("ATCTFPBetaOracleIter");
+            normalizePressureState(next);
+
+            SimpleMapState change = stateDifference(next, current);
+            finalRel =
+                stateNorm
+                (
+                    change,
+                    tangentUScale,
+                    tangentPScale,
+                    tangentPhiScale
+                )
+               /max
+                (
+                    stateNorm
+                    (
+                        next,
+                        tangentUScale,
+                        tangentPScale,
+                        tangentPhiScale
+                    ),
+                    VSMALL
+                );
+
+            current = next;
+            nIters = iter + 1;
+
+            if (finalRel < fixedPointValidationRelTol_)
+            {
+                break;
+            }
+        }
+
+        restoreAll();
+        return current;
+    };
+
+    auto trueFixedPointDefect =
+        [&](const label cellj, const scalar betaValue, const SimpleMapState& state)
+    {
+        restoreAll();
+        beta.primitiveFieldRef()[cellj] = betaValue;
+        beta.correctBoundaryConditions();
+        installState(state);
+
+        SimpleMapState mapped =
+            primalSimpleMapStateAtFrozenState("ATCTFPBetaOracleDefect");
+        normalizePressureState(mapped);
+        SimpleMapState defect = stateDifference(mapped, state);
+        const scalar rel =
+            stateNorm
+            (
+                defect,
+                tangentUScale,
+                tangentPScale,
+                tangentPhiScale
+            )
+           /max
+            (
+                stateNorm
+                (
+                    mapped,
+                    tangentUScale,
+                    tangentPScale,
+                    tangentPhiScale
+                ),
+                VSMALL
+            );
+
+        restoreAll();
+        return rel;
+    };
+
+    auto thermalStateRelChange =
+        [&](const volScalarField& TNew, const scalarField& oldT)
+    {
+        scalar diff = Zero;
+        scalar norm = VSMALL;
+
+        forAll(oldT, celli)
+        {
+            diff += sqr(TNew[celli] - oldT[celli]);
+            norm += sqr(TNew[celli]);
+        }
+
+        reduce(diff, sumOp<scalar>());
+        reduce(norm, sumOp<scalar>());
+
+        return sqrt(diff)/max(sqrt(norm), VSMALL);
+    };
+
+    auto solveDiagnosticTEqnOnce = [&]()
+    {
+        const surfaceScalarField& phiT = primalVars_.phi();
+        volScalarField& TMutable = const_cast<volScalarField&>(TRef());
+        fv::options& fvOptions(fv::options::New(this->mesh_));
+        const volScalarField DEff(this->DEff());
+
+        tmp<fvScalarMatrix> tTEqn;
+        if (props_.variableRhoCp())
+        {
+            const volScalarField C
+            (
+                props_.CField(TMutable, "rhoCpNormFPBetaOracle")
+            );
+
+            tTEqn =
+            (
+                C.internalField()*fvm::div(phiT, TMutable, "div(phi,T)")
+              - fvm::laplacian(DEff, TMutable)
+             ==
+                fvOptions(TMutable)
+            );
+        }
+        else
+        {
+            tTEqn =
+            (
+                fvm::div(phiT, TMutable, "div(phi,T)")
+              - fvm::laplacian(DEff, TMutable)
+             ==
+                fvOptions(TMutable)
+            );
+        }
+
+        fvScalarMatrix& TEqn = tTEqn.ref();
+        TEqn.relax();
+        fvOptions.constrain(TEqn);
+        TEqn.solve().initialResidual();
+        fvOptions.correct(TMutable);
+        TMutable.correctBoundaryConditions();
+    };
+
+    auto convergeDiagnosticTemperature =
+        [&](label& nIters, scalar& finalRel)
+    {
+        volScalarField& TMutable = const_cast<volScalarField&>(TRef());
+        nIters = 0;
+        finalRel = VGREAT;
+
+        const label maxIters =
+            max(label(1), fixedPointValidationMaxIters_);
+
+        for (label iter = 0; iter < maxIters; ++iter)
+        {
+            const scalarField oldT(TMutable.primitiveField());
+            solveDiagnosticTEqnOnce();
+
+            finalRel = thermalStateRelChange(TMutable, oldT);
+            nIters = iter + 1;
+
+            if (finalRel < fixedPointValidationRelTol_)
+            {
+                break;
+            }
+        }
+    };
+
+    auto weightedObjectiveValue = [&]()
+    {
+        scalar J = Zero;
+        PtrList<objective>& functions =
+            objectiveManager_.getObjectiveFunctions();
+
+        for (objective& func : functions)
+        {
+            J += func.weight()*func.J();
+        }
+
+        return J;
+    };
+
+    struct ObjectiveOracleResult
+    {
+        label thermalIters;
+        scalar thermalRel;
+        scalar extraThermalRel;
+        scalar JFirst;
+        scalar JRepeatEvaluation;
+
+        ObjectiveOracleResult()
+        :
+            thermalIters(0),
+            thermalRel(VGREAT),
+            extraThermalRel(VGREAT),
+            JFirst(Zero),
+            JRepeatEvaluation(Zero)
+        {}
+    };
+
+    auto objectiveAtFlowAndBeta =
+        [&](const label cellj, const scalar betaValue, const SimpleMapState& state)
+    {
+        ObjectiveOracleResult result;
+        restoreAll();
+        beta.primitiveFieldRef()[cellj] = betaValue;
+        beta.correctBoundaryConditions();
+        installState(state);
+
+        convergeDiagnosticTemperature(result.thermalIters, result.thermalRel);
+
+        volScalarField& TMutable = const_cast<volScalarField&>(TRef());
+        const scalarField oldT(TMutable.primitiveField());
+        solveDiagnosticTEqnOnce();
+        result.extraThermalRel = thermalStateRelChange(TMutable, oldT);
+
+        result.JFirst = weightedObjectiveValue();
+        result.JRepeatEvaluation = weightedObjectiveValue();
+
+        restoreAll();
+        return result;
+    };
+
+    auto countBranchDiagnostics =
+        [&]
+        (
+            const label cellj,
+            const scalar eps,
+            const SimpleMapState& plusState,
+            const SimpleMapState& minusState,
+            const SimpleMapState& deltaState,
+            label& nInternalSignCrossings,
+            label& nBoundarySignCrossings,
+            label& nNearInternal,
+            label& nNearBoundary
+        )
+    {
+        nInternalSignCrossings = 0;
+        nBoundarySignCrossings = 0;
+        nNearInternal = 0;
+        nNearBoundary = 0;
+
+        label printed = 0;
+        forAll(plusState.phiInternal, facei)
+        {
+            if
+            (
+                (
+                    plusState.phiInternal[facei] > 0
+                 && minusState.phiInternal[facei] < 0
+                )
+             || (
+                    plusState.phiInternal[facei] < 0
+                 && minusState.phiInternal[facei] > 0
+                )
+            )
+            {
+                ++nInternalSignCrossings;
+                if (printed < 20)
+                {
+                    Info<< "ATC-T fixed-point adjoint beta branch face: cell "
+                        << cellj << " eps " << eps
+                        << " location internal face " << facei
+                        << " basePhi " << phiBase.primitiveField()[facei]
+                        << " dPhi " << deltaState.phiInternal[facei]
+                        << endl;
+                    ++printed;
+                }
+            }
+
+            if
+            (
+                mag(deltaState.phiInternal[facei]) > SMALL
+             && mag(phiBase.primitiveField()[facei])
+             <= scalar(10)*eps*mag(deltaState.phiInternal[facei])
+            )
+            {
+                ++nNearInternal;
+                if (printed < 20)
+                {
+                    Info<< "ATC-T fixed-point adjoint beta near-branch face: cell "
+                        << cellj << " eps " << eps
+                        << " location internal face " << facei
+                        << " basePhi " << phiBase.primitiveField()[facei]
+                        << " dPhi " << deltaState.phiInternal[facei]
+                        << endl;
+                    ++printed;
+                }
+            }
+        }
+
+        forAll(plusState.phiBoundary, patchi)
+        {
+            const scalarField& basePatch =
+                phiBase.boundaryField()[patchi];
+
+            forAll(plusState.phiBoundary[patchi], facei)
+            {
+                if
+                (
+                    (
+                        plusState.phiBoundary[patchi][facei] > 0
+                     && minusState.phiBoundary[patchi][facei] < 0
+                    )
+                 || (
+                        plusState.phiBoundary[patchi][facei] < 0
+                     && minusState.phiBoundary[patchi][facei] > 0
+                    )
+                )
+                {
+                    ++nBoundarySignCrossings;
+                    if (printed < 20)
+                    {
+                        Info<< "ATC-T fixed-point adjoint beta branch face: cell "
+                            << cellj << " eps " << eps
+                            << " patch " << mesh_.boundary()[patchi].name()
+                            << " face " << facei
+                            << " basePhi " << basePatch[facei]
+                            << " dPhi "
+                            << deltaState.phiBoundary[patchi][facei]
+                            << endl;
+                        ++printed;
+                    }
+                }
+
+                if
+                (
+                    mag(deltaState.phiBoundary[patchi][facei]) > SMALL
+                 && mag(basePatch[facei])
+                 <= scalar(10)*eps*mag(deltaState.phiBoundary[patchi][facei])
+                )
+                {
+                    ++nNearBoundary;
+                    if (printed < 20)
+                    {
+                        Info<< "ATC-T fixed-point adjoint beta near-branch face: cell "
+                            << cellj << " eps " << eps
+                            << " patch " << mesh_.boundary()[patchi].name()
+                            << " face " << facei
+                            << " basePhi " << basePatch[facei]
+                            << " dPhi "
+                            << deltaState.phiBoundary[patchi][facei]
+                            << endl;
+                        ++printed;
+                    }
+                }
+            }
+        }
+
+        reduce(nInternalSignCrossings, sumOp<label>());
+        reduce(nBoundarySignCrossings, sumOp<label>());
+        reduce(nNearInternal, sumOp<label>());
+        reduce(nNearBoundary, sumOp<label>());
     };
 
     scalarField flowSample(mesh_.nCells(), Zero);
@@ -6804,6 +7859,39 @@ void Foam::thermalAdjointSimple::checkFixedPointAdjointBetaSensitivity
         << "totalRawPerVolume flowPerVolumeOverDt flowBetaMultOverDt "
         << "directBetaMultOverDt totalBetaMultOverDt"
         << endl;
+
+    Info<< "ATC-T fixed-point adjoint beta tangent residual correction "
+        << "samples: cell betaEps tangentIters tangentEstimatedRel "
+        << "tangentFinalTrueRel tangentFlowIntegrated directAdjointFlowIntegrated "
+        << "residualCorrectionU residualCorrectionP "
+        << "residualCorrectionPhiInternal residualCorrectionPhiBoundary "
+        << "residualCorrection correctedTangentFlowIntegrated "
+        << "uncorrectedGap correctedGap fractionExplained "
+        << "tangentFlowPerVolume directAdjointFlowPerVolume "
+        << "correctedTangentFlowPerVolume accepted"
+        << endl;
+
+    if (checkFixedPointTangentAgainstFD_)
+    {
+        Info<< "ATC-T fixed-point adjoint beta objective oracle samples: "
+            << "cell eps plusFlowIters plusReportedRel plusTrueDefect "
+            << "plusTIters plusTRel plusTExtraRel "
+            << "minusFlowIters minusReportedRel minusTrueDefect "
+            << "minusTIters minusTRel minusTExtraRel "
+            << "plusJ plusJRepeatEval plusJRepeatSolve "
+            << "minusJ minusJRepeatEval minusJRepeatSolve "
+            << "objectiveNoise derivativeNoise "
+            << "nInternalSignCross nBoundarySignCross "
+            << "nNearInternal nNearBoundary acceptedFDRow"
+            << endl;
+
+        Info<< "ATC-T fixed-point adjoint beta objective split samples: "
+            << "cell eps branchCrossings conductivityFD directAnalytic "
+            << "conductivitySymRel flowOnlyFD adjointFlow flowSymRel "
+            << "totalFD adjointTotal totalSymRel derivativeNoise "
+            << "gapOverNoise acceptedClassicalFD"
+            << endl;
+    }
 
     for (label reporti = 0; reporti < nReport; ++reporti)
     {
@@ -6921,6 +8009,97 @@ void Foam::thermalAdjointSimple::checkFixedPointAdjointBetaSensitivity
                 << directBetaMult/dt << " "
                 << totalBetaMult/dt
                 << endl;
+
+            if (epsi < min(label(3), fixedPointAdjointBetaFDEps_.size()))
+            {
+                TangentApproxResult tangent =
+                    solveTangentApprox
+                    (
+                        cellj,
+                        eps,
+                        dM,
+                        tangentUScale,
+                        tangentPScale,
+                        tangentPhiScale
+                    );
+
+                const scalar tangentFlow = objectiveContraction(tangent.delta);
+
+                scalar residualU = Zero;
+                scalar residualP = Zero;
+                scalar residualPhiInternal = Zero;
+                scalar residualPhiBoundary = Zero;
+                contractPsiWithState
+                (
+                    tangent.residual,
+                    residualU,
+                    residualP,
+                    residualPhiInternal,
+                    residualPhiBoundary
+                );
+
+                const scalar residualCorrection =
+                    residualU
+                  + residualP
+                  + residualPhiInternal
+                  + residualPhiBoundary;
+                const scalar correctedTangentFlow =
+                    tangentFlow + residualCorrection;
+                const scalar uncorrectedGap = flowIntegrated - tangentFlow;
+                const scalar correctedGap =
+                    flowIntegrated - correctedTangentFlow;
+                const scalar fractionExplained =
+                    mag(uncorrectedGap) > VSMALL
+                  ? residualCorrection/uncorrectedGap
+                  : VGREAT;
+                const scalar correctedSym =
+                    mag(correctedGap)
+                   /(mag(flowIntegrated) + mag(correctedTangentFlow) + VSMALL);
+                const bool sameSign =
+                    flowIntegrated*correctedTangentFlow >= -VSMALL;
+                const bool accepted =
+                    sameSign
+                 && (
+                        correctedSym < scalar(1e-5)
+                     || mag(correctedGap)
+                      < scalar(1e-8)*max(scalar(1), mag(flowIntegrated))
+                    );
+
+                Info<< "ATC-T fixed-point adjoint beta tangent residual "
+                    << "correction sample: "
+                    << cellj << " "
+                    << eps << " "
+                    << tangent.iterations << " "
+                    << tangent.estimatedRel << " "
+                    << tangent.finalRel << " "
+                    << tangentFlow << " "
+                    << flowIntegrated << " "
+                    << residualU << " "
+                    << residualP << " "
+                    << residualPhiInternal << " "
+                    << residualPhiBoundary << " "
+                    << residualCorrection << " "
+                    << correctedTangentFlow << " "
+                    << uncorrectedGap << " "
+                    << correctedGap << " "
+                    << fractionExplained << " "
+                    << tangentFlow/V[cellj] << " "
+                    << flowIntegrated/V[cellj] << " "
+                    << correctedTangentFlow/V[cellj] << " "
+                    << accepted
+                    << endl;
+
+                if (!accepted)
+                {
+                    FatalErrorInFunction
+                        << "Fixed-point adjoint beta tangent residual "
+                        << "correction identity failed for cell " << cellj
+                        << " eps " << eps
+                        << ". correctedGap " << correctedGap
+                        << " correctedSym " << correctedSym
+                        << exit(FatalError);
+                }
+            }
         }
 
         label plateauA = -1;
@@ -7022,6 +8201,308 @@ void Foam::thermalAdjointSimple::checkFixedPointAdjointBetaSensitivity
             << " directBetaMultOverDt " << conductivityContribution[cellj]/dt
             << " totalBetaMultOverDt " << plateauTotalBetaMult/dt
             << endl;
+
+        if (checkFixedPointTangentAgainstFD_)
+        {
+            scalarList validationEps(5, Zero);
+            validationEps[0] = scalar(1e-4);
+            validationEps[1] = scalar(3e-5);
+            validationEps[2] = scalar(1e-5);
+            validationEps[3] = scalar(3e-6);
+            validationEps[4] = scalar(1e-6);
+
+            forAll(validationEps, validationI)
+            {
+                const scalar requestedValidationEps = validationEps[validationI];
+                const scalar room = min(oldBeta, scalar(1) - oldBeta);
+                const scalar validationBetaEps =
+                    min(requestedValidationEps, scalar(0.25)*max(room, SMALL));
+
+                if (validationBetaEps <= SMALL)
+                {
+                    Info<< "ATC-T fixed-point adjoint beta objective oracle "
+                        << "skipped cell " << cellj
+                        << " requestedEps " << requestedValidationEps
+                        << " actualEps " << validationBetaEps
+                        << endl;
+                    continue;
+                }
+
+                label plusIters = 0;
+                scalar plusRel = VGREAT;
+                SimpleMapState xPlus =
+                    iterateFullSimpleMap
+                    (
+                        cellj,
+                        oldBeta + validationBetaEps,
+                        baseState,
+                        plusIters,
+                        plusRel
+                    );
+                const scalar plusTrueDefect =
+                    trueFixedPointDefect
+                    (
+                        cellj,
+                        oldBeta + validationBetaEps,
+                        xPlus
+                    );
+                ObjectiveOracleResult plusObjective =
+                    objectiveAtFlowAndBeta
+                    (
+                        cellj,
+                        oldBeta + validationBetaEps,
+                        xPlus
+                    );
+
+                label plusRepeatIters = 0;
+                scalar plusRepeatRel = VGREAT;
+                SimpleMapState xPlusRepeat =
+                    iterateFullSimpleMap
+                    (
+                        cellj,
+                        oldBeta + validationBetaEps,
+                        baseState,
+                        plusRepeatIters,
+                        plusRepeatRel
+                    );
+                ObjectiveOracleResult plusRepeatObjective =
+                    objectiveAtFlowAndBeta
+                    (
+                        cellj,
+                        oldBeta + validationBetaEps,
+                        xPlusRepeat
+                    );
+
+                label minusIters = 0;
+                scalar minusRel = VGREAT;
+                SimpleMapState xMinus =
+                    iterateFullSimpleMap
+                    (
+                        cellj,
+                        oldBeta - validationBetaEps,
+                        baseState,
+                        minusIters,
+                        minusRel
+                    );
+                const scalar minusTrueDefect =
+                    trueFixedPointDefect
+                    (
+                        cellj,
+                        oldBeta - validationBetaEps,
+                        xMinus
+                    );
+                ObjectiveOracleResult minusObjective =
+                    objectiveAtFlowAndBeta
+                    (
+                        cellj,
+                        oldBeta - validationBetaEps,
+                        xMinus
+                    );
+
+                label minusRepeatIters = 0;
+                scalar minusRepeatRel = VGREAT;
+                SimpleMapState xMinusRepeat =
+                    iterateFullSimpleMap
+                    (
+                        cellj,
+                        oldBeta - validationBetaEps,
+                        baseState,
+                        minusRepeatIters,
+                        minusRepeatRel
+                    );
+                ObjectiveOracleResult minusRepeatObjective =
+                    objectiveAtFlowAndBeta
+                    (
+                        cellj,
+                        oldBeta - validationBetaEps,
+                        xMinusRepeat
+                    );
+
+                SimpleMapState deltaFD =
+                    mapStateDifference
+                    (
+                        xPlus,
+                        xMinus,
+                        validationBetaEps
+                    );
+
+                label nInternalSignCrossings = 0;
+                label nBoundarySignCrossings = 0;
+                label nNearInternal = 0;
+                label nNearBoundary = 0;
+                countBranchDiagnostics
+                (
+                    cellj,
+                    validationBetaEps,
+                    xPlus,
+                    xMinus,
+                    deltaFD,
+                    nInternalSignCrossings,
+                    nBoundarySignCrossings,
+                    nNearInternal,
+                    nNearBoundary
+                );
+
+                const scalar noisePlus =
+                    max
+                    (
+                        mag
+                        (
+                            plusObjective.JFirst
+                          - plusObjective.JRepeatEvaluation
+                        ),
+                        mag
+                        (
+                            plusObjective.JFirst
+                          - plusRepeatObjective.JFirst
+                        )
+                    );
+                const scalar noiseMinus =
+                    max
+                    (
+                        mag
+                        (
+                            minusObjective.JFirst
+                          - minusObjective.JRepeatEvaluation
+                        ),
+                        mag
+                        (
+                            minusObjective.JFirst
+                          - minusRepeatObjective.JFirst
+                        )
+                    );
+                const scalar objectiveNoise = max(noisePlus, noiseMinus);
+                const scalar derivativeNoise =
+                    (noisePlus + noiseMinus)
+                   /(scalar(2)*validationBetaEps*V[cellj]);
+
+                const bool acceptedFDRow =
+                    plusTrueDefect < scalar(5e-10)
+                 && minusTrueDefect < scalar(5e-10)
+                 && plusObjective.extraThermalRel < scalar(1e-10)
+                 && minusObjective.extraThermalRel < scalar(1e-10);
+
+                Info<< "ATC-T fixed-point adjoint beta objective oracle "
+                    << "sample: "
+                    << cellj << " "
+                    << validationBetaEps << " "
+                    << plusIters << " "
+                    << plusRel << " "
+                    << plusTrueDefect << " "
+                    << plusObjective.thermalIters << " "
+                    << plusObjective.thermalRel << " "
+                    << plusObjective.extraThermalRel << " "
+                    << minusIters << " "
+                    << minusRel << " "
+                    << minusTrueDefect << " "
+                    << minusObjective.thermalIters << " "
+                    << minusObjective.thermalRel << " "
+                    << minusObjective.extraThermalRel << " "
+                    << plusObjective.JFirst << " "
+                    << plusObjective.JRepeatEvaluation << " "
+                    << plusRepeatObjective.JFirst << " "
+                    << minusObjective.JFirst << " "
+                    << minusObjective.JRepeatEvaluation << " "
+                    << minusRepeatObjective.JFirst << " "
+                    << objectiveNoise << " "
+                    << derivativeNoise << " "
+                    << nInternalSignCrossings << " "
+                    << nBoundarySignCrossings << " "
+                    << nNearInternal << " "
+                    << nNearBoundary << " "
+                    << acceptedFDRow
+                    << endl;
+
+                ObjectiveOracleResult plusConductivityObjective =
+                    objectiveAtFlowAndBeta
+                    (
+                        cellj,
+                        oldBeta + validationBetaEps,
+                        baseState
+                    );
+                ObjectiveOracleResult minusConductivityObjective =
+                    objectiveAtFlowAndBeta
+                    (
+                        cellj,
+                        oldBeta - validationBetaEps,
+                        baseState
+                    );
+                ObjectiveOracleResult plusFlowObjective =
+                    objectiveAtFlowAndBeta(cellj, oldBeta, xPlus);
+                ObjectiveOracleResult minusFlowObjective =
+                    objectiveAtFlowAndBeta(cellj, oldBeta, xMinus);
+
+                const scalar conductivityFD =
+                    (
+                        plusConductivityObjective.JFirst
+                      - minusConductivityObjective.JFirst
+                    )
+                   /(scalar(2)*validationBetaEps*V[cellj]);
+                const scalar directAnalytic =
+                    conductivityContribution[cellj]/dt;
+                const scalar conductivitySym =
+                    mag(conductivityFD - directAnalytic)
+                   /(mag(conductivityFD) + mag(directAnalytic) + VSMALL);
+
+                const scalar flowOnlyFD =
+                    (
+                        plusFlowObjective.JFirst
+                      - minusFlowObjective.JFirst
+                    )
+                   /(scalar(2)*validationBetaEps*V[cellj]);
+                const scalar adjointFlow = plateauFlowBetaMult/dt;
+                const scalar flowSym =
+                    mag(flowOnlyFD - adjointFlow)
+                   /(mag(flowOnlyFD) + mag(adjointFlow) + VSMALL);
+
+                const scalar totalFD =
+                    (
+                        plusObjective.JFirst
+                      - minusObjective.JFirst
+                    )
+                   /(scalar(2)*validationBetaEps*V[cellj]);
+                const scalar adjointTotal = plateauTotalBetaMult/dt;
+                const scalar totalSym =
+                    mag(totalFD - adjointTotal)
+                   /(mag(totalFD) + mag(adjointTotal) + VSMALL);
+                const scalar totalGap = totalFD - adjointTotal;
+                const scalar gapOverNoise =
+                    mag(totalGap)/max(derivativeNoise, VSMALL);
+                const label branchCrossings =
+                    nInternalSignCrossings + nBoundarySignCrossings;
+                const bool acceptedClassicalFD =
+                    acceptedFDRow
+                 && branchCrossings == 0
+                 && (
+                        (
+                            totalFD*adjointTotal >= -VSMALL
+                         && totalSym < scalar(1e-3)
+                        )
+                     || mag(totalGap)
+                      < scalar(1e-7)*max(scalar(1), mag(totalFD))
+                     || mag(totalGap) <= scalar(10)*derivativeNoise
+                    );
+
+                Info<< "ATC-T fixed-point adjoint beta objective split "
+                    << "sample: "
+                    << cellj << " "
+                    << validationBetaEps << " "
+                    << branchCrossings << " "
+                    << conductivityFD << " "
+                    << directAnalytic << " "
+                    << conductivitySym << " "
+                    << flowOnlyFD << " "
+                    << adjointFlow << " "
+                    << flowSym << " "
+                    << totalFD << " "
+                    << adjointTotal << " "
+                    << totalSym << " "
+                    << derivativeNoise << " "
+                    << gapOverNoise << " "
+                    << acceptedClassicalFD
+                    << endl;
+            }
+        }
     }
 
     if (writeFixedPointAdjointBetaSamples_)
