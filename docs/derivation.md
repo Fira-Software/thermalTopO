@@ -3,6 +3,12 @@
 **thermalTopO derivation note: draft v0.1, 10 July 2026**
 **Review status:** formulation and conjugate-heat-transfer physics review welcome.
 
+For the production fixed-point beta mode, the complete discrete derivation,
+including the SIMPLE map transpose, fixed-point adjoint, analytic beta reverse,
+conductivity contribution and validation identities, is available as:
+
+[Exact fixed-point adjoint and topology-sensitivity derivation](thermalTopO_fixed_point_adjoint_derivation.pdf)
+
 This note derives the adjoint system implemented by `thermalTopO`, an
 extension of OpenFOAM's `adjointOptimisationFoam` (v2512) adding an energy
 equation, its adjoint, and thermal objectives to the existing porosity-based

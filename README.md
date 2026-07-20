@@ -161,6 +161,14 @@ diffusion correction. A structural lower-bound relaxation tie at `beta=0` is
 handled as the feasible right derivative, not as a two-sided classical
 derivative.
 
+### Mathematical derivation
+
+The complete discrete derivation, including the SIMPLE map transpose,
+fixed-point adjoint, analytic beta reverse, conductivity contribution and
+validation identities, is available in:
+
+[Exact fixed-point adjoint and topology-sensitivity derivation](docs/thermalTopO_fixed_point_adjoint_derivation.pdf)
+
 <table>
   <thead>
     <tr>
