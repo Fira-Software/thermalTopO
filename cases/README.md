@@ -2,15 +2,15 @@
 
 ## fdcheck (60x24, laminar 2D CHT verification)
 The gradient-verification harness. Dictionaries:
-- `optimisationDict.full` / `.primalonly` — zone-mean objective, no regularisation
-- `optimisationDict.pnorm` / `.pnorm_primalonly` — patch p-norm objective
-- `optimisationDict.pnorm_reg*` — production configuration (regularisation on)
-- `optimisationDict.pnorm_regT*` — as above plus tabulated D_s(T)
+- `optimisationDict.full` / `.primalonly`: zone-mean objective, no regularisation
+- `optimisationDict.pnorm` / `.pnorm_primalonly`: patch p-norm objective
+- `optimisationDict.pnorm_reg*`: production configuration, regularisation on
+- `optimisationDict.pnorm_regT*`: as above plus tabulated D_s(T)
 
 Drivers (run after `./Allrun` has set up mesh/zones/fields):
-- `fd_driver.py` — directional derivatives, zone-mean objective
-- `fd_cells.py` — single-cell central differences, three regimes
-- `fd_pnorm.py`, `fd_pnorm_reg.py`, `fd_kT.py` — p-norm campaigns
+- `fd_driver.py`: directional derivatives, zone-mean objective
+- `fd_cells.py`: single-cell central differences, three regimes
+- `fd_pnorm.py`, `fd_pnorm_reg.py`, `fd_kT.py`: p-norm campaigns
   (unregularised / production / D_s(T))
 
 Published results are quoted in the top-level README and derivation note.
@@ -30,17 +30,17 @@ patch p-norm) as `fdcheck`, so the numbers are directly comparable.
   model (mu(T)/rho(T)); switch it back to `Newtonian` for a constant-nu
   comparison run.
 - `system/fvSchemes` declares `div(-phiC,Ta)` for the C(T)-weighted adjoint
-  flux. It must NOT be `bounded` — see derivation note section 6.2.
+  flux. It must NOT be `bounded`; see derivation note section 6.2.
 - Dictionaries: `optimisationDict.varprops` / `.varprops_primalonly`
 - Driver: `./fd_varprops.py` (after `./Allrun`)
 
-Manufactured verification fluid: at 300 K it reduces exactly to the
-constant-property fdcheck case, and over 300-339 K rho*cp varies -23.5%,
-nu -41%, k_f +10%, D_s -33%. Results in the top-level README and
-derivation note section 6.3.
+Manufactured verification fluid: at the reference temperature it reduces to
+the constant-property fdcheck case, while the tabulated ranges exercise
+volumetric heat capacity, viscosity, fluid conductivity and solid conductivity.
+The exact numerical rows are kept in the reproducible driver outputs rather
+than in this public summary.
 
 ## demo2d
 Constrained heat-transfer enhancement demonstration: maximise downstream
-zone temperature subject to total-pressure losses <= 2x baseline (active
-constraint) and a solid-volume cap; nullSpace update. Reproduces the
-fin-growth figure: `./Allrun` (about 2-3 hours serial, 80 cycles).
+zone temperature subject to a total-pressure-loss cap and a solid-volume cap;
+nullSpace update. Reproduces the fin-growth figure via `./Allrun`.

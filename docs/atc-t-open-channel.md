@@ -11,7 +11,7 @@ thermal objectives, pressure-drop monitoring and body-fitted verification
 workflows. It is not used as quantitative evidence for an exact
 variable-property SST adjoint.
 
-The production exact path is separate. In `v0.4.2`,
+The production exact path is separate. In `v0.4.3`,
 `useAnalyticFixedPointAdjointBeta` enables the guarded matrix-free fixed-point
 beta sensitivity for the constant-property, one-way-coupled serial Stokes
 branch. That path solves

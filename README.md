@@ -46,7 +46,7 @@ of coolant channels in fusion plasma-facing components.
     <tr>
       <td>Exact matrix-free fixed-point beta sensitivity for the guarded Stokes branch</td>
       <td><code>useAnalyticFixedPointAdjointBeta</code></td>
-      <td>production-integrated and runtime-guarded in v0.4.2</td>
+      <td>production-integrated and runtime-guarded in v0.4.3</td>
     </tr>
     <tr>
       <td>Temperature-dependent properties ρ(T), c_p(T), k_f(T), k_s(T) in primal, adjoint and sensitivities</td>
@@ -131,7 +131,7 @@ and sensitivity extension points; no core sources are patched.
   variable-property SST adjoint for this example. See
   [`docs/atc-t-open-channel.md`](docs/atc-t-open-channel.md).
 
-## Exact fixed-point beta mode, v0.4.2
+## Exact fixed-point beta mode, v0.4.3
 
 `thermalAdjointSimple` includes an opt-in production mode:
 
