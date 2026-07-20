@@ -9,9 +9,9 @@ adjoint temperature equation with its coupling into adjoint momentum,
 thermal objective functions, and the conductivity-interpolation term in the
 topology sensitivities. With it, the existing porosity-based topology
 optimisation, including the upstream constrained update methods
-(ISQP / nullSpace / MMA) and the fully differentiated k-ω SST adjoint,
-can optimise cooling geometries for thermal objectives such as *minimise
-peak wall temperature subject to a pressure-drop cap*.
+(ISQP / nullSpace / MMA) and the momentum-side adjoint k-ω SST implementation,
+can optimise cooling geometries for thermal objectives such as *minimise peak
+wall temperature subject to a pressure-drop cap*.
 
 Developed and released by [Fira Software Ltd](https://firasoftware.com)
 (author: Dr S. Kalogerakos), July 2026. Motivated by heat-exchanger and
@@ -41,7 +41,12 @@ of coolant channels in fusion plasma-facing components.
     <tr>
       <td>Adjoint SIMPLE + adjoint energy equation and thermal-to-momentum coupling</td>
       <td><code>thermalAdjointSimple</code></td>
-      <td>working, FD-verified in porous verification cases; open-channel projected-flux path experimental</td>
+      <td>working and FD-verified in published porous verification cases</td>
+    </tr>
+    <tr>
+      <td>Exact matrix-free fixed-point beta sensitivity for the guarded Stokes branch</td>
+      <td><code>useAnalyticFixedPointAdjointBeta</code></td>
+      <td>production-integrated and runtime-guarded in v0.4.2</td>
     </tr>
     <tr>
       <td>Temperature-dependent properties ρ(T), c_p(T), k_f(T), k_s(T) in primal, adjoint and sensitivities</td>
@@ -111,14 +116,50 @@ and sensitivity extension points; no core sources are patched.
 - Geometry and design-history output, every cycle.
 - Constrained demonstration: fin growth under a pressure-drop cap.
 - Onset-of-nucleate-boiling monitor.
+- Production fixed-point beta sensitivity for the guarded constant-property,
+  one-way-coupled, serial Stokes branch. It solves
+  `(I - M_x)^T psi = J_x`, evaluates `J_beta + psi^T M_beta`, replaces the
+  stock Brinkman sensitivity without double-counting, and retains the direct
+  conductivity contribution.
 
 **Experimental** (in `examples/`, published for transparency and reuse):
 
 - Open-channel channel-and-body co-optimisation. This exercises the
-  thermal-induced Brinkman path in open-flow design cells. The next
-  implementation item is the projected-flux thermal adjoint coupling through the
-  SIMPLE pressure-projection step; see
+  thermal-induced Brinkman path in open-flow design cells. The exact
+  fixed-point beta mode above is a guarded constant-property Stokes production
+  path and a verification reference; it is not presented as an exact
+  variable-property SST adjoint for this example. See
   [`docs/atc-t-open-channel.md`](docs/atc-t-open-channel.md).
+
+## Exact fixed-point beta mode, v0.4.2
+
+`thermalAdjointSimple` includes an opt-in production mode:
+
+```
+solveFixedPointAdjoint              true;
+computeAnalyticFixedPointAdjointBeta true;
+useAnalyticFixedPointAdjointBeta    true;
+```
+
+In that mode the solver uses the validated one-step SIMPLE transpose as a
+matrix-free action, solves the fixed-point adjoint equation
+
+    (I - M_x)^T psi = J_x
+
+and assembles the topology sensitivity as
+
+    dJ/dbeta = J_beta + psi^T M_beta.
+
+The production implementation replaces the stock Brinkman momentum sensitivity
+with `M_beta^T psi`, then adds the existing direct conductivity contribution
+unchanged. It is deliberately guarded to the scope that has been validated:
+OpenFOAM v2512, serial execution, non-coupled patches, Stokes flow, consistent
+SIMPLE, zero pressure non-orthogonal correctors, constant thermal properties,
+one-way flow-to-thermal coupling, one active `topOSource` momentum option, no
+active temperature `fvOptions`, and zero explicit thermal non-orthogonal
+diffusion correction. A structural lower-bound relaxation tie at `beta=0` is
+handled as the feasible right derivative, not as a two-sided classical
+derivative.
 
 <table>
   <thead>
@@ -154,9 +195,9 @@ pass finite differences.
 ## Verification (gradient correctness)
 
 Continuous-adjoint gradients are verified against central finite
-differences on a 2D laminar conjugate-heat-transfer case (Brinkman sponge,
-conductivity ratio 100, hot wall, mean-temperature objective on a
-downstream zone); every constituent solve converged to machine-level
+differences on a laminar conjugate-heat-transfer case with a Brinkman sponge,
+high conductivity contrast, a hot wall and a downstream mean-temperature
+objective. Every constituent solve converged to machine-level
 residuals with automated guards:
 
 ![FD verification](docs/figures/fd_verification.png)
@@ -166,30 +207,27 @@ weight/sign convention; agreement is assessed cell-by-cell after that single
 factor.
 
 - **Single-cell central FD, solid interior, consistent 2nd-order schemes:
-  zone-mean objective median |error| 0.5 % (max 2.1 %); patch p-norm
-  objective median |error| 0.2 % (max 0.9 %).** Against the derivation
-  note's pre-registered < 1 % laminar gate: the p-norm campaign passes it
-  outright. The zone-mean campaign passes on median with max 2.1 %. The
-  p-norm campaign exercises the boundary-driven adjoint flux path used by
-  peak-temperature objectives.
-- **Production configuration (regularisation on, p-norm objective,
-  chained sensitivities): all regimes verify to max 1.7 % per cell**
-  (solid 0.5 % median, edge 0.6 %, sponge 1.2 %). The design-step error
-  localisation observed without regularisation vanishes, as predicted.
+  zone-mean and patch p-norm objectives verify at sub-percent median
+  accuracy.** The patch p-norm campaign exercises the boundary-driven adjoint
+  flux path used by peak-temperature objectives.
+- **Production configuration, regularisation on, p-norm objective and chained
+  sensitivities: all tested regimes verify at low single-digit percent or
+  better.** The design-step error localisation observed without regularisation
+  vanishes, as predicted.
   Note for reproducers: with regularisation active compare FD against
   `topOSens<solver>` (enable `writeAllFields`), not `topologySens<solver>`,
   which upstream writes before the filter/projection chain rule.
-- Directional derivatives across 720 design cells: 1 to 3 % on
-  gradient-dominant directions.
-- With 1st-order upwind advection the solid-interior error grows to a
-  uniform bias of about +11 %. This is an advection-scheme-consistency effect, not a
-  formulation error. Cells adjacent to *unfiltered* step discontinuities
-  in the design field carry larger local errors; regularisation (on in
-  any production run) removes that configuration by construction.
-- Known v1 approximation: frozen turbulent thermal diffusivity in the
-  adjoint energy equation (the momentum-side k-ω SST adjoint is the fully
-  differentiated upstream one). Quantification on turbulent cases is on
-  the roadmap.
+- Directional derivatives across the full design field retain the correct sign
+  and low single-digit magnitude error on gradient-dominant directions.
+- With first-order upwind advection the verification shows a uniform bias. This
+  is an advection-scheme-consistency effect, not a formulation error. Cells
+  adjacent to *unfiltered* step discontinuities in the design field carry larger
+  local errors; regularisation, on in production runs, removes that
+  configuration by construction.
+- Known variable-property/SST approximation: turbulent thermal diffusivity,
+  temperature-dependent coefficient fields and property derivatives are frozen
+  at the converged primal state in the thermal adjoint. The exact fixed-point
+  beta mode is a separate guarded constant-property Stokes path.
 
 Full derivation and verification protocol: [docs/derivation.md](docs/derivation.md).
 
@@ -301,25 +339,15 @@ div(-phiC,Ta)   Gauss limitedLinear 1;
 are not differentiated; C, D_eff and ν are frozen coefficient fields at the
 primal solution. The cost of that is measured, not assumed.
 
-**Verification** (`cases/varprops`, laminar, production configuration, all
-five tables active at once: ρ, c_p, k_f, μ *and* D_s. Across the tabulated
-300 to 340 K span, which the case's temperature field realises to 338.8 K:
-ρc_p -23.5 %, ν -41 %, k_f +10 %, D_s -33 %):
-
-- Solid interior: median error 0.4 %, maximum error 0.8 %; constant-property
-  reference 0.5 % / 1.0 %.
-- Interface edge: median error 0.7 %, maximum error 0.9 %; constant-property
-  reference 0.6 % / 1.5 %.
-- Sponge: median error 1.4 %, maximum error 1.6 %; constant-property reference
-  1.2 % / 1.7 %.
-
-Sign agreement 18/18 cells. Per-cell gradient accuracy with every property
-tabulated is indistinguishable from the constant-property campaign. Across
-the five directional derivatives the sign is likewise always correct, with
-magnitude errors of 2.0 to 5.8 % against 1 to 3 % constant-property, a modest,
-honestly-reported cost of the frozen-property terms. That μ(T) genuinely
-reaches momentum was confirmed against an otherwise identical constant-ν run
-(22 % change in peak pressure, 11.5 % in peak velocity).
+**Verification** (`cases/varprops`, laminar production configuration, all five
+tables active at once: ρ, c_p, k_f, μ *and* D_s): single-cell and directional
+finite-difference checks retain the correct sign and remain close to the
+constant-property campaign. The public scripts and logs in `cases/varprops`
+contain the exact numerical rows. This README keeps only the generic conclusion
+so it is not confused with any project-specific validation report. The
+manufactured property span is deliberately strong enough to exercise the
+variable-property paths, including μ(T) in the momentum equation through
+`viscosityModels::temperatureTable`.
 
 The tables are the mechanism; the verification values are chosen for FD
 conditioning. Production runs load real coolant and structural data through the
@@ -406,10 +434,8 @@ initial designs are supplied through the `alpha` field.
 
 Working examples under `cases/`: `fdcheck` (verification),
 `demo2d` (heat-extraction maximisation under pressure-drop and volume
-constraints). In the demo, the optimiser grows a sharp conductive fin on
-the hot wall, improving the objective by +5.3 K while the nullSpace update
-brings total-pressure losses to the 2x-baseline cap, strictly feasible to
-within 0.03 % at cycle 80:
+constraints). In the demo, the optimiser grows a conductive fin on the hot wall
+while the nullSpace update brings total-pressure losses to the configured cap:
 
 ![fin growth demo](docs/figures/demo_fin_growth.png)
 

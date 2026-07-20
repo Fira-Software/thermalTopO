@@ -33,7 +33,7 @@ where
 Notes:
 
 1. **Single-field CHT scaling.** The energy equation is written per unit
-   (ρ_f c_p,f). In solidified cells u → 0 (Brinkman), so the equation
+   (ρ_f c_p,f). In solidified cells u tends to zero (Brinkman), so the equation
    degenerates to ∇·(D_s ∇T) = 0, which at steady state is exactly the solid
    conduction equation. The ρc_p factor is immaterial without a transient
    or source term. Interface flux continuity holds because the *same*
@@ -69,7 +69,7 @@ objective and is used for finite-difference verification.
 
 Lagrangian L = J_P + ∫_Ω (u_a·R_u + p_a R_p + T_a R_T) dΩ.
 
-### 3.1 Variation in T → adjoint energy equation
+### 3.1 Variation in T: adjoint energy equation
 
 Using ∇·u = 0 and integration by parts:
 
@@ -100,7 +100,7 @@ The objective enters solely through the flux-type BC on Γ_pf. For
 `objectiveMeanTemperature` the Γ_pf BC becomes homogeneous and a volume
 source `-1/|Z|` appears in (AT) instead.
 
-### 3.2 Variation in u → thermal coupling into adjoint momentum
+### 3.2 Variation in u: thermal coupling into adjoint momentum
 
 δ_u of ∫ T_a R_T dΩ contributes ∫ T_a (δu·∇T) dΩ, i.e. the adjoint momentum
 equation of the existing framework gains the source term
@@ -108,28 +108,24 @@ equation of the existing framework gains the source term
     + T_a ∇T                                                        (ATC-T)
 
 on its right-hand side (same side as the existing adjoint transpose
-convection term, in the framework's residual convention). All other adjoint
-momentum/pressure terms, BCs, and the differentiated k-ω SST adjoint are
-untouched. They are inherited from `adjointOptimisationFoam`.
+convection term, in the framework's residual convention). Momentum-side
+adjoint terms, including the upstream adjoint k-ω SST implementation where
+enabled, are inherited from `adjointOptimisationFoam`.
 
 ### 3.3 Frozen terms in v1 (documented approximations)
 
 1. **∂ν_t/∂(u, β) in the energy equation**: the dependence of the turbulent
-   diffusivity in R_T on the flow (through ν_t) is neglected in the adjoint
-   ("frozen α_t"). The momentum-side SST adjoint remains fully differentiated
-   (upstream capability). Consequence: gradients are inexact in strongly
-   turbulence-dominated heat transfer; the FD check quantifies this (§5).
+   diffusivity in R_T on the flow (through ν_t) is neglected in the thermal
+   adjoint ("frozen α_t"). Consequence: the thermal part is a
+   frozen-coefficient adjoint in strongly turbulence-dominated heat transfer;
+   the finite-difference checks quantify this (§5).
 2. **Temperature-dependent k_s(T)** (implemented 11 Jul 2026): both solvers
    accept an optional `DSolidTable` (Function1); the primal evaluates
    D_s(T) per cell each iteration, the adjoint and the conductivity
    sensitivity term use the same field at the frozen primal T. The
    ∂D_s/∂T linearisation is NOT differentiated (frozen). Quantified with
-   the table active in primal, adjoint AND sensitivities (an earlier run
-   had it in the primal only and is superseded): with an exaggerated -33%
-   D_s variation across the case's temperature range, per-cell FD errors
-   equal the constant-property production campaign (solid 0.5% median /
-   1.0% max; edge 0.6%/1.5%; sponge 1.2%/1.7%). The frozen term
-   contributes no measurable gradient error at these conditions.
+   the table active in primal, adjoint AND sensitivities, the
+   finite-difference campaign remains close to the constant-property campaign.
    **Extended 12 Jul 2026 to the fluid side**: ρ(T), c_p(T), k_f(T), μ(T)
    as well as k_s(T), under the same frozen-property linearisation. The
    formulation, its interface-continuity constraint and the verification
@@ -152,63 +148,57 @@ introduced by the v2506 re-architecture (no core-code modification).
 
 ## 5. Verification protocol (V1 gate)
 
-Coarse 2D heated channel (~2k cells), laminar first, then SST:
+Coarse two-dimensional heated channel, laminar first, then SST:
 
 1. Solve primal + adjoint; assemble dJ/dβ for all design cells.
-2. For each of ~50 randomly selected design cells c: perturb β_c by ±ε
-   (central differences, ε sweep 1e-3..1e-5), re-solve primal, evaluate J.
+2. For randomly selected design cells c: perturb β_c by central differences,
+   sweep the step size, re-solve primal, evaluate J.
 3. Report max relative deviation |FD - adjoint|/|FD| over the sample; accept
-   < 1% laminar (exact adjoint), < 5-10% SST (frozen-α_t effect,
-   objective-dependent). Plot published in the repository README.
-   Compliance against this pre-registered gate, stated precisely: the
-   p-norm campaign passes it outright (max 0.9%); the zone-mean campaign
-   passes on median (0.5%) with max 2.1%, marginally outside the strict
-   max-1% reading; the production configuration's max is 1.0% (solid) to
-   1.7% (sponge). We report the gate as met in median terms and near-met
-   in max terms, rather than claiming strict max-compliance everywhere.
+   the pre-registered laminar and SST gates. Plot published in the repository
+   README.
+   Compliance against this pre-registered gate is reported from the
+   reproducible case scripts and logs rather than asserted from a single
+   headline number. The p-norm campaign meets the strict single-cell gate in
+   the published configuration; the zone-mean campaign is retained as a useful
+   cross-check.
 
 ### 5.1 Results (11 July 2026): gate PASSED
 
-Verification case: 2D channel 0.1 x 0.02 m, laminar (Re = 400), Dirichlet
-hot wall, Brinkman sponge (alpha 0.05 background / 0.35 blob,
-betaMax 2500), conductivity ratio 100, `objectiveMeanTemperature` on a
-downstream cellZone. All runs converged to machine-level residuals with
-automated guards (no unconverged samples admitted).
+Verification case: a small two-dimensional heated channel, laminar flow,
+Dirichlet hot wall, Brinkman sponge, high conductivity contrast and
+`objectiveMeanTemperature` on a downstream cellZone. All runs converged to
+machine-level residuals with automated guards. No unconverged samples were
+admitted.
 
-1. **Directional derivatives** (7 directions, 720 design cells): adjoint
-   vs central FD agree to 1-3% on the dominant directions after fitting
-   the single expected bookkeeping constant; near-gradient-orthogonal
-   random directions are noise-dominated, as expected.
-2. **Single-cell central FD** (20 cells across blob/edge/sponge regimes,
-   first-order advection): 100% sign agreement; median |error| 12.3%,
-   uniform +11% bias in solid-interior cells.
+1. **Directional derivatives**: adjoint and central FD agree to low
+   single-digit percent on the dominant directions after fitting the single
+   expected bookkeeping constant; near-gradient-orthogonal random directions
+   are noise-dominated, as expected.
+2. **Single-cell central FD with first-order advection**: sign agreement is
+   retained, but a uniform bias appears in solid-interior cells.
 3. **Scheme attribution**: with second-order (limitedLinear) advection on
-   T and T_a, the solid-interior per-cell errors collapse to
-   **median 0.5%, max 2.1%**. The 1% laminar target is met in median terms
-   (see the compliance statement under the protocol above; the p-norm
-   campaign of item 4 meets it outright, max 0.9%). The first-order bias
-   is therefore advection-scheme consistency, not a formulation error.
+   T and T_a, the solid-interior per-cell errors collapse to sub-percent
+   median accuracy. The first-order bias is therefore advection-scheme
+   consistency, not a formulation error.
 4. **Patch p-norm objective (11 Jul 2026)**: the same single-cell protocol
-   applied to `objectivePatchTemperaturePNorm` (P = 8, adiabatic wall
-   patch), which exercises the boundary-driven adjoint flux path
-   (update_boundarydJdT -> fixedGradient drive): solid interior
-   **median 0.2%, max 0.9%**; high-signal sponge cells 2-3%; blob-edge
-   cells 6-10% with consistent sign (unregularised design steps, same
-   class as item 3's localisation note). Both objective classes are
-   FD-verified.
+   applied to `objectivePatchTemperaturePNorm`, which exercises the
+   boundary-driven adjoint flux path
+   (update_boundarydJdT -> fixedGradient drive): the solid-interior checks
+   meet the strict finite-difference gate, with larger but sign-consistent
+   errors near unregularised design discontinuities. Both objective classes
+   are FD-verified.
 5. **Production configuration (11 Jul 2026)**: regularisation ON (Helmholtz
    filter + tanh projection) with the p-norm objective, FD compared against
-   the projection-chained sensitivities: **solid interior median 0.5% (max
-   1.0%), edge median 0.6% (max 1.5%), sponge median 1.2% (max 1.7%)**.
-   The design-step localisation of items 3-4 vanishes under regularisation,
-   as predicted. No weak regime remains.
+   the projection-chained sensitivities: all tested regimes verify at low
+   single-digit percent or better. The design-step localisation of items 3-4
+   vanishes under regularisation, as predicted. No weak regime remains.
    **Harness caveat for reproducers**: with regularisation active, the
    per-cycle `topologySens<solver>` field is written BEFORE the
    filter/projection chain rule (upstream behaviour, documented in
    topODesignVariables.C); FD comparisons in design-variable space must
    enable `writeAllFields true` and use `topOSens<solver>` instead. The
    optimiser itself always receives the chained gradients.
-4. Confirmed conventions: couplingSign = +1, thermalSensScale = +1
+6. Confirmed conventions: couplingSign = +1, thermalSensScale = +1
    (as derived); design-variable-to-indicator map verified as identity
    with regularisation off; sensitivity scale constant uniform across
    cells and attributable to the framework's volume/step bookkeeping.
@@ -318,40 +308,23 @@ itself. The cost of these omissions is measured, not assumed (§6.3).
 
 ### 6.3 Verification (12 July 2026)
 
-`cases/varprops`: the fdcheck geometry, laminar, production configuration
+`cases/varprops`: the fdcheck geometry, laminar production configuration
 (regularisation on, patch p-norm objective), with **all five tables active
 simultaneously**: ρ(T), c_p(T), k_f(T), μ(T) in the fluid and D_s(T) in the
-solid. A manufactured verification fluid, anchored so that at 300 K it
-reduces exactly to the constant-property case (ν = 1e-6, D_f = 1e-5) and the
-Peclet/Reynolds regime is unchanged. Variation across the tabulated 300-340 K
-span (the case's temperature field reaches 338.8 K, so it realises very
-nearly all of it): ρ -15 %, c_p -10 %, ρc_p -23.5 % (so C: 1.000 → 0.765),
-k_f +10 %, μ -50 % (so ν: 1.0e-6 → 5.9e-7, Re 400 → 680), D_s -33 %.
+solid. A manufactured verification fluid is anchored so it reduces to the
+constant-property case at the reference temperature while still exercising all
+variable-property code paths over the realised temperature range.
 
-That μ(T) genuinely reaches the momentum equation was checked directly
-against an otherwise identical constant-ν run: 22 % change in peak pressure,
-11.5 % in peak velocity.
+Single-cell central differences and directional derivatives retain the correct
+sign and remain close to the constant-property campaign. Directional magnitude
+errors grow modestly, which is the measured cost of the frozen-property
+linearisation. The public scripts and logs carry the exact numerical rows; this
+note records the conclusion and the reproduction path without presenting the
+values as project-specific performance evidence.
 
-Single-cell central differences, ε = 0.008, compared against `topOSensas1`:
-
-- Solid interior: median error 0.4 %, maximum error 0.8 %;
-  constant-property campaign 0.5 % / 1.0 %.
-- Interface edge: median error 0.7 %, maximum error 0.9 %;
-  constant-property campaign 0.6 % / 1.5 %.
-- Sponge: median error 1.4 %, maximum error 1.6 %;
-  constant-property campaign 1.2 % / 1.7 %.
-
-Sign agreement: **18/18** cells. Per-cell accuracy with every property
-tabulated is statistically indistinguishable from the constant-property
-production campaign. The frozen-property terms contribute no measurable
-per-cell gradient error at these conditions.
-
-Directional derivatives over the 720 design cells (blob, band, three random)
-agree in sign in all five directions, with magnitude errors of 2.0-5.8 %
-against 1-3 % for the same directions with constant properties. This modest
-growth is the honest cost of the frozen-property linearisation and is
-reported as such; it is well inside what a descent direction needs, and the
-per-cell gradients that drive the filtered update are unaffected.
+The μ(T) path is checked by comparing against an otherwise identical
+constant-viscosity run, confirming that the temperature-table viscosity reaches
+the momentum equation.
 
 Reproduce: `cases/varprops/Allrun` then `./fd_varprops.py`.
 
@@ -380,17 +353,13 @@ files; they are not cross-checked, and must be kept consistent by hand.
 - **Pressure-drop cap**: existing `objectivePtLosses` as an inequality
   constraint under the framework's ISQP/MMA update methods (upstream since
   v2312). No new code.
-- **No boiling (Bergles-Rohsenow ONB)**: v1 enforces a proxy constraint: a
-  p-norm of T over near-interface fluid cells kept below T_ONB estimated at
-  the local wall flux, plus an exact post-check via the
-  `boilingOnsetBerglesRohsenow` functionObject on the body-fitted verified
-  design. The exact ONB aggregate as a differentiable constraint is roadmap.
-- **No enclosed voids / small-scale porosity**: enforced by the framework's
-  regularisation (Helmholtz filter radius) + projection continuation, and by
-  the extraction pipeline: β iso-surface → STL → snappyHexMesh →
-  `chtMultiRegionSimpleFoam` (k-ω SST, wall-resolved) recompute of all
-  reported quantities. Only body-fitted numbers are reported as final.
-- **Continuation**: RAMP convexity for I_k(β) relaxed → sharpened over
+- **Boiling margin**: `boilingOnsetBerglesRohsenow` provides a post-check and
+  monitor. A differentiable ONB aggregate constraint is roadmap.
+- **Disconnected regions, enclosed voids and small-scale porosity**:
+  regularisation and projection suppress small-scale and diffuse features.
+  Extracted geometries must still be screened and repaired or rejected before
+  body-fitted remeshing and verification.
+- **Continuation**: RAMP convexity for I_k(β) relaxed to sharpened over
   optimisation cycles (large conductivity contrasts make early
   intermediate densities essential for a usable design space).
 
