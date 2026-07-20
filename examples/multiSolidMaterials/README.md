@@ -2,6 +2,9 @@
 
 **Different solid materials in the domain, throughout the topology optimisation.**
 
+**Verified example:** bundled checks assert that each labelled zone and the
+generated solid use the intended material property fields.
+
 The design variable chooses **fluid vs solid**. It does **not** choose *which*
 solid. Material labels are **fixed** for the whole optimisation, assigned by
 cellZone, and every material carries its own diffusivity, constant or tabulated
