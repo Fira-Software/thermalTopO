@@ -191,7 +191,7 @@ validation identities, is available in:
     </tr>
     <tr>
       <td><code>examples/</code></td>
-      <td>experimental work in progress; not evidence</td>
+      <td>worked examples; verification status stated per example README</td>
     </tr>
   </tbody>
 </table>
